@@ -20,7 +20,7 @@ DEFAULT_LON = "4.44197"
 
 HEADERS = {
     "User-Agent": os.getenv(
-        "WINDSURFICE_UA",
+        "LOCAL_WIND_UA",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124 Safari/537.36",
@@ -29,7 +29,7 @@ HEADERS = {
     "Referer": "https://windsurfice.com/en/locations/valkenburgsemeer",
     "Origin": "https://windsurfice.com",
 }
-_cookie = os.getenv("WINDSURFICE_COOKIE")
+_cookie = os.getenv("LOCAL_WIND_COOKIE")
 if _cookie:
     HEADERS["Cookie"] = _cookie
 

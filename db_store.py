@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Dict, Any, Optional, Tuple
 
 
-DB_FILENAME = "windsurfice.db"
+DB_FILENAME = "wind_data.db"
 
 
 def db_path(out_dir: str) -> str:

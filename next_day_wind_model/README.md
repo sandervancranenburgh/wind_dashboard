@@ -4,7 +4,7 @@ This folder contains a trainable LSTM pipeline that predicts the **next 24 hours
 
 ## Data source
 
-- SQLite database: `data/windsurfice.db`
+- SQLite database: `data/wind_data.db`
 - Input table: `forecasts`
 - Target table: `observations`
 
@@ -31,7 +31,7 @@ pip install -r next_day_wind_model/requirements.txt
 
 ```bash
 python3 next_day_wind_model/train_lstm.py \
-  --db data/windsurfice.db \
+  --db data/wind_data.db \
   --site valkenburgsemeer \
   --model HARMONIE \
   --window-hours 72 \
@@ -59,7 +59,7 @@ It trains two residual models:
 
 ```bash
 python3 next_day_wind_model/update_model_and_predict.py \
-  --db data/windsurfice.db \
+  --db data/wind_data.db \
   --site valkenburgsemeer \
   --model HARMONIE \
   --window-hours 72 \
@@ -70,7 +70,7 @@ python3 next_day_wind_model/update_model_and_predict.py \
   --out-dir next_day_wind_model/artifacts
 ```
 
-Before training, the script now checks forecast freshness in the DB and can auto-run `windsurfice_fetch2.py` when data are stale.
+Before training, the script now checks forecast freshness in the DB and can auto-run `source_fetch.py` when data are stale.
 
 Useful options:
 - `--max-forecast-age-hours 8`

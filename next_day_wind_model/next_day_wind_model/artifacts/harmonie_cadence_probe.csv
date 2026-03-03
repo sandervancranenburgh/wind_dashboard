@@ -1,0 +1,2 @@
+fetched_at_utc,ok,http_status,row_count,signature_sha1,changed_vs_prev,min_target_utc,max_target_utc,error
+2026-02-28T20:17:00.133288+00:00,True,200,69,6c8b8bd5b754aefbfea0678c09ea0d462881302e,False,2026-02-28T09:00:00+00:00,2026-03-03T05:00:00+00:00,

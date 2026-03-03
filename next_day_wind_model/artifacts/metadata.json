@@ -1,0 +1,22 @@
+{
+  "trained_at_utc": "2026-02-28T16:31:55.961930+00:00",
+  "db_path": "data/windsurfice.db",
+  "site": "valkenburgsemeer",
+  "forecast_model": "HARMONIE",
+  "window_hours": 72,
+  "target_hours": 24,
+  "n_train": 2783,
+  "n_val": 696,
+  "feature_cols": [
+    "forecast_avg",
+    "forecast_max",
+    "forecast_dir",
+    "month_sin",
+    "month_cos"
+  ],
+  "target_col": "actual_avg",
+  "best_val_loss": 0.7256463036454958,
+  "val_mae_denormalized": 2.83644962310791,
+  "val_rmse_denormalized": 3.8983700275421143,
+  "device": "cpu"
+}

@@ -15,7 +15,7 @@ from data_pipeline import DatasetConfig, build_training_arrays
 
 
 class NextDayLSTM(nn.Module):
-    def __init__(self, n_features: int, target_hours: int) -> None:
+    def __init__(self, n_features: int, target_hours: int, output_activation: str = "linear") -> None:
         super().__init__()
         self.lstm1 = nn.LSTM(input_size=n_features, hidden_size=64, batch_first=True)
         self.dropout = nn.Dropout(0.2)
@@ -23,6 +23,10 @@ class NextDayLSTM(nn.Module):
         self.fc1 = nn.Linear(32, 64)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(64, target_hours)
+        self.output_activation = str(output_activation).strip().lower()
+        if self.output_activation not in {"linear", "softplus"}:
+            raise ValueError("output_activation must be 'linear' or 'softplus'.")
+        self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.lstm1(x)
@@ -31,6 +35,8 @@ class NextDayLSTM(nn.Module):
         x = x[:, -1, :]
         x = self.relu(self.fc1(x))
         x = self.fc2(x)
+        if self.output_activation == "softplus":
+            x = self.softplus(x)
         return x
 
 

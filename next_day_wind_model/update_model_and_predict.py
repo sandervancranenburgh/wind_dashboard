@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retrain residual models (speed + direction) on all data and output next-day predictions.",
     )
-    parser.add_argument("--db", default="data/windsurfice.db", help="Path to SQLite DB.")
+    parser.add_argument("--db", default="data/wind_data.db", help="Path to SQLite DB.")
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-data-refresh-check",
         action="store_true",
-        help="Skip pre-run check that may call windsurfice_fetch2.py for newer data.",
+        help="Skip pre-run check that may call source_fetch.py for newer data.",
     )
     parser.add_argument(
         "--max-forecast-age-hours",
@@ -123,7 +123,7 @@ def _latest_forecast_run_ts_ms(db_path: Path, site: str, model: str) -> int | No
 
 
 def _run_fetch_script(repo_root: Path, out_data_dir: Path) -> None:
-    fetch_script = repo_root / "windsurfice_fetch2.py"
+    fetch_script = repo_root / "source_fetch.py"
     cmd = ["python3", str(fetch_script), str(out_data_dir)]
     print(f"Refreshing source data via: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(repo_root), check=True)
@@ -915,7 +915,7 @@ def publish_web_dashboard(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="{refresh}">
-  <title>Windsurfice Wind Dashboard</title>
+  <title>Super local wind prediction Valkenburgse meer</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
@@ -928,7 +928,7 @@ def publish_web_dashboard(
   </style>
 </head>
 <body>
-  <h1>Windsurfice Wind Dashboard</h1>
+  <h1>Super local wind prediction Valkenburgse meer</h1>
   <p class="meta">Last updated: {generated_local_str}</p>
   <p>
     <a href="next_day_predictions.csv">Next-day table CSV</a>

@@ -60,7 +60,7 @@ def evaluate_denormalized(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train LSTM model for next-day wind prediction.")
-    parser.add_argument("--db", default="data/windsurfice.db", help="Path to SQLite DB.")
+    parser.add_argument("--db", default="data/wind_data.db", help="Path to SQLite DB.")
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")

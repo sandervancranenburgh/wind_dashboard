@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local runtime data
+data/*.db
+*.log
+
+# Model/runtime artifacts (regenerated)
+next_day_wind_model/artifacts/
+next_day_wind_model/web_dashboard/*.csv
+next_day_wind_model/web_dashboard/*.png

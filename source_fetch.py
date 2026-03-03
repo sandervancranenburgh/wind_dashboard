@@ -15,17 +15,20 @@ MODEL = "HARMONIE"
 LAT = "52.1603"
 LON = "4.44197"
 
-# --- Headers: copy the same trick that worked for you in the browser ---
-# If needed, put your cookie in the WIND_SURFICE_COOKIE env var to avoid hardcoding it.
+# --- Headers ---
+# Optional cookie can be passed via LOCAL_WIND_COOKIE env var.
 HEADERS = {
-    "User-Agent": os.getenv("WINDSURFICE_UA", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                             "Chrome/124 Safari/537.36"),
+    "User-Agent": os.getenv(
+        "LOCAL_WIND_UA",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124 Safari/537.36",
+    ),
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://windsurfice.com/en/locations/valkenburgsemeer",
     "Origin": "https://windsurfice.com",
 }
-_cookie = os.getenv("WINDSURFICE_COOKIE")
+_cookie = os.getenv("LOCAL_WIND_COOKIE")
 if _cookie:
     HEADERS["Cookie"] = _cookie
 

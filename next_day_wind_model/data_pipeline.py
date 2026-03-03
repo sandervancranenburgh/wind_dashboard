@@ -59,6 +59,10 @@ def _load_forecasts(conn: sqlite3.Connection, site: str, model: str) -> pd.DataF
                     payload,
                     ["WindForecastAvr", "wind_speed", "windspeed", "WS", "ff", "speed"],
                 ),
+                "forecast_min": _extract_first(
+                    payload,
+                    ["WindForecastMin", "wind_min", "windspeed_min", "WS_min", "ff_min", "speed_min"],
+                ),
                 "forecast_max": _extract_first(
                     payload,
                     ["WindForecastMax", "wind_gust", "gust", "WG", "fg"],
@@ -78,7 +82,7 @@ def _load_forecasts(conn: sqlite3.Connection, site: str, model: str) -> pd.DataF
     forecast_df = forecast_df.drop_duplicates(subset=["target_dt"], keep="first")
     forecast_df = forecast_df.set_index("target_dt").sort_index()
 
-    return forecast_df[["forecast_avg", "forecast_max", "forecast_dir"]]
+    return forecast_df[["forecast_avg", "forecast_min", "forecast_max", "forecast_dir"]]
 
 
 def _load_observations(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
@@ -154,7 +158,7 @@ def _add_calendar_features(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _interpolate_missing_features(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "actual_max", "actual_dir"]
+    feature_cols = ["forecast_avg", "forecast_min", "forecast_max", "forecast_dir", "actual_max", "actual_dir"]
     for col in feature_cols:
         if col in out.columns:
             out[col] = out[col].interpolate(limit_direction="both")
@@ -471,12 +475,16 @@ def build_next_day_inference_input(
 
     x_window = history_frame[feature_cols].to_numpy(dtype=np.float32)
     forecast_next = target_frame["forecast_avg"].to_numpy(dtype=np.float32)
+    forecast_min_next = target_frame["forecast_min"].to_numpy(dtype=np.float32)
+    forecast_max_next = target_frame["forecast_max"].to_numpy(dtype=np.float32)
     forecast_dir_next = target_frame["forecast_dir"].to_numpy(dtype=np.float32)
 
     X_input = _apply_standardizer(x_window[np.newaxis, :, :], x_mean, x_std).astype(np.float32)
     return {
         "X_input": X_input,
         "forecast_next24": forecast_next,
+        "forecast_min_next24": forecast_min_next,
+        "forecast_max_next24": forecast_max_next,
         "forecast_dir_next24": forecast_dir_next,
         "target_times": np.array([t.isoformat() for t in target_times]),
         "anchor_time": anchor_time.isoformat(),

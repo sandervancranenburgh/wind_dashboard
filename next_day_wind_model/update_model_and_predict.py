@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
     parser.add_argument(
+        "--speed-constraint-eps",
+        type=float,
+        default=0.1,
+        help="Epsilon for constrained speed log-ratio residual model.",
+    )
+    parser.add_argument(
         "--skip-training",
         action="store_true",
         help="Skip model training and only refresh prediction outputs using saved models/scalers.",
@@ -305,19 +311,29 @@ def train_with_validation(
     return model, stats
 
 
-def predict_speed_residual(
+def predict_speed(
     model: nn.Module,
     X_input: np.ndarray,
     forecast_speed: np.ndarray,
     y_mean: float,
     y_std: float,
+    target_mode: str,
+    constraint_eps: float | None,
     device: torch.device,
 ) -> np.ndarray:
     model.eval()
     with torch.no_grad():
         pred_scaled = model(torch.from_numpy(X_input).float().to(device)).cpu().numpy()[0]
-    pred_residual = pred_scaled * y_std + y_mean
-    return pred_residual + forecast_speed
+    pred = pred_scaled * y_std + y_mean
+    mode = str(target_mode).strip().lower()
+    if mode == "residual":
+        pred = pred + forecast_speed
+    elif mode == "constrained_logratio":
+        eps = float(0.1 if constraint_eps is None else constraint_eps)
+        pred = np.exp(np.log(forecast_speed + eps) + pred)
+    elif mode != "absolute":
+        raise ValueError(f"Unsupported speed target mode: {target_mode}")
+    return pred.astype(np.float32)
 
 
 def predict_direction_residual(
@@ -343,12 +359,20 @@ def build_prediction_table(
 ) -> pd.DataFrame:
     target_times = pd.to_datetime(inference_input["target_times"], utc=True)
     forecast_speed = inference_input["forecast_next24"].astype(np.float32)
+    forecast_min = inference_input["forecast_min_next24"].astype(np.float32)
+    forecast_max = inference_input["forecast_max_next24"].astype(np.float32)
+    forecast_min = np.where(np.isnan(forecast_min), forecast_speed, forecast_min).astype(np.float32)
+    forecast_max = np.where(np.isnan(forecast_max), forecast_speed, forecast_max).astype(np.float32)
+    lo = np.minimum(forecast_min, forecast_max)
+    hi = np.maximum(forecast_min, forecast_max)
     forecast_dir = inference_input["forecast_dir_next24"].astype(np.float32)
 
     table = pd.DataFrame(
         {
             "target_time_utc": target_times,
             "forecast_wind_speed": forecast_speed,
+            "forecast_wind_min": lo,
+            "forecast_wind_max": hi,
             "lstm_pred_wind_speed": speed_pred.astype(np.float32),
             "forecast_wind_dir_deg": forecast_dir,
             "lstm_pred_wind_dir_deg": dir_pred.astype(np.float32),
@@ -360,6 +384,42 @@ def build_prediction_table(
         - 180,
     )
     return table
+
+
+def _apply_speed_background(ax: plt.Axes, y_top: float, x_left: float, x_right: float) -> None:
+    y_max = max(20.0, float(y_top))
+    grad = np.linspace(0.0, 1.0, 256).reshape(256, 1)
+    cmap = plt.matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wind_bg_blue_green",
+        [
+            (0.00, "#7fb6ff"),
+            (0.25, "#57a6ff"),
+            (0.45, "#4ecdb2"),
+            (0.62, "#30c27a"),
+            (1.00, "#22b36a"),
+        ],
+    )
+    ax.imshow(
+        grad,
+        extent=[x_left, x_right, 0.0, y_max],
+        origin="lower",
+        aspect="auto",
+        cmap=cmap,
+        alpha=0.5,
+        zorder=0,
+        interpolation="bicubic",
+    )
+
+
+def _smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
+    """Gentle centered rolling mean for plotting; preserves NaN gaps."""
+    arr = np.asarray(values, dtype=float)
+    if window <= 1:
+        return arr.copy()
+    s = pd.Series(arr)
+    out = s.rolling(window=window, center=True, min_periods=1).mean().to_numpy(dtype=float)
+    out[np.isnan(arr)] = np.nan
+    return out
 
 
 def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
@@ -375,13 +435,31 @@ def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
     first_dt = table["target_time_utc"].iloc[0]
     day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
-    y_min = float(min(table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
-    y_max = float(max(table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
+    y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
+    y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
     pad = max((y_max - y_min) * 0.08, 0.8)
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(x, table["forecast_wind_speed"], marker="o", label="Forecast speed")
-    ax.plot(x, table["lstm_pred_wind_speed"], marker="o", label="LSTM speed (residual)")
+    _apply_speed_background(ax, y_max + pad, x_left=-0.5, x_right=len(table) - 0.5)
+    marker_size = 3.0
+    fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
+    fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
+    fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
+    lstm_avg = table["lstm_pred_wind_speed"].to_numpy(dtype=float)
+    ax.fill_between(
+        x,
+        fc_low,
+        fc_high,
+        color="gray",
+        alpha=0.25,
+        linewidth=0.8,
+        edgecolor="gray",
+        label="_nolegend_",
+        zorder=1,
+    )
+    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Forecast max speed")
+    ax.plot(x, fc_avg, marker="o", markersize=marker_size, color="gray", label="Forecast avg speed")
+    ax.plot(x, lstm_avg, marker="o", markersize=marker_size, color="tab:blue", label="LSTM avg speed")
     ax.set_title(f"Next-Day Wind Speed ({day_label}, UTC)")
     ax.set_xlabel("Hour (UTC)")
     ax.set_ylabel("Wind speed (kts)")
@@ -396,7 +474,7 @@ def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
     y_base_axes = -0.20
     arrow_len_axes = 0.075
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
-        for direction_deg, color in [(fdir, "tab:blue"), (ldir, "tab:orange")]:
+        for direction_deg, color in [(fdir, "gray"), (ldir, "tab:blue")]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
             dy = arrow_len_axes * np.cos(theta)
@@ -428,6 +506,8 @@ def build_current_day_table(
     direction_model: nn.Module,
     speed_scalers: dict,
     direction_scalers: dict,
+    speed_target_mode: str,
+    speed_constraint_eps: float | None,
     local_tz: str,
     test_now_local_hour: int | None,
     device: torch.device,
@@ -470,14 +550,23 @@ def build_current_day_table(
             speed_res_scaled = speed_model(torch.from_numpy(x_speed).float().to(device)).cpu().numpy()[0]
             dir_res_scaled = direction_model(torch.from_numpy(x_dir).float().to(device)).cpu().numpy()[0]
 
-        speed_res = speed_res_scaled * float(speed_scalers["y_std"][0]) + float(speed_scalers["y_mean"][0])
+        speed_out = speed_res_scaled * float(speed_scalers["y_std"][0]) + float(speed_scalers["y_mean"][0])
         dir_res = dir_res_scaled * float(direction_scalers["y_std"][0]) + float(direction_scalers["y_mean"][0])
-        speed_res = speed_res[:target_n]
+        speed_out = speed_out[:target_n]
         dir_res = dir_res[:target_n]
 
         fc_speed = future_frame["forecast_avg"].to_numpy(dtype=np.float32)
         fc_dir = future_frame["forecast_dir"].to_numpy(dtype=np.float32)
-        lstm_speed = fc_speed + speed_res
+        mode = str(speed_target_mode).strip().lower()
+        if mode == "residual":
+            lstm_speed = fc_speed + speed_out
+        elif mode == "constrained_logratio":
+            eps = float(0.1 if speed_constraint_eps is None else speed_constraint_eps)
+            lstm_speed = np.exp(np.log(fc_speed + eps) + speed_out)
+        elif mode == "absolute":
+            lstm_speed = speed_out
+        else:
+            raise ValueError(f"Unsupported speed target mode: {speed_target_mode}")
         lstm_dir = _angle_add_deg(fc_dir, dir_res.astype(np.float32))
         return lstm_speed.astype(np.float32), lstm_dir.astype(np.float32)
 
@@ -523,14 +612,23 @@ def build_current_day_table(
     # If day is effectively finished, return actual-only table for today.
     if remaining_n == 0:
         full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
-        fc_today = forecast_frame_local.reindex(full_hours)["forecast_avg"]
+        fc_re = forecast_frame_local.reindex(full_hours)
+        fc_avg = fc_re["forecast_avg"].to_numpy(dtype=np.float32)
+        fc_min = fc_re["forecast_min"].to_numpy(dtype=np.float32)
+        fc_max = fc_re["forecast_max"].to_numpy(dtype=np.float32)
+        fc_min = np.where(np.isnan(fc_min), fc_avg, fc_min).astype(np.float32)
+        fc_max = np.where(np.isnan(fc_max), fc_avg, fc_max).astype(np.float32)
+        fc_low = np.minimum(fc_min, fc_max)
+        fc_high = np.maximum(fc_min, fc_max)
         table = pd.DataFrame(
             {
                 "time_local": full_hours,
-                "forecast_wind_speed": fc_today.to_numpy(dtype=np.float32),
+                "forecast_wind_speed": fc_avg,
+                "forecast_wind_min": fc_low,
+                "forecast_wind_max": fc_high,
                 "lstm_pred_wind_speed": np.full(len(full_hours), np.nan, dtype=np.float32),
                 "actual_wind_speed": actual_today.reindex(full_hours).to_numpy(dtype=np.float32),
-                "forecast_wind_dir_deg": forecast_frame_local.reindex(full_hours)["forecast_dir"].to_numpy(dtype=np.float32),
+                "forecast_wind_dir_deg": fc_re["forecast_dir"].to_numpy(dtype=np.float32),
                 "lstm_pred_wind_dir_deg": np.full(len(full_hours), np.nan, dtype=np.float32),
                 "actual_wind_dir_deg": actual_dir_today.reindex(full_hours).to_numpy(dtype=np.float32),
             }
@@ -545,10 +643,19 @@ def build_current_day_table(
     lstm_speed_rem, lstm_dir_rem = _predict_residuals_for_targets(remaining_local)
 
     fc_today = forecast_frame_local.reindex(full_hours)
+    fc_min = fc_today["forecast_min"].to_numpy(dtype=np.float32)
+    fc_avg = fc_today["forecast_avg"].to_numpy(dtype=np.float32)
+    fc_max = fc_today["forecast_max"].to_numpy(dtype=np.float32)
+    fc_min = np.where(np.isnan(fc_min), fc_avg, fc_min).astype(np.float32)
+    fc_max = np.where(np.isnan(fc_max), fc_avg, fc_max).astype(np.float32)
+    fc_low = np.minimum(fc_min, fc_max)
+    fc_high = np.maximum(fc_min, fc_max)
     table = pd.DataFrame(
         {
             "time_local": full_hours,
-            "forecast_wind_speed": fc_today["forecast_avg"].to_numpy(dtype=np.float32),
+            "forecast_wind_speed": fc_avg,
+            "forecast_wind_min": fc_low,
+            "forecast_wind_max": fc_high,
             "forecast_wind_dir_deg": fc_today["forecast_dir"].to_numpy(dtype=np.float32),
             "actual_wind_speed": actual_today.reindex(full_hours).to_numpy(dtype=np.float32),
             "actual_wind_dir_deg": actual_dir_today.reindex(full_hours).to_numpy(dtype=np.float32),
@@ -577,6 +684,8 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
 
     speed_series = pd.concat(
         [
+            table["forecast_wind_min"].dropna(),
+            table["forecast_wind_max"].dropna(),
             table["forecast_wind_speed"].dropna(),
             table["lstm_pred_wind_speed_full"].dropna(),
             table["lstm_pred_wind_speed"].dropna(),
@@ -590,19 +699,36 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
     y_upper = y_max + pad
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    marker_size = 5.5
+    marker_size = 3.0
+    _apply_speed_background(ax, y_upper, x_left=-0.5, x_right=len(table) - 0.5)
+    fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
+    fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
+    fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
+    actual_avg = table["actual_wind_speed"].to_numpy(dtype=float)
+    ax.fill_between(
+        x,
+        fc_low,
+        fc_high,
+        color="gray",
+        alpha=0.25,
+        linewidth=0.8,
+        edgecolor="gray",
+        label="_nolegend_",
+        zorder=1,
+    )
+    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Forecast max speed")
     ax.plot(
         x,
-        table["forecast_wind_speed"],
+        fc_avg,
         marker="o",
         markersize=marker_size,
-        color="tab:blue",
+        color="gray",
         linewidth=2.0,
-        label="Forecast speed",
+        label="Forecast avg speed",
     )
     ax.plot(
         x,
-        table["actual_wind_speed"].to_numpy(dtype=float),
+        actual_avg,
         marker="o",
         markersize=marker_size,
         color="magenta",
@@ -621,7 +747,7 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
     ax.plot(
         x,
         lstm_past,
-        color="tab:orange",
+        color="tab:blue",
         linestyle="--",
         linewidth=1.6,
         alpha=0.9,
@@ -637,13 +763,13 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
         lstm_future,
         marker="o",
         markersize=marker_size,
-        color="tab:orange",
+        color="tab:blue",
         linewidth=2.0,
-        label="LSTM speed",
+        label="LSTM avg speed",
         zorder=3,
     )
-    ax.set_title(f"Current-Day Wind ({day_label}, {local_tz})")
-    ax.set_xlabel(f"Hour ({local_tz})")
+    ax.set_title(f"Current-day wind prediction: {day_label}")
+    ax.set_xlabel("Time")
     ax.set_ylabel("Wind speed (kts)")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99))
@@ -681,7 +807,7 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
         adir = row["actual_wind_dir_deg"]
         if pd.isna(ldir):
             ldir = row["lstm_pred_wind_dir_deg_full"]
-        for direction_deg, color, z in [(fdir, "tab:blue", 3), (ldir, "tab:orange", 4), (adir, "magenta", 6)]:
+        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, "tab:blue", 4), (adir, "magenta", 6)]:
             if pd.isna(direction_deg):
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -715,26 +841,43 @@ def compute_running_mae(table: pd.DataFrame) -> tuple[float, float, int]:
     return mae_fc, mae_lstm, common_points
 
 
-def _save_model(path: Path, model: nn.Module, n_features: int, target_hours: int, target_name: str) -> None:
+def _save_model(
+    path: Path,
+    model: nn.Module,
+    n_features: int,
+    target_hours: int,
+    target_name: str,
+    target_mode: str,
+    output_activation: str,
+    extra: dict | None = None,
+) -> None:
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "model_class": "NextDayLSTM",
+        "n_features": int(n_features),
+        "target_hours": int(target_hours),
+        "target_name": target_name,
+        "target_mode": target_mode,
+        "output_activation": output_activation,
+    }
+    if extra:
+        payload.update(extra)
     torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "model_class": "NextDayLSTM",
-            "n_features": int(n_features),
-            "target_hours": int(target_hours),
-            "target_name": target_name,
-            "target_mode": "residual",
-        },
+        payload,
         path,
     )
 
 
-def _load_model(path: Path, device: torch.device) -> nn.Module:
+def _load_model(path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     ckpt = torch.load(path, map_location=device)
-    model = NextDayLSTM(n_features=int(ckpt["n_features"]), target_hours=int(ckpt["target_hours"])).to(device)
+    model = NextDayLSTM(
+        n_features=int(ckpt["n_features"]),
+        target_hours=int(ckpt["target_hours"]),
+        output_activation=str(ckpt.get("output_activation", "linear")),
+    ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model
+    return model, ckpt
 
 
 def _resolve_now_local(local_tz: str, test_now_local_hour: int | None) -> datetime:
@@ -1017,38 +1160,55 @@ def main() -> None:
         for p in [speed_model_path, direction_model_path, *speed_scalers_path.values(), *direction_scalers_path.values()]:
             if not p.exists():
                 raise FileNotFoundError(f"Missing artifact for --skip-training mode: {p}")
-        speed_model = _load_model(speed_model_path, device)
-        direction_model = _load_model(direction_model_path, device)
+        speed_model, speed_ckpt = _load_model(speed_model_path, device)
+        direction_model, direction_ckpt = _load_model(direction_model_path, device)
         speed_arrays = {k: np.load(v) for k, v in speed_scalers_path.items()}
         direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
+        speed_target_mode = str(speed_ckpt.get("target_mode", "residual")).strip().lower()
+        direction_target_mode = str(direction_ckpt.get("target_mode", "residual")).strip().lower()
+        speed_constraint_eps = speed_ckpt.get("constraint_eps", None)
         speed_train_stats = None
         direction_train_stats = None
         n_samples_all_speed = None
         n_samples_all_direction = None
         feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
     else:
-        # --- Train residual speed model ---
+        # --- Train constrained residual speed model (positive by construction) ---
         speed_arrays = build_all_training_arrays(db_path, cfg, target_mode="residual")
+        speed_constraint_eps = float(args.speed_constraint_eps)
+        speed_y_raw = np.log(speed_arrays["y_actual_all_raw"] + speed_constraint_eps) - np.log(
+            speed_arrays["y_forecast_all_raw"] + speed_constraint_eps
+        )
+        y_mean = float(speed_y_raw.mean())
+        y_std = float(speed_y_raw.std())
+        if y_std == 0.0:
+            y_std = 1.0
+        speed_arrays["y_mean"] = np.array([y_mean], dtype=np.float32)
+        speed_arrays["y_std"] = np.array([y_std], dtype=np.float32)
+        speed_y_scaled = (speed_y_raw - y_mean) / y_std
         speed_model = NextDayLSTM(
             n_features=speed_arrays["X_all"].shape[2],
-            target_hours=speed_arrays["y_all"].shape[1],
+            target_hours=speed_y_scaled.shape[1],
+            output_activation="linear",
         ).to(device)
         speed_model, speed_train_stats = train_with_validation(
             model=speed_model,
             X_all=speed_arrays["X_all"],
-            y_all=speed_arrays["y_all"],
+            y_all=speed_y_scaled.astype(np.float32),
             batch_size=args.batch_size,
             epochs=args.epochs,
             validation_split=args.validation_split,
             model_label="speed",
             device=device,
         )
+        speed_target_mode = "constrained_logratio"
 
         # --- Train residual direction model ---
         direction_arrays = build_all_direction_training_arrays(db_path, cfg)
         direction_model = NextDayLSTM(
             n_features=direction_arrays["X_all"].shape[2],
             target_hours=direction_arrays["y_all"].shape[1],
+            output_activation="linear",
         ).to(device)
         direction_model, direction_train_stats = train_with_validation(
             model=direction_model,
@@ -1065,8 +1225,11 @@ def main() -> None:
             speed_model_path,
             speed_model,
             n_features=speed_arrays["X_all"].shape[2],
-            target_hours=speed_arrays["y_all"].shape[1],
+            target_hours=speed_y_scaled.shape[1],
             target_name="wind_speed",
+            target_mode=speed_target_mode,
+            output_activation="linear",
+            extra={"constraint_eps": speed_constraint_eps},
         )
         _save_model(
             direction_model_path,
@@ -1074,6 +1237,8 @@ def main() -> None:
             n_features=direction_arrays["X_all"].shape[2],
             target_hours=direction_arrays["y_all"].shape[1],
             target_name="wind_direction",
+            target_mode="residual",
+            output_activation="linear",
         )
 
         np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
@@ -1087,6 +1252,7 @@ def main() -> None:
         n_samples_all_speed = int(speed_arrays["X_all"].shape[0])
         n_samples_all_direction = int(direction_arrays["X_all"].shape[0])
         feature_cols = speed_arrays["feature_cols"]
+        direction_target_mode = "residual"
 
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
@@ -1101,12 +1267,14 @@ def main() -> None:
         x_std=direction_arrays["x_std"],
     )
 
-    speed_pred = predict_speed_residual(
+    speed_pred = predict_speed(
         model=speed_model,
         X_input=inference_input_speed["X_input"],
         forecast_speed=inference_input_speed["forecast_next24"],
         y_mean=float(speed_arrays["y_mean"][0]),
         y_std=float(speed_arrays["y_std"][0]),
+        target_mode=speed_target_mode,
+        constraint_eps=speed_constraint_eps,
         device=device,
     )
     direction_pred = predict_direction_residual(
@@ -1152,6 +1320,8 @@ def main() -> None:
             "y_mean": direction_arrays["y_mean"],
             "y_std": direction_arrays["y_std"],
         },
+        speed_target_mode=speed_target_mode,
+        speed_constraint_eps=speed_constraint_eps,
         local_tz=args.local_timezone,
         test_now_local_hour=args.test_now_local_hour,
         device=device,
@@ -1226,8 +1396,9 @@ def main() -> None:
         "n_train_direction": None if direction_train_stats is None else int(direction_train_stats["n_train"]),
         "n_val_direction": None if direction_train_stats is None else int(direction_train_stats["n_val"]),
         "feature_cols": feature_cols,
-        "speed_model_target": "residual",
-        "direction_model_target": "residual",
+        "speed_model_target": speed_target_mode,
+        "speed_constraint_eps": speed_constraint_eps,
+        "direction_model_target": direction_target_mode,
         "best_train_loss_speed": None if speed_train_stats is None else float(speed_train_stats["best_train_loss"]),
         "best_train_loss_eval_speed": None if speed_train_stats is None else float(speed_train_stats["best_train_loss_eval"]),
         "best_val_loss_speed": None if speed_train_stats is None else float(speed_train_stats["best_val_loss"]),

@@ -422,7 +422,37 @@ def _smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
     return out
 
 
-def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
+def _parse_iso_utc(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    value = ts.strip()
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_plot_meta_text(prediction_generated_at_utc: str, model_trained_at_utc: str | None) -> str:
+    pred_dt = _parse_iso_utc(prediction_generated_at_utc)
+    train_dt = _parse_iso_utc(model_trained_at_utc)
+    pred_txt = pred_dt.strftime("%H:%M") if pred_dt is not None else "unknown"
+    train_txt = f"{train_dt.day} {train_dt.strftime('%B %H:%M')}" if train_dt is not None else "unknown"
+    return f"Last plot update: {pred_txt}\nLast model training: {train_txt}"
+
+
+def save_prediction_plot(
+    table: pd.DataFrame,
+    plot_path: Path,
+    prediction_generated_at_utc: str,
+    model_trained_at_utc: str | None,
+) -> None:
     table = table.copy()
     table = table[(table["target_time_utc"].dt.hour >= 8) & (table["target_time_utc"].dt.hour <= 22)].reset_index(
         drop=True
@@ -439,8 +469,8 @@ def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
     y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
     pad = max((y_max - y_min) * 0.08, 0.8)
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-    _apply_speed_background(ax, y_max + pad, x_left=-0.5, x_right=len(table) - 0.5)
+    fig, ax = plt.subplots(figsize=(14, 7.2))
+    _apply_speed_background(ax, y_max + pad, x_left=0.0, x_right=len(table) - 1.0)
     marker_size = 3.0
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
@@ -463,16 +493,28 @@ def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
     ax.set_title(f"Next-Day Wind Speed ({day_label}, UTC)")
     ax.set_xlabel("Hour (UTC)")
     ax.set_ylabel("Wind speed (kts)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0)
     ax.set_xticks(x, table["hour_label"], rotation=0)
-    ax.set_ylim(y_min - pad, y_max + pad)
+    ax.set_xlim(0.0, len(table) - 1.0)
+    ax.set_ylim(0.0, y_max + pad)
+    ax.text(
+        0.015,
+        1.13,
+        _format_plot_meta_text(prediction_generated_at_utc, model_trained_at_utc),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="black",
+        clip_on=False,
+    )
 
     # Draw wind direction arrows under x-axis.
     # Mapping: up-arrow means South wind (from South), per user preference.
     # Using x-axis transform keeps arrows below axis regardless of y-scale.
-    y_base_axes = -0.20
-    arrow_len_axes = 0.075
+    y_base_axes = -0.14
+    arrow_len_axes = 0.065
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, "tab:blue")]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -494,7 +536,7 @@ def save_prediction_plot(table: pd.DataFrame, plot_path: Path) -> None:
                 clip_on=False,
             )
 
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.tight_layout(rect=[0, 0.04, 1, 0.965])
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -672,7 +714,13 @@ def build_current_day_table(
     return table
 
 
-def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -> None:
+def save_current_day_plot(
+    table: pd.DataFrame,
+    plot_path: Path,
+    local_tz: str,
+    prediction_generated_at_utc: str,
+    model_trained_at_utc: str | None,
+) -> None:
     table = table.copy()
     table = table[(table["time_local"].dt.hour >= 8) & (table["time_local"].dt.hour <= 22)].reset_index(drop=True)
     if table.empty:
@@ -695,12 +743,12 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
     y_min = float(speed_series.min()) if not speed_series.empty else 0.0
     y_max = float(speed_series.max()) if not speed_series.empty else 10.0
     pad = max((y_max - y_min) * 0.08, 0.8)
-    y_lower = min(y_min - pad, -0.5)
+    y_lower = 0.0
     y_upper = y_max + pad
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=(14, 7.2))
     marker_size = 3.0
-    _apply_speed_background(ax, y_upper, x_left=-0.5, x_right=len(table) - 0.5)
+    _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
     fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
@@ -771,9 +819,10 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
     ax.set_title(f"Current-day wind prediction: {day_label}")
     ax.set_xlabel("Time")
     ax.set_ylabel("Wind speed (kts)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99))
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0)
     ax.set_xticks(x, table["hour_local"], rotation=0)
+    ax.set_xlim(0.0, len(table) - 1.0)
     ax.set_ylim(y_lower, y_upper)
 
     if len(future_idx) > 0:
@@ -797,10 +846,21 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
         zorder=7,
     )
+    ax.text(
+        0.015,
+        1.13,
+        _format_plot_meta_text(prediction_generated_at_utc, model_trained_at_utc),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="black",
+        clip_on=False,
+    )
 
     # Direction arrows below axis for forecast, LSTM (remaining where available, else full-day context), and actual.
-    y_base_axes = -0.20
-    arrow_len_axes = 0.075
+    y_base_axes = -0.14
+    arrow_len_axes = 0.065
     for i, row in table.iterrows():
         fdir = row["forecast_wind_dir_deg"]
         ldir = row["lstm_pred_wind_dir_deg"]
@@ -824,7 +884,7 @@ def save_current_day_plot(table: pd.DataFrame, plot_path: Path, local_tz: str) -
                 zorder=z,
             )
 
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.tight_layout(rect=[0, 0.04, 1, 0.965])
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -878,6 +938,15 @@ def _load_model(path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, ckpt
+
+
+def _resolve_model_trained_utc(ckpt: dict, model_path: Path) -> str | None:
+    ts = ckpt.get("trained_at_utc")
+    if ts:
+        return str(ts)
+    if model_path.exists():
+        return datetime.fromtimestamp(model_path.stat().st_mtime, tz=timezone.utc).isoformat()
+    return None
 
 
 def _resolve_now_local(local_tz: str, test_now_local_hour: int | None) -> datetime:
@@ -1167,6 +1236,7 @@ def main() -> None:
         speed_target_mode = str(speed_ckpt.get("target_mode", "residual")).strip().lower()
         direction_target_mode = str(direction_ckpt.get("target_mode", "residual")).strip().lower()
         speed_constraint_eps = speed_ckpt.get("constraint_eps", None)
+        model_last_trained_at_utc = _resolve_model_trained_utc(speed_ckpt, speed_model_path)
         speed_train_stats = None
         direction_train_stats = None
         n_samples_all_speed = None
@@ -1229,7 +1299,7 @@ def main() -> None:
             target_name="wind_speed",
             target_mode=speed_target_mode,
             output_activation="linear",
-            extra={"constraint_eps": speed_constraint_eps},
+            extra={"constraint_eps": speed_constraint_eps, "trained_at_utc": datetime.now(timezone.utc).isoformat()},
         )
         _save_model(
             direction_model_path,
@@ -1239,6 +1309,7 @@ def main() -> None:
             target_name="wind_direction",
             target_mode="residual",
             output_activation="linear",
+            extra={"trained_at_utc": datetime.now(timezone.utc).isoformat()},
         )
 
         np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
@@ -1253,6 +1324,7 @@ def main() -> None:
         n_samples_all_direction = int(direction_arrays["X_all"].shape[0])
         feature_cols = speed_arrays["feature_cols"]
         direction_target_mode = "residual"
+        model_last_trained_at_utc = datetime.now(timezone.utc).isoformat()
 
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
@@ -1305,7 +1377,13 @@ def main() -> None:
     table_for_csv.to_csv(table_path, index=False)
 
     plot_path = out_dir / "next_day_predictions.png"
-    save_prediction_plot(table, plot_path)
+    prediction_generated_at_utc = datetime.now(timezone.utc).isoformat()
+    save_prediction_plot(
+        table,
+        plot_path,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+    )
 
     # --- Current day plot/table: actuals up to present + prediction for remaining day ---
     current_day_table = build_current_day_table(
@@ -1335,7 +1413,13 @@ def main() -> None:
     current_day_table_csv.to_csv(current_day_table_path, index=False)
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
-    save_current_day_plot(current_day_table, current_day_plot_path, args.local_timezone)
+    save_current_day_plot(
+        current_day_table,
+        current_day_plot_path,
+        args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+    )
     mae_forecast, mae_lstm, mae_n_points = compute_running_mae(current_day_table)
     archived_current_day_plot = None
     daily_mae_csv = None
@@ -1415,6 +1499,8 @@ def main() -> None:
         "prediction_anchor_time": inference_input_speed["anchor_time"],
         "reference_observation_time": inference_input_speed["reference_observation_time"],
         "prediction_day_start": inference_input_speed["prediction_day_start"],
+        "prediction_generated_at_utc": prediction_generated_at_utc,
+        "model_last_trained_at_utc": model_last_trained_at_utc,
         "y_scaler_mean_speed": float(speed_arrays["y_mean"][0]),
         "y_scaler_std_speed": float(speed_arrays["y_std"][0]),
         "y_scaler_mean_direction": float(direction_arrays["y_mean"][0]),

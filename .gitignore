@@ -5,6 +5,9 @@ __pycache__/
 # Local runtime data
 data/*.db
 *.log
+*.npy
+*.pt
+*.pth
 
 # Model/runtime artifacts (regenerated)
 next_day_wind_model/artifacts/

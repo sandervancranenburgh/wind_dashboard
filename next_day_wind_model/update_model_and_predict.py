@@ -11,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 import torch
@@ -1131,7 +1132,7 @@ def maybe_archive_current_day_plot(
     return str(archived_path)
 
 
-def save_daily_mae_plot(history_csv: Path, plot_png: Path) -> None:
+def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Europe/Amsterdam") -> None:
     if not history_csv.exists():
         return
     hist = pd.read_csv(history_csv)
@@ -1147,16 +1148,94 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path) -> None:
         hist["mae_forecast"] = hist["mse_forecast"]
     if "mae_lstm" not in hist.columns and "mse_lstm" in hist.columns:
         hist["mae_lstm"] = hist["mse_lstm"]
+    hist["mae_forecast"] = pd.to_numeric(hist["mae_forecast"], errors="coerce")
+    hist["mae_lstm"] = pd.to_numeric(hist["mae_lstm"], errors="coerce")
+    hist = hist.dropna(subset=["mae_forecast", "mae_lstm"])
+    if hist.empty:
+        return
+
+    # If multiple runs exist for a day, plot the average daily MAE.
+    hist["day"] = hist["date"].dt.floor("D")
+    hist_daily = hist.groupby("day", as_index=False)[["mae_forecast", "mae_lstm"]].mean(numeric_only=True)
 
     fig, ax = plt.subplots(figsize=(10, 4.8))
-    ax.plot(hist["date"], hist["mae_forecast"], marker="o", linewidth=1.8, label="Forecast MAE")
-    ax.plot(hist["date"], hist["mae_lstm"], marker="o", linewidth=1.8, label="LSTM MAE")
+    now_local = datetime.now(ZoneInfo(local_tz))
+    month_start_current = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    if month_start_current.month == 12:
+        next_month = month_start_current.replace(year=month_start_current.year + 1, month=1)
+    else:
+        next_month = month_start_current.replace(month=month_start_current.month + 1)
+    month_end_current = next_month - timedelta(days=1)
+
+    first_day = hist_daily["day"].min().to_pydatetime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    x_start = pd.Timestamp(first_day)
+    x_end = pd.Timestamp(month_end_current)
+
+    # Alternate monthly background shading for readability over multi-month history.
+    shade_idx = 0
+    cursor = pd.Timestamp(first_day)
+    while cursor <= x_end:
+        if cursor.month == 12:
+            month_next = cursor.replace(year=cursor.year + 1, month=1, day=1)
+        else:
+            month_next = cursor.replace(month=cursor.month + 1, day=1)
+        month_end = month_next - pd.Timedelta(days=1)
+        if shade_idx % 2 == 1:
+            ax.axvspan(cursor, month_end + pd.Timedelta(hours=23, minutes=59), color="0.8", alpha=0.18, zorder=0)
+        shade_idx += 1
+        cursor = month_next
+
+    if not hist_daily.empty:
+        ax.plot(
+            hist_daily["day"],
+            hist_daily["mae_lstm"],
+            linewidth=2.2,
+            color=LSTM_HIGHLIGHT_COLOR,
+            label="Super local vs measured wind",
+        )
+        ax.plot(
+            hist_daily["day"],
+            hist_daily["mae_forecast"],
+            linewidth=1.8,
+            color="gray",
+            label="Harmonie vs measured wind",
+        )
     ax.set_title("Daily End-of-Day MAE")
     ax.set_xlabel("Date")
     ax.set_ylabel("MAE (kts)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left")
-    fig.autofmt_xdate(rotation=35, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    if not hist_daily.empty:
+        ax.legend(loc="upper left")
+    y_top_data = float(np.nanmax([hist_daily["mae_forecast"].max(), hist_daily["mae_lstm"].max()])) if not hist_daily.empty else 0.0
+    y_top = max(4.0, y_top_data * 1.06)
+    ax.set_ylim(0.0, y_top)
+    ax.margins(x=0, y=0)
+    ax.set_xlim(x_start, x_end)
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    if hist_daily.empty:
+        avg_text = "Average MAE in shown period\nSuper local: n/a\nHarmonie: n/a"
+    else:
+        avg_lstm = float(hist_daily["mae_lstm"].mean())
+        avg_fc = float(hist_daily["mae_forecast"].mean())
+        avg_text = (
+            "Average MAE in shown period\n"
+            f"Super local: {avg_lstm:.2f} kts\n"
+            f"Harmonie: {avg_fc:.2f} kts"
+        )
+    ax.text(
+        0.985,
+        1.02,
+        avg_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        color="black",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    )
+    ax.set_title("Mean Average Prediction Error")
+    fig.autofmt_xdate(rotation=25, ha="right")
     fig.tight_layout()
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
@@ -1235,7 +1314,7 @@ def maybe_save_daily_mae(
     hist.to_csv(history_csv, index=False)
 
     history_png = out_dir / "daily_mae_history.png"
-    save_daily_mae_plot(history_csv, history_png)
+    save_daily_mae_plot(history_csv, history_png, local_tz=local_tz)
     return str(history_csv), str(history_png)
 
 
@@ -1716,6 +1795,11 @@ def main() -> None:
             fallback_csv = out_dir / "daily_mae_history.csv"
             if fallback_csv.exists():
                 daily_mae_csv_src = fallback_csv
+        # Always refresh daily MAE plot from CSV when available, not only after end-of-day save.
+        if daily_mae_csv_src is not None:
+            daily_mae_png_refresh = out_dir / "daily_mae_history.png"
+            save_daily_mae_plot(daily_mae_csv_src, daily_mae_png_refresh, local_tz=args.local_timezone)
+            daily_mae_png_src = daily_mae_png_refresh
         web_publish = publish_web_dashboard(
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,

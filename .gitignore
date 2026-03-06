@@ -11,6 +11,9 @@ data/*.db
 
 # Model/runtime artifacts (regenerated)
 next_day_wind_model/artifacts/
+next_day_wind_model/artifacts/*.npy
+next_day_wind_model/artifacts/*.pt
+next_day_wind_model/artifacts/*.pth
 next_day_wind_model/web_dashboard/*.csv
 next_day_wind_model/web_dashboard/*.png
 data/*.csv

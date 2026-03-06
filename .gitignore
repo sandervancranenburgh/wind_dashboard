@@ -10,3 +10,4 @@ data/*.db
 next_day_wind_model/artifacts/
 next_day_wind_model/web_dashboard/*.csv
 next_day_wind_model/web_dashboard/*.png
+data/*.csv

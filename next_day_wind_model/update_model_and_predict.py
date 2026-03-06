@@ -21,7 +21,6 @@ from data_pipeline import (
     DatasetConfig,
     _angle_add_deg,
     _build_forecast_feature_frame,
-    _load_observations,
     _apply_standardizer,
     build_all_direction_training_arrays,
     build_all_training_arrays,
@@ -71,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Testing only: override local current hour (0-23) for current-day plot logic.",
+    )
+    parser.add_argument(
+        "--current-day-interval-minutes",
+        type=int,
+        default=6,
+        help="Sampling interval (minutes) for current-day plot/MAE using raw observations.",
     )
     parser.add_argument(
         "--skip-data-refresh-check",
@@ -421,6 +426,57 @@ def _apply_speed_background(ax: plt.Axes, y_top: float, x_left: float, x_right: 
     )
 
 
+def _load_observations_raw(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
+    query = """
+    SELECT ts, wind_speed, wind_dir, payload
+    FROM observations
+    WHERE site = ?
+      AND ts IS NOT NULL
+    ORDER BY ts
+    """
+    rows = conn.execute(query, (site,)).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["actual_avg", "actual_dir"])
+
+    records: list[dict] = []
+    for ts, wind_speed, wind_dir, payload_raw in rows:
+        payload = {}
+        if payload_raw:
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                payload = {}
+        avg = payload.get("AverageWind")
+        if avg is None:
+            avg = payload.get("WindSpeedAvg")
+        if avg is None:
+            avg = wind_speed
+        direc = payload.get("WindDirection")
+        if direc is None:
+            direc = wind_dir
+        try:
+            avg_f = float(avg) if avg is not None else np.nan
+        except (TypeError, ValueError):
+            avg_f = np.nan
+        try:
+            dir_f = float(direc) if direc is not None else np.nan
+        except (TypeError, ValueError):
+            dir_f = np.nan
+        records.append({"obs_ts": int(ts), "actual_avg": avg_f, "actual_dir": dir_f})
+
+    out = pd.DataFrame.from_records(records)
+    out["obs_dt"] = pd.to_datetime(out["obs_ts"], unit="ms", utc=True)
+    out = out.set_index("obs_dt").sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out[["actual_avg", "actual_dir"]]
+
+
+def _interp_hourly_to_dense(hourly_values: np.ndarray, hourly_index: pd.DatetimeIndex, dense_index: pd.DatetimeIndex) -> np.ndarray:
+    s = pd.Series(hourly_values, index=hourly_index, dtype=float)
+    dense = s.reindex(s.index.union(dense_index)).sort_index().interpolate(method="time").reindex(dense_index)
+    return dense.to_numpy(dtype=np.float32)
+
+
 def _smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
     """Gentle centered rolling mean for plotting; preserves NaN gaps."""
     arr = np.asarray(values, dtype=float)
@@ -449,18 +505,32 @@ def _parse_iso_utc(ts: str | None) -> datetime | None:
     return dt
 
 
-def _format_plot_meta_text(prediction_generated_at_utc: str, model_trained_at_utc: str | None) -> str:
+def _format_plot_meta_text(
+    prediction_generated_at_utc: str,
+    prediction_updated_at_utc: str | None,
+    model_trained_at_utc: str | None,
+    local_tz: str,
+) -> str:
     pred_dt = _parse_iso_utc(prediction_generated_at_utc)
+    pred_upd_dt = _parse_iso_utc(prediction_updated_at_utc)
     train_dt = _parse_iso_utc(model_trained_at_utc)
-    pred_txt = pred_dt.strftime("%H:%M") if pred_dt is not None else "unknown"
-    train_txt = f"{train_dt.day} {train_dt.strftime('%B %H:%M')}" if train_dt is not None else "unknown"
-    return f"Last plot update: {pred_txt}\nLast model training: {train_txt}"
+    tz = ZoneInfo(local_tz)
+    pred_txt = pred_dt.astimezone(tz).strftime("%H:%M") if pred_dt is not None else "unknown"
+    pred_upd_txt = pred_upd_dt.astimezone(tz).strftime("%H:%M") if pred_upd_dt is not None else "unknown"
+    train_txt = (
+        f"{train_dt.astimezone(tz).day} {train_dt.astimezone(tz).strftime('%B %H:%M')}"
+        if train_dt is not None
+        else "unknown"
+    )
+    return f"Last plot update: {pred_txt}\nLast prediction update: {pred_upd_txt}\nLast model training: {train_txt}"
 
 
 def save_prediction_plot(
     table: pd.DataFrame,
     plot_path: Path,
+    local_tz: str,
     prediction_generated_at_utc: str,
+    prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
 ) -> None:
     table = table.copy()
@@ -517,7 +587,7 @@ def save_prediction_plot(
     ax.text(
         0.015,
         1.13,
-        _format_plot_meta_text(prediction_generated_at_utc, model_trained_at_utc),
+        _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -568,6 +638,7 @@ def build_current_day_table(
     speed_constraint_eps: float | None,
     local_tz: str,
     test_now_local_hour: int | None,
+    current_day_interval_minutes: int,
     device: torch.device,
 ) -> pd.DataFrame:
     def _predict_residuals_for_targets(
@@ -638,25 +709,20 @@ def build_current_day_table(
     now_hour_local = now_local.replace(minute=0, second=0, microsecond=0)
     day_start_local = now_hour_local.replace(hour=0)
     day_end_local = day_start_local + timedelta(hours=23)
+    interval_min = int(current_day_interval_minutes)
+    if interval_min <= 0 or 60 % interval_min != 0:
+        raise ValueError("--current-day-interval-minutes must be a positive divisor of 60.")
 
-    # Build forecast frame (UTC indexed) and observations (UTC indexed), then convert to local timezone.
+    # Build forecast frame (UTC indexed) and raw observations, then convert to local timezone.
     forecast_frame_utc = _build_forecast_feature_frame(db_path, cfg)
     conn = sqlite3.connect(str(db_path))
     try:
-        obs_hourly_utc = _load_observations(conn, cfg.site)
+        obs_raw_utc = _load_observations_raw(conn, cfg.site)
     finally:
         conn.close()
 
     forecast_frame_local = forecast_frame_utc.tz_convert(tz)
-    obs_hourly_local = obs_hourly_utc.tz_convert(tz)
-
-    # Actuals for today up to current hour.
-    actual_today = obs_hourly_local[
-        (obs_hourly_local.index >= day_start_local) & (obs_hourly_local.index <= now_hour_local)
-    ]["actual_avg"]
-    actual_dir_today = obs_hourly_local[
-        (obs_hourly_local.index >= day_start_local) & (obs_hourly_local.index <= now_hour_local)
-    ]["actual_dir"]
+    obs_raw_local = obs_raw_utc.tz_convert(tz)
 
     # Remaining hours today (prediction target): next hour .. 23:00 local.
     remaining_local = pd.date_range(
@@ -667,38 +733,15 @@ def build_current_day_table(
     )
     remaining_n = len(remaining_local)
 
-    # If day is effectively finished, return actual-only table for today.
-    if remaining_n == 0:
-        full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
-        fc_re = forecast_frame_local.reindex(full_hours)
-        fc_avg = fc_re["forecast_avg"].to_numpy(dtype=np.float32)
-        fc_min = fc_re["forecast_min"].to_numpy(dtype=np.float32)
-        fc_max = fc_re["forecast_max"].to_numpy(dtype=np.float32)
-        fc_min = np.where(np.isnan(fc_min), fc_avg, fc_min).astype(np.float32)
-        fc_max = np.where(np.isnan(fc_max), fc_avg, fc_max).astype(np.float32)
-        fc_low = np.minimum(fc_min, fc_max)
-        fc_high = np.maximum(fc_min, fc_max)
-        table = pd.DataFrame(
-            {
-                "time_local": full_hours,
-                "forecast_wind_speed": fc_avg,
-                "forecast_wind_min": fc_low,
-                "forecast_wind_max": fc_high,
-                "lstm_pred_wind_speed": np.full(len(full_hours), np.nan, dtype=np.float32),
-                "actual_wind_speed": actual_today.reindex(full_hours).to_numpy(dtype=np.float32),
-                "forecast_wind_dir_deg": fc_re["forecast_dir"].to_numpy(dtype=np.float32),
-                "lstm_pred_wind_dir_deg": np.full(len(full_hours), np.nan, dtype=np.float32),
-                "actual_wind_dir_deg": actual_dir_today.reindex(full_hours).to_numpy(dtype=np.float32),
-            }
-        )
-        table["hour_local"] = table["time_local"].dt.strftime("%H")
-        return table
-
     # Full-day context prediction (00..23) based on day-start anchor.
     full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
     lstm_speed_full, lstm_dir_full = _predict_residuals_for_targets(full_hours)
     # Remaining-day best prediction (next hour..23) based on current anchor.
-    lstm_speed_rem, lstm_dir_rem = _predict_residuals_for_targets(remaining_local)
+    if remaining_n > 0:
+        lstm_speed_rem, lstm_dir_rem = _predict_residuals_for_targets(remaining_local)
+    else:
+        lstm_speed_rem = np.array([], dtype=np.float32)
+        lstm_dir_rem = np.array([], dtype=np.float32)
 
     fc_today = forecast_frame_local.reindex(full_hours)
     fc_min = fc_today["forecast_min"].to_numpy(dtype=np.float32)
@@ -708,25 +751,91 @@ def build_current_day_table(
     fc_max = np.where(np.isnan(fc_max), fc_avg, fc_max).astype(np.float32)
     fc_low = np.minimum(fc_min, fc_max)
     fc_high = np.maximum(fc_min, fc_max)
+    dense_end = day_end_local + timedelta(minutes=(60 - interval_min))
+    dense_times = pd.date_range(
+        start=day_start_local,
+        end=dense_end,
+        freq=f"{interval_min}min",
+        tz=tz,
+    )
+
+    # Forecast/LSTM hourly values -> dense timeline for plotting and MAE at higher cadence.
+    fc_speed_dense = _interp_hourly_to_dense(fc_avg, full_hours, dense_times)
+    fc_min_dense = _interp_hourly_to_dense(fc_low, full_hours, dense_times)
+    fc_max_dense = _interp_hourly_to_dense(fc_high, full_hours, dense_times)
+    fc_dir_dense = _interp_hourly_to_dense(fc_today["forecast_dir"].to_numpy(dtype=np.float32), full_hours, dense_times)
+    lstm_full_dense = _interp_hourly_to_dense(lstm_speed_full.astype(np.float32), full_hours, dense_times)
+    lstm_dir_full_dense = _interp_hourly_to_dense(lstm_dir_full.astype(np.float32), full_hours, dense_times)
+
+    rem_hourly_speed = pd.Series(np.nan, index=full_hours, dtype=float)
+    rem_hourly_dir = pd.Series(np.nan, index=full_hours, dtype=float)
+    if remaining_n > 0:
+        rem_hourly_speed.loc[remaining_local] = lstm_speed_rem.astype(np.float32)
+        rem_hourly_dir.loc[remaining_local] = lstm_dir_rem.astype(np.float32)
+        # Add continuity point at the boundary for a continuous future line.
+        prev_hour = remaining_local[0] - timedelta(hours=1)
+        if prev_hour in rem_hourly_speed.index:
+            rem_hourly_speed.loc[prev_hour] = float(
+                lstm_speed_full[np.where(full_hours == prev_hour)[0][0]]
+            )
+            rem_hourly_dir.loc[prev_hour] = float(
+                lstm_dir_full[np.where(full_hours == prev_hour)[0][0]]
+            )
+    rem_dense_speed = (
+        rem_hourly_speed.reindex(rem_hourly_speed.index.union(dense_times))
+        .sort_index()
+        .interpolate(method="time")
+        .reindex(dense_times)
+        .to_numpy(dtype=np.float32)
+    )
+    rem_dense_dir = (
+        rem_hourly_dir.reindex(rem_hourly_dir.index.union(dense_times))
+        .sort_index()
+        .interpolate(method="time")
+        .reindex(dense_times)
+        .to_numpy(dtype=np.float32)
+    )
+
+    # Actual measurements at higher cadence (latest known values up to now).
+    actual_day_raw = obs_raw_local[(obs_raw_local.index >= day_start_local) & (obs_raw_local.index <= now_local)]
+    actual_speed_dense = (
+        actual_day_raw["actual_avg"]
+        .reindex(actual_day_raw.index.union(dense_times))
+        .sort_index()
+        .ffill()
+        .reindex(dense_times)
+        .to_numpy(dtype=np.float32)
+    )
+    actual_dir_dense = (
+        actual_day_raw["actual_dir"]
+        .reindex(actual_day_raw.index.union(dense_times))
+        .sort_index()
+        .ffill()
+        .reindex(dense_times)
+        .to_numpy(dtype=np.float32)
+    )
+    actual_speed_dense = np.where(dense_times <= now_local, actual_speed_dense, np.nan).astype(np.float32)
+    actual_dir_dense = np.where(dense_times <= now_local, actual_dir_dense, np.nan).astype(np.float32)
+
     table = pd.DataFrame(
         {
-            "time_local": full_hours,
-            "forecast_wind_speed": fc_avg,
-            "forecast_wind_min": fc_low,
-            "forecast_wind_max": fc_high,
-            "forecast_wind_dir_deg": fc_today["forecast_dir"].to_numpy(dtype=np.float32),
-            "actual_wind_speed": actual_today.reindex(full_hours).to_numpy(dtype=np.float32),
-            "actual_wind_dir_deg": actual_dir_today.reindex(full_hours).to_numpy(dtype=np.float32),
-            "lstm_pred_wind_speed_full": lstm_speed_full.astype(np.float32),
-            "lstm_pred_wind_dir_deg_full": lstm_dir_full.astype(np.float32),
-            "lstm_pred_wind_speed": np.full(len(full_hours), np.nan, dtype=np.float32),
-            "lstm_pred_wind_dir_deg": np.full(len(full_hours), np.nan, dtype=np.float32),
+            "time_local": dense_times,
+            "forecast_wind_speed": fc_speed_dense,
+            "forecast_wind_min": fc_min_dense,
+            "forecast_wind_max": fc_max_dense,
+            "forecast_wind_dir_deg": fc_dir_dense,
+            "actual_wind_speed": actual_speed_dense,
+            "actual_wind_dir_deg": actual_dir_dense,
+            "lstm_pred_wind_speed_full": lstm_full_dense,
+            "lstm_pred_wind_dir_deg_full": lstm_dir_full_dense,
+            "lstm_pred_wind_speed": rem_dense_speed,
+            "lstm_pred_wind_dir_deg": rem_dense_dir,
         }
     )
-    rem_mask = table["time_local"].isin(remaining_local)
-    table.loc[rem_mask, "lstm_pred_wind_speed"] = lstm_speed_rem.astype(np.float32)
-    table.loc[rem_mask, "lstm_pred_wind_dir_deg"] = lstm_dir_rem.astype(np.float32)
+    future_start = now_hour_local + timedelta(hours=1)
+    table["is_future"] = table["time_local"] >= future_start
     table["hour_local"] = table["time_local"].dt.strftime("%H")
+    table["minute_local"] = table["time_local"].dt.minute
     return table
 
 
@@ -735,6 +844,7 @@ def save_current_day_plot(
     plot_path: Path,
     local_tz: str,
     prediction_generated_at_utc: str,
+    prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
 ) -> None:
     table = table.copy()
@@ -763,7 +873,6 @@ def save_current_day_plot(
     y_upper = y_max + pad
 
     fig, ax = plt.subplots(figsize=(14, 7.2))
-    marker_size = 3.0
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
@@ -792,7 +901,7 @@ def save_current_day_plot(
         x,
         actual_avg,
         marker="o",
-        markersize=marker_size,
+        markersize=2.2,
         color="magenta",
         linewidth=2.2,
         label="Wind speed - measured",
@@ -800,7 +909,7 @@ def save_current_day_plot(
     )
 
     # Vertical line at present hour boundary (first predicted hour).
-    future_idx = np.where(~np.isnan(table["lstm_pred_wind_speed"].to_numpy(dtype=float)))[0]
+    future_idx = np.where(table["is_future"].to_numpy(dtype=bool))[0]
 
     # LSTM past segment (dashed): full-day context up to current time.
     lstm_past = table["lstm_pred_wind_speed_full"].to_numpy(dtype=float).copy()
@@ -832,36 +941,58 @@ def save_current_day_plot(
     ax.set_xlabel("Time")
     ax.set_ylabel("Wind speed (kts)")
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0)
-    ax.set_xticks(x, table["hour_local"], rotation=0)
+    handles, labels = ax.get_legend_handles_labels()
+    desired_order = [
+        "Super local wind prediction - avg speed",
+        "Wind speed - measured",
+        "Harmonie model - avg speed",
+        "Harmonie model - max speed",
+    ]
+    order_map = {label: handle for handle, label in zip(handles, labels)}
+    ordered_handles = [order_map[label] for label in desired_order if label in order_map]
+    ordered_labels = [label for label in desired_order if label in order_map]
+    ax.legend(
+        ordered_handles,
+        ordered_labels,
+        loc="upper left",
+        bbox_to_anchor=(0.015, 0.99),
+        borderaxespad=0.0,
+    )
+    hour_tick_mask = table["time_local"].dt.minute.eq(0)
+    tick_pos = np.where(hour_tick_mask.to_numpy())[0]
+    tick_lbl = table.loc[hour_tick_mask, "time_local"].dt.strftime("%H").to_list()
+    ax.set_xticks(tick_pos, tick_lbl, rotation=0)
     ax.set_xlim(0.0, len(table) - 1.0)
     ax.set_ylim(y_lower, y_upper)
 
-    if len(future_idx) > 0:
-        ax.axvline(future_idx[0] - 0.5, color="gray", linestyle="--", linewidth=1.0)
+    actual_idx = np.where(~np.isnan(actual_avg))[0]
+    if len(actual_idx) > 0:
+        # Mark "now" at the latest available measured point on the dense timeline.
+        ax.axvline(float(actual_idx[-1]), color="gray", linestyle="--", linewidth=1.0)
 
     mae_fc, mae_lstm, _ = compute_running_mae(table)
     mse_text = (
-        f"Running MAE up to now\n"
-        f"Forecast vs actual: {mae_fc:.2f} kts\n"
-        f"LSTM vs actual: {mae_lstm:.2f} kts"
+        f"Running mean absolute error\n"
+        f"Super local vs measured wind: {mae_lstm:.2f} kts\n"
+        f"Harmonie vs measured wind: {mae_fc:.2f} kts"
     )
     ax.text(
-        0.015,
-        0.03,
+        0.985,
+        1.13,
         mse_text,
         transform=ax.transAxes,
-        ha="left",
-        va="bottom",
+        ha="right",
+        va="top",
         fontsize=10,
         color="black",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
         zorder=7,
+        clip_on=False,
     )
     ax.text(
         0.015,
         1.13,
-        _format_plot_meta_text(prediction_generated_at_utc, model_trained_at_utc),
+        _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -873,7 +1004,17 @@ def save_current_day_plot(
     # Direction arrows below axis for forecast, LSTM (remaining where available, else full-day context), and actual.
     y_base_axes = -0.14
     arrow_len_axes = 0.065
-    for i, row in table.iterrows():
+    if len(table) >= 2:
+        step_min = max(
+            1,
+            int(round((table["time_local"].iloc[1] - table["time_local"].iloc[0]).total_seconds() / 60.0)),
+        )
+    else:
+        step_min = 6
+    points_per_hour = max(1.0, 60.0 / step_min)
+    arrow_dx_scale = 0.22 * points_per_hour
+    arrow_rows = table[table["time_local"].dt.minute.eq(0)]
+    for i, row in arrow_rows.iterrows():
         fdir = row["forecast_wind_dir_deg"]
         ldir = row["lstm_pred_wind_dir_deg"]
         adir = row["actual_wind_dir_deg"]
@@ -883,7 +1024,7 @@ def save_current_day_plot(
             if pd.isna(direction_deg):
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
-            dx = 0.22 * np.sin(theta)
+            dx = arrow_dx_scale * np.sin(theta)
             dy = arrow_len_axes * np.cos(theta)
             ax.annotate(
                 "",
@@ -1493,10 +1634,14 @@ def main() -> None:
 
     plot_path = out_dir / "next_day_predictions.png"
     prediction_generated_at_utc = datetime.now(timezone.utc).isoformat()
+    prediction_update_local = datetime.now(ZoneInfo(args.local_timezone)).replace(minute=0, second=0, microsecond=0)
+    prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
     save_prediction_plot(
         table,
         plot_path,
+        local_tz=args.local_timezone,
         prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
     )
 
@@ -1517,6 +1662,7 @@ def main() -> None:
         speed_constraint_eps=speed_constraint_eps,
         local_tz=args.local_timezone,
         test_now_local_hour=args.test_now_local_hour,
+        current_day_interval_minutes=args.current_day_interval_minutes,
         device=device,
     )
     is_test_mode = args.test_now_local_hour is not None
@@ -1533,6 +1679,7 @@ def main() -> None:
         current_day_plot_path,
         args.local_timezone,
         prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
     )
     mae_forecast, mae_lstm, mae_n_points = compute_running_mae(current_day_table)
@@ -1624,6 +1771,7 @@ def main() -> None:
         "reference_observation_time": inference_input_speed["reference_observation_time"],
         "prediction_day_start": inference_input_speed["prediction_day_start"],
         "prediction_generated_at_utc": prediction_generated_at_utc,
+        "prediction_updated_at_utc": prediction_updated_at_utc,
         "model_last_trained_at_utc": model_last_trained_at_utc,
         "y_scaler_mean_speed": float(speed_arrays["y_mean"][0]),
         "y_scaler_std_speed": float(speed_arrays["y_std"][0]),
@@ -1646,6 +1794,7 @@ def main() -> None:
         "expected_update_hour_utc": args.expected_update_hour_utc,
         "validation_split": args.validation_split,
         "local_timezone": args.local_timezone,
+        "current_day_interval_minutes": args.current_day_interval_minutes,
         "test_now_local_hour": args.test_now_local_hour,
     }
     metadata_path = out_dir / ("metadata_update.json" if not is_test_mode else f"metadata_update{test_suffix}.json")

@@ -1,5 +1,5 @@
 {
-  "trained_at_utc": "2026-03-06T09:10:15.079837+00:00",
+  "trained_at_utc": "2026-03-06T09:14:02.256435+00:00",
   "db_path": "/home/sandervancranenburgh/Documents/repos/wind_fetcher2/data/wind_data.db",
   "site": "valkenburgsemeer",
   "forecast_model": "HARMONIE",
@@ -34,7 +34,7 @@
   "prediction_anchor_time": "2026-03-06T23:00:00+00:00",
   "reference_observation_time": "2026-03-06T09:01:24+00:00",
   "prediction_day_start": "2026-03-07T00:00:00+00:00",
-  "prediction_generated_at_utc": "2026-03-06T09:10:12.699223+00:00",
+  "prediction_generated_at_utc": "2026-03-06T09:13:59.875829+00:00",
   "model_last_trained_at_utc": "2026-03-06T06:15:27.544004+00:00",
   "y_scaler_mean_speed": -0.3818848133087158,
   "y_scaler_std_speed": 0.5730589628219604,
@@ -56,6 +56,11 @@
     "daily_mae_history.png": "docs/daily_mae_history.png",
     "daily_mae_history.csv": "docs/daily_mae_history.csv",
     "index.html": "docs/index.html"
+  },
+  "web_dashboard_git_publish": {
+    "enabled": false,
+    "pushed": false,
+    "reason": "disabled"
   },
   "speed_model_path": "next_day_wind_model/artifacts/next_day_lstm_speed_residual.pt",
   "direction_model_path": "next_day_wind_model/artifacts/next_day_lstm_direction_residual.pt",

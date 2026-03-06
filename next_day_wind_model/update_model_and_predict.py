@@ -102,6 +102,13 @@ def parse_args() -> argparse.Namespace:
         default=900,
         help="Auto-refresh interval for dashboard HTML.",
     )
+    parser.add_argument(
+        "--git-auto-push-pages",
+        action="store_true",
+        help="Auto-commit and push web dashboard folder changes to GitHub.",
+    )
+    parser.add_argument("--git-remote", default="origin", help="Git remote name for auto-push.")
+    parser.add_argument("--git-branch", default="main", help="Git branch name for auto-push.")
     return parser.parse_args()
 
 
@@ -1170,6 +1177,109 @@ def publish_web_dashboard(
     return copied
 
 
+def auto_push_dashboard_changes(
+    repo_root: Path,
+    web_out_dir: Path,
+    remote: str,
+    branch: str,
+) -> dict:
+    if not (repo_root / ".git").exists():
+        return {"enabled": True, "pushed": False, "reason": "not_a_git_repo"}
+
+    try:
+        rel_web_dir = web_out_dir.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return {"enabled": True, "pushed": False, "reason": "web_out_dir_outside_repo"}
+
+    rel_web_dir_s = str(rel_web_dir)
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain", "--", rel_web_dir_s],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_status_failed:{exc.returncode}"}
+    if status.stdout.strip() == "":
+        return {"enabled": True, "pushed": False, "reason": "no_changes"}
+
+    # Safety: if the index already contains staged files outside dashboard path, don't auto-commit.
+    try:
+        staged_all = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_staged_check_failed:{exc.returncode}"}
+    staged_paths = [p.strip() for p in staged_all.stdout.splitlines() if p.strip()]
+    outside = [
+        p
+        for p in staged_paths
+        if not (p == rel_web_dir_s or p.startswith(rel_web_dir_s + "/"))
+    ]
+    if outside:
+        return {
+            "enabled": True,
+            "pushed": False,
+            "reason": "staged_changes_outside_web_dir",
+            "outside_count": len(outside),
+            "outside_sample": outside[:5],
+        }
+
+    try:
+        subprocess.run(["git", "-C", str(repo_root), "add", "--", rel_web_dir_s], check=True)
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_add_failed:{exc.returncode}"}
+
+    try:
+        staged = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only", "--", rel_web_dir_s],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_staged_web_check_failed:{exc.returncode}"}
+    if staged.stdout.strip() == "":
+        return {"enabled": True, "pushed": False, "reason": "nothing_staged"}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    commit_msg = f"auto: update dashboard artifacts ({stamp})"
+    try:
+        subprocess.run(["git", "-C", str(repo_root), "commit", "-m", commit_msg, "--", rel_web_dir_s], check=True)
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_commit_failed:{exc.returncode}"}
+    try:
+        subprocess.run(["git", "-C", str(repo_root), "push", remote, branch], check=True)
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_push_failed:{exc.returncode}"}
+
+    try:
+        commit_hash = (
+            subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+        )
+    except subprocess.CalledProcessError:
+        commit_hash = "unknown"
+    return {
+        "enabled": True,
+        "pushed": True,
+        "reason": "",
+        "remote": remote,
+        "branch": branch,
+        "commit": commit_hash,
+        "path": rel_web_dir_s,
+    }
+
+
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -1442,6 +1552,7 @@ def main() -> None:
         )
 
     web_publish = None
+    git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode:
         daily_mae_png_src = None if daily_mae_png is None else Path(daily_mae_png)
         daily_mae_csv_src = None if daily_mae_csv is None else Path(daily_mae_csv)
@@ -1464,6 +1575,14 @@ def main() -> None:
             daily_mae_png=daily_mae_png_src,
             daily_mae_csv=daily_mae_csv_src,
         )
+        if args.git_auto_push_pages:
+            repo_root = Path(__file__).resolve().parents[1]
+            git_publish = auto_push_dashboard_changes(
+                repo_root=repo_root,
+                web_out_dir=Path(args.web_out_dir),
+                remote=args.git_remote,
+                branch=args.git_branch,
+            )
 
     metadata = {
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1514,6 +1633,7 @@ def main() -> None:
         "daily_mae_history_png": daily_mae_png,
         "web_dashboard_dir": None if web_publish is None else str(Path(args.web_out_dir).resolve()),
         "web_dashboard_files": web_publish,
+        "web_dashboard_git_publish": git_publish,
         "speed_model_path": str(speed_model_path),
         "direction_model_path": str(direction_model_path),
         "data_refresh": refresh_info,
@@ -1543,6 +1663,14 @@ def main() -> None:
         print(f"Daily MAE history plot saved to: {daily_mae_png}")
     if web_publish is not None:
         print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
+    if args.git_auto_push_pages:
+        if git_publish.get("pushed"):
+            print(
+                "Web dashboard pushed to git: "
+                f"{git_publish.get('remote')}/{git_publish.get('branch')} @ {git_publish.get('commit')}"
+            )
+        else:
+            print(f"Web dashboard git push skipped: {git_publish.get('reason')}")
     print()
     print(table_for_csv.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
 

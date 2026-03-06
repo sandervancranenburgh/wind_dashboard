@@ -3,4 +3,4 @@ date,run_local_time,mae_forecast,mae_lstm,n_points,details_csv
 2026-03-03,2026-03-03T22:25:05.722906+01:00,2.353571952523097,2.2447484665266844,23,next_day_wind_model/artifacts/daily_error_details/20260303_actual_forecast_lstm.csv
 2026-03-04,2026-03-04T22:25:05.476584+01:00,1.7869215918623882,0.9381864666938782,23,next_day_wind_model/artifacts/daily_error_details/20260304_actual_forecast_lstm.csv
 2026-03-05,2026-03-05T22:25:06.284547+01:00,2.597858014314071,1.1976075587065325,23,next_day_wind_model/artifacts/daily_error_details/20260305_actual_forecast_lstm.csv
-2026-03-06,2026-03-06T22:02:06.647595+01:00,1.9913636391813105,1.2720192340287295,220,next_day_wind_model/artifacts/daily_error_details/20260306_actual_forecast_lstm.csv
+2026-03-06,2026-03-06T22:08:06.554418+01:00,1.987330319115479,1.2693576613162978,221,next_day_wind_model/artifacts/daily_error_details/20260306_actual_forecast_lstm.csv

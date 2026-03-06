@@ -30,6 +30,9 @@ from data_pipeline import (
 from train_lstm import NextDayLSTM
 
 
+LSTM_HIGHLIGHT_COLOR = "#d7191c"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retrain residual models (speed + direction) on all data and output next-day predictions.",
@@ -494,9 +497,15 @@ def save_prediction_plot(
         label="_nolegend_",
         zorder=1,
     )
-    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Forecast max speed")
-    ax.plot(x, fc_avg, marker="o", markersize=marker_size, color="gray", label="Forecast avg speed")
-    ax.plot(x, lstm_avg, marker="o", markersize=marker_size, color="tab:blue", label="LSTM avg speed")
+    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Harmonie model - max speed")
+    ax.plot(x, fc_avg, color="gray", linewidth=1.5, label="Harmonie model - avg speed")
+    ax.plot(
+        x,
+        lstm_avg,
+        color=LSTM_HIGHLIGHT_COLOR,
+        linewidth=2.4,
+        label="Super local wind prediction - avg speed",
+    )
     ax.set_title(f"Next-Day Wind Speed ({day_label}, UTC)")
     ax.set_xlabel("Hour (UTC)")
     ax.set_ylabel("Wind speed (kts)")
@@ -523,7 +532,7 @@ def save_prediction_plot(
     y_base_axes = -0.14
     arrow_len_axes = 0.065
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
-        for direction_deg, color in [(fdir, "gray"), (ldir, "tab:blue")]:
+        for direction_deg, color in [(fdir, "gray"), (ldir, LSTM_HIGHLIGHT_COLOR)]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
             dy = arrow_len_axes * np.cos(theta)
@@ -771,15 +780,13 @@ def save_current_day_plot(
         label="_nolegend_",
         zorder=1,
     )
-    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Forecast max speed")
+    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Harmonie model - max speed")
     ax.plot(
         x,
         fc_avg,
-        marker="o",
-        markersize=marker_size,
         color="gray",
-        linewidth=2.0,
-        label="Forecast avg speed",
+        linewidth=1.5,
+        label="Harmonie model - avg speed",
     )
     ax.plot(
         x,
@@ -788,7 +795,7 @@ def save_current_day_plot(
         markersize=marker_size,
         color="magenta",
         linewidth=2.2,
-        label="Actual speed (up to now)",
+        label="Wind speed - measured",
         zorder=5,
     )
 
@@ -802,9 +809,9 @@ def save_current_day_plot(
     ax.plot(
         x,
         lstm_past,
-        color="tab:blue",
+        color=LSTM_HIGHLIGHT_COLOR,
         linestyle="--",
-        linewidth=1.6,
+        linewidth=2.0,
         alpha=0.9,
         label="_nolegend_",
     )
@@ -816,11 +823,9 @@ def save_current_day_plot(
     ax.plot(
         x,
         lstm_future,
-        marker="o",
-        markersize=marker_size,
-        color="tab:blue",
-        linewidth=2.0,
-        label="LSTM avg speed",
+        color=LSTM_HIGHLIGHT_COLOR,
+        linewidth=2.6,
+        label="Super local wind prediction - avg speed",
         zorder=3,
     )
     ax.set_title(f"Current-day wind prediction: {day_label}")
@@ -874,7 +879,7 @@ def save_current_day_plot(
         adir = row["actual_wind_dir_deg"]
         if pd.isna(ldir):
             ldir = row["lstm_pred_wind_dir_deg_full"]
-        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, "tab:blue", 4), (adir, "magenta", 6)]:
+        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, LSTM_HIGHLIGHT_COLOR, 4), (adir, "magenta", 6)]:
             if pd.isna(direction_deg):
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)

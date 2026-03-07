@@ -27,6 +27,13 @@ from data_pipeline import (
     build_all_training_arrays,
     build_next_day_inference_input,
 )
+from intraday_model import (
+    IntradayBundle,
+    load_intraday_model,
+    predict_intraday_day_speed,
+    save_intraday_model,
+    train_intraday_model,
+)
 from train_lstm import NextDayLSTM
 
 
@@ -44,6 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours for Y.")
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--intraday-epochs", type=int, default=50, help="Training epochs for intraday model.")
+    parser.add_argument("--intraday-hidden1", type=int, default=128, help="Intraday MLP first hidden size.")
+    parser.add_argument("--intraday-hidden2", type=int, default=64, help="Intraday MLP second hidden size.")
+    parser.add_argument("--intraday-dropout", type=float, default=0.1, help="Intraday MLP dropout.")
+    parser.add_argument("--intraday-learning-rate", type=float, default=1e-3, help="Intraday MLP Adam learning rate.")
+    parser.add_argument(
+        "--intraday-recency-power",
+        type=float,
+        default=1.0,
+        help="Recency weighting strength for intraday training (higher = more recent emphasis).",
+    )
     parser.add_argument(
         "--speed-constraint-eps",
         type=float,
@@ -631,6 +649,7 @@ def save_prediction_plot(
 def build_current_day_table(
     db_path: Path,
     cfg: DatasetConfig,
+    intraday_bundle: IntradayBundle,
     speed_model: nn.Module,
     direction_model: nn.Module,
     speed_scalers: dict,
@@ -724,6 +743,7 @@ def build_current_day_table(
 
     forecast_frame_local = forecast_frame_utc.tz_convert(tz)
     obs_raw_local = obs_raw_utc.tz_convert(tz)
+    obs_hourly_local = obs_raw_local.resample("1h").mean(numeric_only=True)
 
     # Remaining hours today (prediction target): next hour .. 23:00 local.
     remaining_local = pd.date_range(
@@ -734,15 +754,25 @@ def build_current_day_table(
     )
     remaining_n = len(remaining_local)
 
-    # Full-day context prediction (00..23) based on day-start anchor.
+    # Full-day context direction prediction (00..23) based on day-start anchor.
     full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
-    lstm_speed_full, lstm_dir_full = _predict_residuals_for_targets(full_hours)
+    _, lstm_dir_full = _predict_residuals_for_targets(full_hours)
     # Remaining-day best prediction (next hour..23) based on current anchor.
     if remaining_n > 0:
-        lstm_speed_rem, lstm_dir_rem = _predict_residuals_for_targets(remaining_local)
+        _, lstm_dir_rem = _predict_residuals_for_targets(remaining_local)
     else:
-        lstm_speed_rem = np.array([], dtype=np.float32)
         lstm_dir_rem = np.array([], dtype=np.float32)
+
+    # Dedicated intraday speed model: strongly conditions on recent actuals/residuals.
+    intraday_speed_full, intraday_speed_rem = predict_intraday_day_speed(
+        bundle=intraday_bundle,
+        forecast_frame_local=forecast_frame_local,
+        actual_hourly_local=obs_hourly_local["actual_avg"] if "actual_avg" in obs_hourly_local.columns else pd.Series(dtype=float),
+        day_start_local=day_start_local,
+        day_end_local=day_end_local,
+        now_hour_local=now_hour_local,
+        device=device,
+    )
 
     fc_today = forecast_frame_local.reindex(full_hours)
     fc_min = fc_today["forecast_min"].to_numpy(dtype=np.float32)
@@ -765,19 +795,20 @@ def build_current_day_table(
     fc_min_dense = _interp_hourly_to_dense(fc_low, full_hours, dense_times)
     fc_max_dense = _interp_hourly_to_dense(fc_high, full_hours, dense_times)
     fc_dir_dense = _interp_hourly_to_dense(fc_today["forecast_dir"].to_numpy(dtype=np.float32), full_hours, dense_times)
-    lstm_full_dense = _interp_hourly_to_dense(lstm_speed_full.astype(np.float32), full_hours, dense_times)
+    lstm_full_dense = _interp_hourly_to_dense(intraday_speed_full.astype(np.float32), full_hours, dense_times)
     lstm_dir_full_dense = _interp_hourly_to_dense(lstm_dir_full.astype(np.float32), full_hours, dense_times)
 
     rem_hourly_speed = pd.Series(np.nan, index=full_hours, dtype=float)
     rem_hourly_dir = pd.Series(np.nan, index=full_hours, dtype=float)
     if remaining_n > 0:
-        rem_hourly_speed.loc[remaining_local] = lstm_speed_rem.astype(np.float32)
+        rem_vals = pd.Series(intraday_speed_rem, index=full_hours, dtype=float).reindex(remaining_local).to_numpy(dtype=np.float32)
+        rem_hourly_speed.loc[remaining_local] = rem_vals
         rem_hourly_dir.loc[remaining_local] = lstm_dir_rem.astype(np.float32)
         # Add continuity point at the boundary for a continuous future line.
         prev_hour = remaining_local[0] - timedelta(hours=1)
         if prev_hour in rem_hourly_speed.index:
             rem_hourly_speed.loc[prev_hour] = float(
-                lstm_speed_full[np.where(full_hours == prev_hour)[0][0]]
+                intraday_speed_full[np.where(full_hours == prev_hour)[0][0]]
             )
             rem_hourly_dir.loc[prev_hour] = float(
                 lstm_dir_full[np.where(full_hours == prev_hour)[0][0]]
@@ -1547,6 +1578,7 @@ def main() -> None:
 
     speed_model_path = out_dir / "next_day_lstm_speed_residual.pt"
     direction_model_path = out_dir / "next_day_lstm_direction_residual.pt"
+    intraday_model_path = out_dir / "intraday_speed_residual.pt"
     speed_scalers_path = {
         "x_mean": out_dir / "x_mean_speed.npy",
         "x_std": out_dir / "x_std_speed.npy",
@@ -1559,13 +1591,21 @@ def main() -> None:
         "y_mean": out_dir / "y_mean_direction.npy",
         "y_std": out_dir / "y_std_direction.npy",
     }
+    intraday_hparams = {}
 
     if args.skip_training:
-        for p in [speed_model_path, direction_model_path, *speed_scalers_path.values(), *direction_scalers_path.values()]:
+        for p in [
+            speed_model_path,
+            direction_model_path,
+            intraday_model_path,
+            *speed_scalers_path.values(),
+            *direction_scalers_path.values(),
+        ]:
             if not p.exists():
                 raise FileNotFoundError(f"Missing artifact for --skip-training mode: {p}")
         speed_model, speed_ckpt = _load_model(speed_model_path, device)
         direction_model, direction_ckpt = _load_model(direction_model_path, device)
+        intraday_bundle, intraday_ckpt = load_intraday_model(intraday_model_path, device)
         speed_arrays = {k: np.load(v) for k, v in speed_scalers_path.items()}
         direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
         speed_target_mode = str(speed_ckpt.get("target_mode", "residual")).strip().lower()
@@ -1577,6 +1617,14 @@ def main() -> None:
         n_samples_all_speed = None
         n_samples_all_direction = None
         feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+        intraday_train_stats = None
+        intraday_hparams = {
+            "hidden1": intraday_ckpt.get("hidden1"),
+            "hidden2": intraday_ckpt.get("hidden2"),
+            "dropout": intraday_ckpt.get("dropout"),
+            "learning_rate": intraday_ckpt.get("learning_rate"),
+            "recency_power": intraday_ckpt.get("recency_power"),
+        }
     else:
         # --- Train constrained residual speed model (positive by construction) ---
         speed_arrays = build_all_training_arrays(db_path, cfg, target_mode="residual")
@@ -1626,6 +1674,20 @@ def main() -> None:
             device=device,
         )
 
+        intraday_bundle, intraday_train_stats = train_intraday_model(
+            db_path=db_path,
+            cfg=cfg,
+            device=device,
+            epochs=int(args.intraday_epochs),
+            batch_size=args.batch_size,
+            validation_split=args.validation_split,
+            hidden1=int(args.intraday_hidden1),
+            hidden2=int(args.intraday_hidden2),
+            dropout=float(args.intraday_dropout),
+            learning_rate=float(args.intraday_learning_rate),
+            recency_power=float(args.intraday_recency_power),
+        )
+
         _save_model(
             speed_model_path,
             speed_model,
@@ -1646,6 +1708,18 @@ def main() -> None:
             output_activation="linear",
             extra={"trained_at_utc": datetime.now(timezone.utc).isoformat()},
         )
+        save_intraday_model(
+            intraday_model_path,
+            intraday_bundle,
+            extra={
+                "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+                "hidden1": int(args.intraday_hidden1),
+                "hidden2": int(args.intraday_hidden2),
+                "dropout": float(args.intraday_dropout),
+                "learning_rate": float(args.intraday_learning_rate),
+                "recency_power": float(args.intraday_recency_power),
+            },
+        )
 
         np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
         np.save(speed_scalers_path["x_std"], speed_arrays["x_std"])
@@ -1660,6 +1734,13 @@ def main() -> None:
         feature_cols = speed_arrays["feature_cols"]
         direction_target_mode = "residual"
         model_last_trained_at_utc = datetime.now(timezone.utc).isoformat()
+        intraday_hparams = {
+            "hidden1": int(args.intraday_hidden1),
+            "hidden2": int(args.intraday_hidden2),
+            "dropout": float(args.intraday_dropout),
+            "learning_rate": float(args.intraday_learning_rate),
+            "recency_power": float(args.intraday_recency_power),
+        }
 
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
@@ -1728,6 +1809,7 @@ def main() -> None:
     current_day_table = build_current_day_table(
         db_path=db_path,
         cfg=cfg,
+        intraday_bundle=intraday_bundle,
         speed_model=speed_model,
         direction_model=direction_model,
         speed_scalers={"x_mean": speed_arrays["x_mean"], "x_std": speed_arrays["x_std"], "y_mean": speed_arrays["y_mean"], "y_std": speed_arrays["y_std"]},
@@ -1873,6 +1955,17 @@ def main() -> None:
         "web_dashboard_git_publish": git_publish,
         "speed_model_path": str(speed_model_path),
         "direction_model_path": str(direction_model_path),
+        "intraday_model_path": str(intraday_model_path),
+        "intraday_model_class": "IntradayResidualMLP",
+        "intraday_feature_count": int(len(getattr(intraday_bundle, "x_mean", []))),
+        "intraday_n_train": None if intraday_train_stats is None else int(intraday_train_stats["n_train"]),
+        "intraday_n_val": None if intraday_train_stats is None else int(intraday_train_stats["n_val"]),
+        "intraday_best_val_loss": None if intraday_train_stats is None else float(intraday_train_stats["best_val_loss"]),
+        "intraday_hidden1": intraday_hparams.get("hidden1"),
+        "intraday_hidden2": intraday_hparams.get("hidden2"),
+        "intraday_dropout": intraday_hparams.get("dropout"),
+        "intraday_learning_rate": intraday_hparams.get("learning_rate"),
+        "intraday_recency_power": intraday_hparams.get("recency_power"),
         "data_refresh": refresh_info,
         "max_forecast_age_hours": args.max_forecast_age_hours,
         "expected_update_hour_utc": args.expected_update_hour_utc,
@@ -1888,6 +1981,7 @@ def main() -> None:
     print("Model update complete.")
     print(f"Speed model saved to: {speed_model_path}")
     print(f"Direction model saved to: {direction_model_path}")
+    print(f"Intraday model saved to: {intraday_model_path}")
     print(f"Prediction table saved to: {table_path}")
     print(f"Prediction plot saved to: {plot_path}")
     print(f"Current-day table saved to: {current_day_table_path}")

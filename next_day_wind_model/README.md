@@ -42,6 +42,28 @@ python3 next_day_wind_model/train_lstm.py \
 ```
 This trains the **residual speed model** only: target = `(actual_speed - forecast_speed)`.
 
+## Hyperparameter Tuning (Both Models)
+
+Tune both:
+- next-day constrained residual model
+- intraday residual model
+
+```bash
+python3 next_day_wind_model/tune_hyperparameters.py \
+  --db data/wind_data.db \
+  --site valkenburgsemeer \
+  --model HARMONIE \
+  --n-splits 3 \
+  --max-configs-next-day 18 \
+  --max-configs-intraday 24 \
+  --out-dir next_day_wind_model/artifacts
+```
+
+Outputs:
+- `next_day_wind_model/artifacts/tuning_next_day_results.csv`
+- `next_day_wind_model/artifacts/tuning_intraday_results.csv`
+- `next_day_wind_model/artifacts/tuning_summary.json` (includes recommended training command)
+
 ## Output artifacts
 
 - `next_day_wind_model/artifacts/next_day_lstm_speed_residual.pt` (residual speed)

@@ -161,6 +161,7 @@ def _interpolate_missing_features(frame: pd.DataFrame) -> pd.DataFrame:
     feature_cols = ["forecast_avg", "forecast_min", "forecast_max", "forecast_dir", "actual_max", "actual_dir"]
     for col in feature_cols:
         if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
             out[col] = out[col].interpolate(limit_direction="both")
     return out
 

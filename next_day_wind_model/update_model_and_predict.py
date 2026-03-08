@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea, VPacker
 import numpy as np
 import pandas as pd
 import torch
@@ -562,7 +563,7 @@ def save_prediction_plot(
     x = np.arange(len(table))
     table["hour_label"] = table["target_time_utc"].dt.strftime("%H")
     first_dt = table["target_time_utc"].iloc[0]
-    day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
+    day_label = f"{first_dt.day} {first_dt.strftime('%B')}"
 
     y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
     y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
@@ -595,8 +596,8 @@ def save_prediction_plot(
         linewidth=2.4,
         label="Super local wind prediction - avg speed",
     )
-    ax.set_title(f"Next-Day Wind Speed ({day_label}, UTC)")
-    ax.set_xlabel("Hour (UTC)")
+    ax.set_title(f"Next-day wind speed: {day_label}.")
+    ax.set_xlabel("Time")
     ax.set_ylabel("Wind speed (kts)")
     ax.grid(axis="y", alpha=0.3)
     ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0)
@@ -1270,7 +1271,7 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
         1,
         sharex=True,
         figsize=(11.4, 6.8),
-        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.26},
+        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.40},
     )
     now_local = datetime.now(ZoneInfo(local_tz))
     month_start_current = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
@@ -1373,23 +1374,82 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
     valid_rows = merged.dropna(subset=["mae_forecast", "mae_lstm"])
     avg_lstm = float(valid_rows["mae_lstm"].mean())
     avg_fc = float(valid_rows["mae_forecast"].mean())
-    avg_text = (
-        "Average MAE in shown period\n"
-        f"Super local: {avg_lstm:.2f} kts\n"
-        f"Harmonie: {avg_fc:.2f} kts"
+    valid_speed_rows = merged.dropna(subset=["avg_lstm_wind_speed", "avg_forecast_wind_speed", "avg_actual_wind_speed"])
+    avg_daily_abs_lstm = float(np.mean(np.abs(valid_speed_rows["avg_lstm_wind_speed"] - valid_speed_rows["avg_actual_wind_speed"])))
+    avg_daily_abs_fc = float(np.mean(np.abs(valid_speed_rows["avg_forecast_wind_speed"] - valid_speed_rows["avg_actual_wind_speed"])))
+    def _metric_line(superlocal_value: float, harmonie_value: float):
+        superlocal = HPacker(
+            children=[
+                TextArea("Super local: ", textprops={"fontsize": 9, "color": "black"}),
+                TextArea(f"{superlocal_value:.2f}", textprops={"fontsize": 9, "color": "#2ca02c", "fontweight": "bold"}),
+                TextArea(" kts", textprops={"fontsize": 9, "color": "black"}),
+            ],
+            align="center",
+            pad=0,
+            sep=0,
+        )
+        harmonie = HPacker(
+            children=[
+                TextArea("Harmonie: ", textprops={"fontsize": 9, "color": "black"}),
+                TextArea(f"{harmonie_value:.2f}", textprops={"fontsize": 9, "color": "black", "fontweight": "bold"}),
+                TextArea(" kts", textprops={"fontsize": 9, "color": "black"}),
+            ],
+            align="center",
+            pad=0,
+            sep=0,
+        )
+        return superlocal, harmonie
+
+    daily_super, daily_harm = _metric_line(avg_daily_abs_lstm, avg_daily_abs_fc)
+    hourly_super, hourly_harm = _metric_line(avg_lstm, avg_fc)
+    daily_box = VPacker(
+        children=[
+            TextArea("Daily MAE", textprops={"fontsize": 9, "fontweight": "bold", "color": "black"}),
+            daily_super,
+            daily_harm,
+        ],
+        align="left",
+        pad=0,
+        sep=1,
     )
-    ax_bottom.text(
-        0.985,
-        1.04,
-        avg_text,
-        transform=ax_bottom.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=9,
-        color="black",
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    hourly_box = VPacker(
+        children=[
+            TextArea("Hourly MAE", textprops={"fontsize": 9, "fontweight": "bold", "color": "black"}),
+            hourly_super,
+            hourly_harm,
+        ],
+        align="left",
+        pad=0,
+        sep=1,
     )
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.96, bottom=0.10, hspace=0.30)
+    metric_box_y = 1.22
+    left_anchored = AnchoredOffsetbox(
+        loc="upper left",
+        child=daily_box,
+        pad=0.2,
+        frameon=True,
+        bbox_to_anchor=(0.01, metric_box_y),
+        bbox_transform=ax_bottom.transAxes,
+        borderpad=0.35,
+    )
+    left_anchored.patch.set_facecolor("white")
+    left_anchored.patch.set_alpha(0.78)
+    left_anchored.patch.set_edgecolor("none")
+    right_anchored = AnchoredOffsetbox(
+        loc="upper right",
+        child=hourly_box,
+        pad=0.2,
+        frameon=True,
+        bbox_to_anchor=(0.99, metric_box_y),
+        bbox_transform=ax_bottom.transAxes,
+        borderpad=0.35,
+    )
+    right_anchored.patch.set_facecolor("white")
+    right_anchored.patch.set_alpha(0.78)
+    right_anchored.patch.set_edgecolor("none")
+    ax_bottom.add_artist(left_anchored)
+    ax_bottom.add_artist(right_anchored)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
 
@@ -1628,30 +1688,27 @@ def publish_web_dashboard(
     .meta {{ color: #555; margin: 0 0 16px 0; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }}
     .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }}
+    .desc {{ margin: 2px 0 10px 0; color: #444; font-size: 14px; }}
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
-    a {{ color: #0a58ca; text-decoration: none; margin-right: 12px; }}
-    a:hover {{ text-decoration: underline; }}
   </style>
 </head>
 <body>
   <h1>Super local wind prediction Valkenburgse meer</h1>
   <p class="meta">Last updated: {generated_local_str}</p>
-  <p>
-    <a href="next_day_predictions.csv">Next-day table CSV</a>
-    <a href="current_day_predictions.csv">Current-day table CSV</a>
-    <a href="daily_mae_history.csv">Day-ahead MAE history CSV</a>
-  </p>
   <div class="grid">
     <div class="card">
       <h2>Current Day Prediction</h2>
+      <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
       <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
     </div>
     <div class="card">
       <h2>Next Day Prediction</h2>
+      <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
       <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
     </div>
     <div class="card">
       <h2>Day-ahead MAE History</h2>
+      <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead MAE for Harmonie and super-local predictions.</p>
       <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
     </div>
   </div>

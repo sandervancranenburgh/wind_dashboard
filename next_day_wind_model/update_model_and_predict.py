@@ -6,7 +6,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1170,10 +1170,30 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
     if hist.empty:
         return
 
+    if "evaluation_type" not in hist.columns:
+        hist["evaluation_type"] = "legacy_current_day"
+    hist = hist[hist["evaluation_type"] == "day_ahead_frozen"].copy()
+    for c in ["avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]:
+        if c not in hist.columns:
+            hist[c] = np.nan
+    if "details_csv" in hist.columns:
+        missing_stats = hist[["avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]].isna().any(axis=1)
+        for i in hist.index[missing_stats]:
+            details_path = Path(str(hist.at[i, "details_csv"]))
+            if not details_path.exists():
+                continue
+            try:
+                det = pd.read_csv(details_path)
+                if "actual_wind_speed" in det.columns and pd.isna(hist.at[i, "avg_actual_wind_speed"]):
+                    hist.at[i, "avg_actual_wind_speed"] = float(pd.to_numeric(det["actual_wind_speed"], errors="coerce").mean())
+                if "forecast_wind_speed" in det.columns and pd.isna(hist.at[i, "avg_forecast_wind_speed"]):
+                    hist.at[i, "avg_forecast_wind_speed"] = float(pd.to_numeric(det["forecast_wind_speed"], errors="coerce").mean())
+                if "lstm_wind_speed" in det.columns and pd.isna(hist.at[i, "avg_lstm_wind_speed"]):
+                    hist.at[i, "avg_lstm_wind_speed"] = float(pd.to_numeric(det["lstm_wind_speed"], errors="coerce").mean())
+            except Exception:
+                pass
     hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
     hist = hist.dropna(subset=["date"]).sort_values("date")
-    if hist.empty:
-        return
 
     if "mae_forecast" not in hist.columns and "mse_forecast" in hist.columns:
         hist["mae_forecast"] = hist["mse_forecast"]
@@ -1181,15 +1201,77 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
         hist["mae_lstm"] = hist["mse_lstm"]
     hist["mae_forecast"] = pd.to_numeric(hist["mae_forecast"], errors="coerce")
     hist["mae_lstm"] = pd.to_numeric(hist["mae_lstm"], errors="coerce")
+    hist["avg_actual_wind_speed"] = pd.to_numeric(hist["avg_actual_wind_speed"], errors="coerce")
+    hist["avg_forecast_wind_speed"] = pd.to_numeric(hist["avg_forecast_wind_speed"], errors="coerce")
+    hist["avg_lstm_wind_speed"] = pd.to_numeric(hist["avg_lstm_wind_speed"], errors="coerce")
     hist = hist.dropna(subset=["mae_forecast", "mae_lstm"])
-    if hist.empty:
+
+    hist["day"] = hist["date"].dt.floor("D")
+    hist_daily = hist.groupby("day", as_index=False)[
+        ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
+    ].mean(numeric_only=True)
+
+    backfill_csv = history_csv.parent / "dayahead_backfill_history.csv"
+    backfill_daily = pd.DataFrame(
+        columns=["day", "mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
+    )
+    if backfill_csv.exists():
+        backfill = pd.read_csv(backfill_csv)
+        if "day_local" in backfill.columns:
+            backfill["day"] = pd.to_datetime(backfill["day_local"], errors="coerce")
+        elif "date" in backfill.columns:
+            backfill["day"] = pd.to_datetime(backfill["date"], errors="coerce")
+        else:
+            backfill["day"] = pd.NaT
+        for c in ["avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]:
+            if c not in backfill.columns:
+                backfill[c] = np.nan
+        for c in ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]:
+            if c in backfill.columns:
+                backfill[c] = pd.to_numeric(backfill[c], errors="coerce")
+        backfill = backfill.dropna(subset=["day"])
+        if not backfill.empty:
+            backfill_daily = backfill.groupby("day", as_index=False)[
+                ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
+            ].mean(numeric_only=True)
+
+    if hist_daily.empty and backfill_daily.empty:
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        ax.set_title("Mean Absolute Prediction Error (Day-ahead)")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("MAE (kts)")
+        ax.set_ylim(0.0, 4.0)
+        ax.grid(axis="y", alpha=0.3)
+        ax.text(
+            0.5,
+            0.5,
+            "No day-ahead history yet.\nFirst entry appears after a full target day completes.",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="#444",
+        )
+        fig.tight_layout()
+        fig.savefig(plot_png, dpi=150)
+        plt.close(fig)
         return
 
-    # If multiple runs exist for a day, plot the average daily MAE.
-    hist["day"] = hist["date"].dt.floor("D")
-    hist_daily = hist.groupby("day", as_index=False)[["mae_forecast", "mae_lstm"]].mean(numeric_only=True)
+    if hist_daily.empty:
+        merged = backfill_daily.set_index("day")
+    elif backfill_daily.empty:
+        merged = hist_daily.set_index("day")
+    else:
+        merged = hist_daily.set_index("day").combine_first(backfill_daily.set_index("day"))
+    merged = merged.sort_index()
 
-    fig, ax = plt.subplots(figsize=(10, 4.8))
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(11.4, 6.8),
+        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.26},
+    )
     now_local = datetime.now(ZoneInfo(local_tz))
     month_start_current = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     if month_start_current.month == 12:
@@ -1198,9 +1280,12 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
         next_month = month_start_current.replace(month=month_start_current.month + 1)
     month_end_current = next_month - timedelta(days=1)
 
-    first_day = hist_daily["day"].min().to_pydatetime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    x_start = pd.Timestamp(first_day)
+    first_day = merged.index.min().to_pydatetime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    september_start = datetime(first_day.year, 9, 1)
+    x_start = max(pd.Timestamp(first_day), pd.Timestamp(september_start))
     x_end = pd.Timestamp(month_end_current)
+    full_index = pd.date_range(start=x_start, end=x_end, freq="D")
+    merged = merged.reindex(full_index)
 
     # Alternate monthly background shading for readability over multi-month history.
     shade_idx = 0
@@ -1212,131 +1297,277 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
             month_next = cursor.replace(month=cursor.month + 1, day=1)
         month_end = month_next - pd.Timedelta(days=1)
         if shade_idx % 2 == 1:
-            ax.axvspan(cursor, month_end + pd.Timedelta(hours=23, minutes=59), color="0.8", alpha=0.18, zorder=0)
+            for ax in (ax_top, ax_bottom):
+                ax.axvspan(cursor, month_end + pd.Timedelta(hours=23, minutes=59), color="0.8", alpha=0.18, zorder=0)
         shade_idx += 1
         cursor = month_next
 
-    if not hist_daily.empty:
-        ax.plot(
-            hist_daily["day"],
-            hist_daily["mae_lstm"],
-            linewidth=2.2,
-            color=LSTM_HIGHLIGHT_COLOR,
-            label="Super local vs measured wind",
+    # Top: daily average wind-speed levels.
+    ax_top.plot(
+        merged.index,
+        merged["avg_lstm_wind_speed"],
+        linewidth=1.6,
+        color=LSTM_HIGHLIGHT_COLOR,
+        label="Super local predicted wind speed (daily mean)",
+    )
+    ax_top.plot(
+        merged.index,
+        merged["avg_forecast_wind_speed"],
+        linewidth=1.4,
+        color="gray",
+        label="Harmonie predicted wind speed (daily mean)",
+    )
+    ax_top.plot(
+        merged.index,
+        merged["avg_actual_wind_speed"],
+        linewidth=1.4,
+        color="magenta",
+        label="Measured wind speed (daily mean)",
+    )
+    ax_top.set_title("Daily Mean Wind Speed")
+    ax_top.set_ylabel("Wind speed (kts)")
+    ax_top.grid(axis="y", alpha=0.3)
+    ax_top.legend(loc="upper left")
+    speed_top = float(
+        np.nanmax(
+            [
+                merged["avg_lstm_wind_speed"].max(),
+                merged["avg_forecast_wind_speed"].max(),
+                merged["avg_actual_wind_speed"].max(),
+            ]
         )
-        ax.plot(
-            hist_daily["day"],
-            hist_daily["mae_forecast"],
-            linewidth=1.8,
-            color="gray",
-            label="Harmonie vs measured wind",
-        )
-    ax.set_title("Daily End-of-Day MAE")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("MAE (kts)")
-    ax.grid(axis="y", alpha=0.3)
-    if not hist_daily.empty:
-        ax.legend(loc="upper left")
-    y_top_data = float(np.nanmax([hist_daily["mae_forecast"].max(), hist_daily["mae_lstm"].max()])) if not hist_daily.empty else 0.0
-    y_top = max(4.0, y_top_data * 1.06)
-    ax.set_ylim(0.0, y_top)
-    ax.margins(x=0, y=0)
-    ax.set_xlim(x_start, x_end)
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=3))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    if hist_daily.empty:
-        avg_text = "Average MAE in shown period\nSuper local: n/a\nHarmonie: n/a"
-    else:
-        avg_lstm = float(hist_daily["mae_lstm"].mean())
-        avg_fc = float(hist_daily["mae_forecast"].mean())
-        avg_text = (
-            "Average MAE in shown period\n"
-            f"Super local: {avg_lstm:.2f} kts\n"
-            f"Harmonie: {avg_fc:.2f} kts"
-        )
-    ax.text(
+    )
+    ax_top.set_ylim(0.0, max(4.0, speed_top * 1.04))
+    ax_top.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter("{x:.0f}"))
+
+    # Bottom: day-ahead MAE.
+    ax_bottom.plot(
+        merged.index,
+        merged["mae_lstm"],
+        linewidth=2.2,
+        color=LSTM_HIGHLIGHT_COLOR,
+        label="Day-ahead MAE super local",
+    )
+    ax_bottom.plot(
+        merged.index,
+        merged["mae_forecast"],
+        linewidth=1.8,
+        color="gray",
+        label="Day-ahead MAE Harmonie",
+    )
+    ax_bottom.set_title("Day-ahead Mean Absolute Error")
+    ax_bottom.set_ylabel("MAE (kts)")
+    ax_bottom.grid(axis="y", alpha=0.3)
+    ax_bottom.legend(loc="upper left")
+    y_top_data = float(np.nanmax([merged["mae_forecast"].max(), merged["mae_lstm"].max()]))
+    ax_bottom.set_ylim(0.0, max(4.0, y_top_data * 1.08))
+
+    for ax in (ax_top, ax_bottom):
+        ax.margins(x=0, y=0)
+        ax.set_xlim(x_start, x_end)
+    date_locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    ax_bottom.xaxis.set_major_locator(date_locator)
+    ax_bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
+    ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
+    ax_bottom.set_xlabel("Date")
+    valid_rows = merged.dropna(subset=["mae_forecast", "mae_lstm"])
+    avg_lstm = float(valid_rows["mae_lstm"].mean())
+    avg_fc = float(valid_rows["mae_forecast"].mean())
+    avg_text = (
+        "Average MAE in shown period\n"
+        f"Super local: {avg_lstm:.2f} kts\n"
+        f"Harmonie: {avg_fc:.2f} kts"
+    )
+    ax_bottom.text(
         0.985,
-        1.02,
+        1.04,
         avg_text,
-        transform=ax.transAxes,
+        transform=ax_bottom.transAxes,
         ha="right",
         va="bottom",
         fontsize=9,
         color="black",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
     )
-    ax.set_title("Mean Average Prediction Error")
-    fig.autofmt_xdate(rotation=25, ha="right")
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.96, bottom=0.10, hspace=0.30)
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
 
 
-def maybe_save_daily_mae(
+def save_dayahead_snapshot(
     out_dir: Path,
+    table: pd.DataFrame,
+    local_tz: str,
+    prediction_generated_at_utc: str,
+) -> str | None:
+    if table.empty:
+        return None
+    pred_dt = _parse_iso_utc(prediction_generated_at_utc)
+    if pred_dt is None:
+        pred_dt = datetime.now(timezone.utc)
+    issue_local = pred_dt.astimezone(ZoneInfo(local_tz))
+    target_times_utc = pd.to_datetime(table["target_time_utc"], utc=True)
+    if len(target_times_utc) == 0:
+        return None
+    target_day_local = target_times_utc[0].astimezone(ZoneInfo(local_tz)).date()
+    snapshot_dir = out_dir / "dayahead_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / (
+        f"{issue_local.strftime('%Y%m%d-%H%M%S')}_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    )
+    snap = table[
+        [
+            "target_time_utc",
+            "hour_utc",
+            "forecast_wind_speed",
+            "lstm_pred_wind_speed",
+            "forecast_wind_dir_deg",
+            "lstm_pred_wind_dir_deg",
+        ]
+    ].copy()
+    snap["target_time_utc"] = pd.to_datetime(snap["target_time_utc"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    snap["issue_local_time"] = issue_local.isoformat()
+    snap["issue_date_local"] = issue_local.strftime("%Y-%m-%d")
+    snap["target_date_local"] = target_day_local.strftime("%Y-%m-%d")
+    snap.to_csv(snapshot_path, index=False)
+    return str(snapshot_path)
+
+
+def _find_dayahead_snapshot(out_dir: Path, target_day_local: date) -> Path | None:
+    snapshot_dir = out_dir / "dayahead_snapshots"
+    if not snapshot_dir.exists():
+        return None
+    pattern = f"*_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    matches = sorted(snapshot_dir.glob(pattern))
+    if not matches:
+        return None
+    # Use earliest issued snapshot for a fair fixed day-ahead comparison.
+    return matches[0]
+
+
+def maybe_save_daily_mae_dayahead(
+    out_dir: Path,
+    db_path: Path,
+    cfg: DatasetConfig,
     local_tz: str,
     test_now_local_hour: int | None,
-    mae_forecast: float,
-    mae_lstm: float,
-    n_points: int,
-    current_day_table: pd.DataFrame,
 ) -> tuple[str | None, str | None]:
     now_local = _resolve_now_local(local_tz, test_now_local_hour)
     if now_local.hour < 22:
         return None, None
 
+    target_day_local = now_local.date()
+    snapshot_path = _find_dayahead_snapshot(out_dir, target_day_local)
+    if snapshot_path is None or (not snapshot_path.exists()):
+        return None, None
+
+    snap = pd.read_csv(snapshot_path)
+    if snap.empty or "target_time_utc" not in snap.columns:
+        return None, None
+    snap["target_time_utc"] = pd.to_datetime(snap["target_time_utc"], utc=True, errors="coerce")
+    snap = snap.dropna(subset=["target_time_utc"]).copy()
+    if snap.empty:
+        return None, None
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        obs_raw_utc = _load_observations_raw(conn, cfg.site)
+    finally:
+        conn.close()
+    if obs_raw_utc.empty:
+        return None, None
+    obs_hourly_utc = obs_raw_utc.resample("1h").mean(numeric_only=True)
+    actual = obs_hourly_utc.reindex(snap["target_time_utc"])["actual_avg"].to_numpy(dtype=float)
+    forecast = pd.to_numeric(snap["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float)
+    lstm = pd.to_numeric(snap["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float)
+    valid = (~np.isnan(actual)) & (~np.isnan(forecast)) & (~np.isnan(lstm))
+    if not valid.any():
+        return None, None
+
+    mae_forecast = float(np.mean(np.abs(actual[valid] - forecast[valid])))
+    mae_lstm = float(np.mean(np.abs(actual[valid] - lstm[valid])))
+    avg_actual_speed = float(np.mean(actual[valid]))
+    avg_forecast_speed = float(np.mean(forecast[valid]))
+    avg_lstm_speed = float(np.mean(lstm[valid]))
+    n_points = int(np.sum(valid))
+
     history_csv = out_dir / "daily_mae_history.csv"
     legacy_history_csv = out_dir / "daily_mse_history.csv"
     details_dir = out_dir / "daily_error_details"
     details_dir.mkdir(parents=True, exist_ok=True)
-    day_stamp = now_local.strftime("%Y%m%d")
-    details_csv = details_dir / f"{day_stamp}_actual_forecast_lstm.csv"
+    day_stamp = target_day_local.strftime("%Y%m%d")
+    details_csv = details_dir / f"{day_stamp}_dayahead_actual_forecast_lstm.csv"
 
-    details = current_day_table.copy()
-    details = details[
-        [
-            "time_local",
-            "hour_local",
-            "forecast_wind_speed",
-            "lstm_pred_wind_speed_full",
-            "actual_wind_speed",
-        ]
-    ].rename(
-        columns={
-            "lstm_pred_wind_speed_full": "lstm_wind_speed",
-        }
-    )
-    details["abs_err_forecast"] = np.abs(details["actual_wind_speed"] - details["forecast_wind_speed"])
-    details["abs_err_lstm"] = np.abs(details["actual_wind_speed"] - details["lstm_wind_speed"])
-    details["time_local"] = pd.to_datetime(details["time_local"]).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    details = snap.copy()
+    details["actual_wind_speed"] = actual
+    details["abs_err_forecast"] = np.abs(details["actual_wind_speed"] - pd.to_numeric(details["forecast_wind_speed"], errors="coerce"))
+    details["abs_err_lstm"] = np.abs(details["actual_wind_speed"] - pd.to_numeric(details["lstm_pred_wind_speed"], errors="coerce"))
+    details["target_time_utc"] = pd.to_datetime(details["target_time_utc"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     details.to_csv(details_csv, index=False)
 
     row = pd.DataFrame(
         [
             {
-                "date": now_local.strftime("%Y-%m-%d"),
+                "date": target_day_local.strftime("%Y-%m-%d"),
                 "run_local_time": now_local.isoformat(),
+                "issue_local_time": str(snap["issue_local_time"].iloc[0]) if "issue_local_time" in snap.columns else "",
                 "mae_forecast": mae_forecast,
                 "mae_lstm": mae_lstm,
+                "avg_actual_wind_speed": avg_actual_speed,
+                "avg_forecast_wind_speed": avg_forecast_speed,
+                "avg_lstm_wind_speed": avg_lstm_speed,
                 "n_points": int(n_points),
                 "details_csv": str(details_csv),
+                "snapshot_csv": str(snapshot_path),
+                "evaluation_type": "day_ahead_frozen",
             }
         ]
     )
     if history_csv.exists():
         hist = pd.read_csv(history_csv)
+        if "evaluation_type" not in hist.columns:
+            hist["evaluation_type"] = "legacy_current_day"
     elif legacy_history_csv.exists():
         hist = pd.read_csv(legacy_history_csv)
         if "mae_forecast" not in hist.columns and "mse_forecast" in hist.columns:
             hist["mae_forecast"] = hist["mse_forecast"]
         if "mae_lstm" not in hist.columns and "mse_lstm" in hist.columns:
             hist["mae_lstm"] = hist["mse_lstm"]
-        keep_cols = [c for c in ["date", "run_local_time", "mae_forecast", "mae_lstm", "n_points"] if c in hist.columns]
+        keep_cols = [
+            c
+            for c in [
+                "date",
+                "run_local_time",
+                "mae_forecast",
+                "mae_lstm",
+                "avg_actual_wind_speed",
+                "avg_forecast_wind_speed",
+                "avg_lstm_wind_speed",
+                "n_points",
+            ]
+            if c in hist.columns
+        ]
         hist = hist[keep_cols]
+        hist["evaluation_type"] = "legacy_current_day"
     else:
-        hist = pd.DataFrame(columns=["date", "run_local_time", "mae_forecast", "mae_lstm", "n_points", "details_csv"])
+        hist = pd.DataFrame(
+            columns=[
+                "date",
+                "run_local_time",
+                "issue_local_time",
+                "mae_forecast",
+                "mae_lstm",
+                "avg_actual_wind_speed",
+                "avg_forecast_wind_speed",
+                "avg_lstm_wind_speed",
+                "n_points",
+                "details_csv",
+                "snapshot_csv",
+                "evaluation_type",
+            ]
+        )
 
-    hist = hist[hist["date"] != row.iloc[0]["date"]]
+    hist = hist[~((hist["date"] == row.iloc[0]["date"]) & (hist["evaluation_type"] == "day_ahead_frozen"))]
     hist = pd.concat([hist, row], ignore_index=True)
 
     hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
@@ -1408,7 +1639,7 @@ def publish_web_dashboard(
   <p>
     <a href="next_day_predictions.csv">Next-day table CSV</a>
     <a href="current_day_predictions.csv">Current-day table CSV</a>
-    <a href="daily_mae_history.csv">Daily MAE history CSV</a>
+    <a href="daily_mae_history.csv">Day-ahead MAE history CSV</a>
   </p>
   <div class="grid">
     <div class="card">
@@ -1420,8 +1651,8 @@ def publish_web_dashboard(
       <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
     </div>
     <div class="card">
-      <h2>Daily MAE History</h2>
-      <img src="daily_mae_history.png?v={cache_bust}" alt="Daily MAE history">
+      <h2>Day-ahead MAE History</h2>
+      <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
     </div>
   </div>
 </body>
@@ -1791,6 +2022,14 @@ def main() -> None:
     ].copy()
     table_for_csv["target_time_utc"] = table_for_csv["target_time_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     table_for_csv.to_csv(table_path, index=False)
+    dayahead_snapshot_csv = None
+    if not args.skip_training and args.test_now_local_hour is None:
+        dayahead_snapshot_csv = save_dayahead_snapshot(
+            out_dir=out_dir,
+            table=table,
+            local_tz=args.local_timezone,
+            prediction_generated_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
 
     plot_path = out_dir / "next_day_predictions.png"
     prediction_generated_at_utc = datetime.now(timezone.utc).isoformat()
@@ -1843,7 +2082,6 @@ def main() -> None:
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
     )
-    mae_forecast, mae_lstm, mae_n_points = compute_running_mae(current_day_table)
     archived_current_day_plot = None
     daily_mae_csv = None
     daily_mae_png = None
@@ -1854,14 +2092,12 @@ def main() -> None:
             local_tz=args.local_timezone,
             test_now_local_hour=args.test_now_local_hour,
         )
-        daily_mae_csv, daily_mae_png = maybe_save_daily_mae(
-        out_dir=out_dir,
-        local_tz=args.local_timezone,
-        test_now_local_hour=args.test_now_local_hour,
-        mae_forecast=mae_forecast,
-        mae_lstm=mae_lstm,
-        n_points=mae_n_points,
-            current_day_table=current_day_table,
+        daily_mae_csv, daily_mae_png = maybe_save_daily_mae_dayahead(
+            out_dir=out_dir,
+            db_path=db_path,
+            cfg=cfg,
+            local_tz=args.local_timezone,
+            test_now_local_hour=args.test_now_local_hour,
         )
 
     web_publish = None
@@ -1944,6 +2180,7 @@ def main() -> None:
         "y_scaler_mean_direction": float(direction_arrays["y_mean"][0]),
         "y_scaler_std_direction": float(direction_arrays["y_std"][0]),
         "prediction_table_csv": str(table_path),
+        "dayahead_snapshot_csv": dayahead_snapshot_csv,
         "prediction_plot_png": str(plot_path),
         "current_day_table_csv": str(current_day_table_path),
         "current_day_plot_png": str(current_day_plot_path),

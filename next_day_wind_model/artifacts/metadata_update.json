@@ -1,5 +1,5 @@
 {
-  "trained_at_utc": "2026-03-08T21:29:58.826605+00:00",
+  "trained_at_utc": "2026-03-08T21:32:11.588617+00:00",
   "db_path": "/home/sandervancranenburgh/Documents/repos/wind_fetcher2/data/wind_data.db",
   "site": "valkenburgsemeer",
   "forecast_model": "HARMONIE",
@@ -32,9 +32,9 @@
   "epochs_ran_direction": null,
   "device": "cpu",
   "prediction_anchor_time": "2026-03-08T23:00:00+00:00",
-  "reference_observation_time": "2026-03-08T21:22:50+00:00",
+  "reference_observation_time": "2026-03-08T21:28:50+00:00",
   "prediction_day_start": "2026-03-09T00:00:00+00:00",
-  "prediction_generated_at_utc": "2026-03-08T21:29:54.345258+00:00",
+  "prediction_generated_at_utc": "2026-03-08T21:32:05.072685+00:00",
   "prediction_updated_at_utc": "2026-03-08T21:00:00+00:00",
   "model_last_trained_at_utc": "2026-03-08T10:25:06.512416+00:00",
   "y_scaler_mean_speed": -0.3629419207572937,
@@ -46,7 +46,7 @@
   "prediction_plot_png": "next_day_wind_model/artifacts/next_day_predictions.png",
   "current_day_table_csv": "next_day_wind_model/artifacts/current_day_predictions.csv",
   "current_day_plot_png": "next_day_wind_model/artifacts/current_day_predictions.png",
-  "current_day_plot_archived_png": "next_day_wind_model/artifacts/current_day_plot_archive/20260308-222958_current_day_predictions.png",
+  "current_day_plot_archived_png": "next_day_wind_model/artifacts/current_day_plot_archive/20260308-223208_current_day_predictions.png",
   "daily_mae_history_csv": null,
   "daily_mae_history_png": null,
   "web_dashboard_dir": "/home/sandervancranenburgh/Documents/repos/wind_fetcher2/docs",
@@ -63,9 +63,13 @@
     "index.html": "docs/index.html"
   },
   "web_dashboard_git_publish": {
-    "enabled": false,
-    "pushed": false,
-    "reason": "disabled"
+    "enabled": true,
+    "pushed": true,
+    "reason": "",
+    "remote": "origin",
+    "branch": "main",
+    "commit": "181e5837adc5cbda2986cc41c5e55f1247f4c2a6",
+    "path": "docs"
   },
   "speed_model_path": "next_day_wind_model/artifacts/next_day_lstm_speed_residual.pt",
   "direction_model_path": "next_day_wind_model/artifacts/next_day_lstm_direction_residual.pt",

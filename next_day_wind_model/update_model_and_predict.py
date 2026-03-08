@@ -570,13 +570,13 @@ def save_prediction_plot(
     y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
     pad = max((y_max - y_min) * 0.08, 0.8)
 
-    fig_size = (8.4, 9.6) if mobile else (14, 7.2)
+    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
     title_fs = 14 if mobile else None
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
     meta_fs = 10 if mobile else 9
-    meta_y = 1.11 if mobile else 1.13
+    meta_y = 1.14 if mobile else 1.13
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_max + pad, x_left=0.0, x_right=len(table) - 1.0)
     marker_size = 3.0
@@ -628,8 +628,8 @@ def save_prediction_plot(
     # Draw wind direction arrows under x-axis.
     # Mapping: up-arrow means South wind (from South), per user preference.
     # Using x-axis transform keeps arrows below axis regardless of y-scale.
-    y_base_axes = -0.14
-    arrow_len_axes = 0.065
+    y_base_axes = -0.115 if mobile else -0.14
+    arrow_len_axes = 0.058 if mobile else 0.065
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, LSTM_HIGHLIGHT_COLOR)]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -651,7 +651,9 @@ def save_prediction_plot(
                 clip_on=False,
             )
 
-    fig.tight_layout(rect=[0, 0.04, 1, 0.965])
+    layout_top = 0.93 if mobile else 0.965
+    layout_bottom = 0.055 if mobile else 0.04
+    fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -918,14 +920,14 @@ def save_current_day_plot(
     y_lower = 0.0
     y_upper = y_max + pad
 
-    fig_size = (8.4, 9.6) if mobile else (14, 7.2)
+    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
     title_fs = 14 if mobile else None
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
     meta_fs = 10 if mobile else 9
     mae_fs = 11 if mobile else 10
-    meta_y = 1.11 if mobile else 1.13
+    meta_y = 1.16 if mobile else 1.13
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
@@ -1058,8 +1060,8 @@ def save_current_day_plot(
     )
 
     # Direction arrows below axis for forecast, LSTM (remaining where available, else full-day context), and actual.
-    y_base_axes = -0.14
-    arrow_len_axes = 0.065
+    y_base_axes = -0.115 if mobile else -0.14
+    arrow_len_axes = 0.058 if mobile else 0.065
     if len(table) >= 2:
         step_min = max(
             1,
@@ -1093,7 +1095,9 @@ def save_current_day_plot(
                 zorder=z,
             )
 
-    fig.tight_layout(rect=[0, 0.04, 1, 0.965])
+    layout_top = 0.92 if mobile else 0.965
+    layout_bottom = 0.055 if mobile else 0.04
+    fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -1187,7 +1191,12 @@ def maybe_archive_current_day_plot(
     return str(archived_path)
 
 
-def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Europe/Amsterdam") -> None:
+def save_daily_mae_plot(
+    history_csv: Path,
+    plot_png: Path,
+    local_tz: str = "Europe/Amsterdam",
+    mobile_last_months: int | None = None,
+) -> None:
     if not history_csv.exists():
         return
     hist = pd.read_csv(history_csv)
@@ -1305,8 +1314,19 @@ def save_daily_mae_plot(history_csv: Path, plot_png: Path, local_tz: str = "Euro
     month_end_current = next_month - timedelta(days=1)
 
     first_day = merged.index.min().to_pydatetime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    september_start = datetime(first_day.year, 9, 1)
-    x_start = max(pd.Timestamp(first_day), pd.Timestamp(september_start))
+    if mobile_last_months is not None and int(mobile_last_months) > 0:
+        months = int(mobile_last_months)
+        start_current_month = month_start_current
+        start_target_month = start_current_month
+        for _ in range(max(0, months - 1)):
+            if start_target_month.month == 1:
+                start_target_month = start_target_month.replace(year=start_target_month.year - 1, month=12)
+            else:
+                start_target_month = start_target_month.replace(month=start_target_month.month - 1)
+        x_start = max(pd.Timestamp(first_day), pd.Timestamp(start_target_month))
+    else:
+        september_start = datetime(first_day.year, 9, 1)
+        x_start = max(pd.Timestamp(first_day), pd.Timestamp(september_start))
     x_end = pd.Timestamp(month_end_current)
     full_index = pd.date_range(start=x_start, end=x_end, freq="D")
     merged = merged.reindex(full_index)
@@ -1674,6 +1694,7 @@ def publish_web_dashboard(
     current_day_png_mobile: Path | None,
     current_day_csv: Path,
     daily_mae_png: Path | None,
+    daily_mae_png_mobile: Path | None,
     daily_mae_csv: Path | None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1686,6 +1707,7 @@ def publish_web_dashboard(
         (current_day_png_mobile, "current_day_predictions_mobile.png"),
         (current_day_csv, "current_day_predictions.csv"),
         (daily_mae_png, "daily_mae_history.png"),
+        (daily_mae_png_mobile, "daily_mae_history_mobile.png"),
         (daily_mae_csv, "daily_mae_history.csv"),
     ]
     copied: dict[str, str] = {}
@@ -1711,6 +1733,11 @@ def publish_web_dashboard(
         f"next_day_predictions_mobile.png?v={cache_bust}"
         if "next_day_predictions_mobile.png" in copied
         else f"next_day_predictions.png?v={cache_bust}"
+    )
+    daily_mae_mobile_src = (
+        f"daily_mae_history_mobile.png?v={cache_bust}"
+        if "daily_mae_history_mobile.png" in copied
+        else f"daily_mae_history.png?v={cache_bust}"
     )
     html = f"""<!doctype html>
 <html lang="en">
@@ -1774,7 +1801,10 @@ def publish_web_dashboard(
     <div class="card">
       <h2>Day-ahead MAE History</h2>
       <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead MAE for Harmonie and super-local predictions.</p>
-      <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
+      <picture>
+        <source media="(max-width: 768px)" srcset="{daily_mae_mobile_src}">
+        <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
+      </picture>
     </div>
   </div>
   <p class="overview overview-mobile">
@@ -2253,11 +2283,16 @@ def main() -> None:
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode:
         daily_mae_png_src = None if daily_mae_png is None else Path(daily_mae_png)
+        daily_mae_png_mobile_src: Path | None = None
         daily_mae_csv_src = None if daily_mae_csv is None else Path(daily_mae_csv)
         if daily_mae_png_src is None:
             fallback_png = out_dir / "daily_mae_history.png"
             if fallback_png.exists():
                 daily_mae_png_src = fallback_png
+        if daily_mae_png_mobile_src is None:
+            fallback_mobile_png = out_dir / "daily_mae_history_mobile.png"
+            if fallback_mobile_png.exists():
+                daily_mae_png_mobile_src = fallback_mobile_png
         if daily_mae_csv_src is None:
             fallback_csv = out_dir / "daily_mae_history.csv"
             if fallback_csv.exists():
@@ -2267,6 +2302,14 @@ def main() -> None:
             daily_mae_png_refresh = out_dir / "daily_mae_history.png"
             save_daily_mae_plot(daily_mae_csv_src, daily_mae_png_refresh, local_tz=args.local_timezone)
             daily_mae_png_src = daily_mae_png_refresh
+            daily_mae_png_mobile_refresh = out_dir / "daily_mae_history_mobile.png"
+            save_daily_mae_plot(
+                daily_mae_csv_src,
+                daily_mae_png_mobile_refresh,
+                local_tz=args.local_timezone,
+                mobile_last_months=3,
+            )
+            daily_mae_png_mobile_src = daily_mae_png_mobile_refresh
         web_publish = publish_web_dashboard(
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
@@ -2278,6 +2321,7 @@ def main() -> None:
             current_day_png_mobile=current_day_plot_mobile_path,
             current_day_csv=current_day_table_path,
             daily_mae_png=daily_mae_png_src,
+            daily_mae_png_mobile=daily_mae_png_mobile_src,
             daily_mae_csv=daily_mae_csv_src,
         )
         if args.git_auto_push_pages:

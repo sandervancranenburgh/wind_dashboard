@@ -1015,8 +1015,8 @@ def save_current_day_plot(
     ax.grid(axis="y", alpha=0.3)
     handles, labels = ax.get_legend_handles_labels()
     desired_order = [
-        "Super local wind prediction - avg speed",
         "Wind speed - measured",
+        "Super local wind prediction - avg speed",
         "Harmonie model - avg speed",
         "Harmonie model - max speed",
     ]

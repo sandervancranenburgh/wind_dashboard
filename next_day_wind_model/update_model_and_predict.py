@@ -564,7 +564,7 @@ def save_prediction_plot(
     x = np.arange(len(table))
     table["hour_label"] = table["target_time_utc"].dt.strftime("%H")
     first_dt = table["target_time_utc"].iloc[0]
-    day_label = f"{first_dt.day} {first_dt.strftime('%B')}"
+    day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
     y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
     y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
@@ -608,7 +608,23 @@ def save_prediction_plot(
     ax.set_xlabel("Time", fontsize=label_fs)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0, fontsize=legend_fs)
+    handles, labels = ax.get_legend_handles_labels()
+    desired_order = [
+        "Super local wind prediction - avg speed",
+        "Harmonie model - avg speed",
+        "Harmonie model - max speed",
+    ]
+    order_map = {label: handle for handle, label in zip(handles, labels)}
+    ordered_handles = [order_map[label] for label in desired_order if label in order_map]
+    ordered_labels = [label for label in desired_order if label in order_map]
+    ax.legend(
+        ordered_handles,
+        ordered_labels,
+        loc="upper left",
+        bbox_to_anchor=(0.015, 0.99),
+        borderaxespad=0.0,
+        fontsize=legend_fs,
+    )
     ax.set_xticks(x, table["hour_label"], rotation=0)
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)

@@ -552,6 +552,7 @@ def save_prediction_plot(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
+    mobile: bool = False,
 ) -> None:
     table = table.copy()
     table = table[(table["target_time_utc"].dt.hour >= 8) & (table["target_time_utc"].dt.hour <= 22)].reset_index(
@@ -569,7 +570,14 @@ def save_prediction_plot(
     y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
     pad = max((y_max - y_min) * 0.08, 0.8)
 
-    fig, ax = plt.subplots(figsize=(14, 7.2))
+    fig_size = (8.4, 9.6) if mobile else (14, 7.2)
+    title_fs = 14 if mobile else None
+    label_fs = 12 if mobile else None
+    tick_fs = 11 if mobile else None
+    legend_fs = 10 if mobile else None
+    meta_fs = 10 if mobile else 9
+    meta_y = 1.11 if mobile else 1.13
+    fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_max + pad, x_left=0.0, x_right=len(table) - 1.0)
     marker_size = 3.0
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
@@ -596,22 +604,23 @@ def save_prediction_plot(
         linewidth=2.4,
         label="Super local wind prediction - avg speed",
     )
-    ax.set_title(f"Next-day wind speed: {day_label}.")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Wind speed (kts)")
+    ax.set_title(f"Next-day wind speed: {day_label}.", fontsize=title_fs)
+    ax.set_xlabel("Time", fontsize=label_fs)
+    ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(0.015, 0.99), borderaxespad=0.0, fontsize=legend_fs)
     ax.set_xticks(x, table["hour_label"], rotation=0)
+    ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)
     ax.set_ylim(0.0, y_max + pad)
     ax.text(
         0.015,
-        1.13,
+        meta_y,
         _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=9,
+        fontsize=meta_fs,
         color="black",
         clip_on=False,
     )
@@ -879,9 +888,13 @@ def save_current_day_plot(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
+    mobile: bool = False,
 ) -> None:
     table = table.copy()
-    table = table[(table["time_local"].dt.hour >= 8) & (table["time_local"].dt.hour <= 22)].reset_index(drop=True)
+    table = table[
+        (table["time_local"].dt.hour >= 8)
+        & ((table["time_local"].dt.hour < 22) | ((table["time_local"].dt.hour == 22) & (table["time_local"].dt.minute == 0)))
+    ].reset_index(drop=True)
     if table.empty:
         raise ValueError("No rows available in 08:00-22:00 range for current-day plotting.")
 
@@ -905,7 +918,15 @@ def save_current_day_plot(
     y_lower = 0.0
     y_upper = y_max + pad
 
-    fig, ax = plt.subplots(figsize=(14, 7.2))
+    fig_size = (8.4, 9.6) if mobile else (14, 7.2)
+    title_fs = 14 if mobile else None
+    label_fs = 12 if mobile else None
+    tick_fs = 11 if mobile else None
+    legend_fs = 10 if mobile else None
+    meta_fs = 10 if mobile else 9
+    mae_fs = 11 if mobile else 10
+    meta_y = 1.11 if mobile else 1.13
+    fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
@@ -970,9 +991,9 @@ def save_current_day_plot(
         label="Super local wind prediction - avg speed",
         zorder=3,
     )
-    ax.set_title(f"Current-day wind prediction: {day_label}")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Wind speed (kts)")
+    ax.set_title(f"Current-day wind prediction: {day_label}", fontsize=title_fs)
+    ax.set_xlabel("Time", fontsize=label_fs)
+    ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
     handles, labels = ax.get_legend_handles_labels()
     desired_order = [
@@ -990,12 +1011,14 @@ def save_current_day_plot(
         loc="upper left",
         bbox_to_anchor=(0.015, 0.99),
         borderaxespad=0.0,
+        fontsize=legend_fs,
     )
     hour_tick_mask = table["time_local"].dt.minute.eq(0)
     tick_pos = np.where(hour_tick_mask.to_numpy())[0]
     tick_lbl = table.loc[hour_tick_mask, "time_local"].dt.strftime("%H").to_list()
     ax.set_xticks(tick_pos, tick_lbl, rotation=0)
-    ax.set_xlim(0.0, len(table) - 1.0)
+    ax.tick_params(axis="both", labelsize=tick_fs)
+    ax.set_xlim(-0.05, len(table) - 1.0 + 0.02)
     ax.set_ylim(y_lower, y_upper)
 
     actual_idx = np.where(~np.isnan(actual_avg))[0]
@@ -1011,12 +1034,12 @@ def save_current_day_plot(
     )
     ax.text(
         0.985,
-        1.13,
+        meta_y,
         mse_text,
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=10,
+        fontsize=mae_fs,
         color="black",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
         zorder=7,
@@ -1024,12 +1047,12 @@ def save_current_day_plot(
     )
     ax.text(
         0.015,
-        1.13,
+        meta_y,
         _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=9,
+        fontsize=meta_fs,
         color="black",
         clip_on=False,
     )
@@ -1645,8 +1668,10 @@ def publish_web_dashboard(
     local_tz: str,
     web_refresh_seconds: int,
     next_day_png: Path,
+    next_day_png_mobile: Path | None,
     next_day_csv: Path,
     current_day_png: Path,
+    current_day_png_mobile: Path | None,
     current_day_csv: Path,
     daily_mae_png: Path | None,
     daily_mae_csv: Path | None,
@@ -1655,8 +1680,10 @@ def publish_web_dashboard(
 
     publish_pairs: list[tuple[Path | None, str]] = [
         (next_day_png, "next_day_predictions.png"),
+        (next_day_png_mobile, "next_day_predictions_mobile.png"),
         (next_day_csv, "next_day_predictions.csv"),
         (current_day_png, "current_day_predictions.png"),
+        (current_day_png_mobile, "current_day_predictions_mobile.png"),
         (current_day_csv, "current_day_predictions.csv"),
         (daily_mae_png, "daily_mae_history.png"),
         (daily_mae_csv, "daily_mae_history.csv"),
@@ -1675,6 +1702,16 @@ def publish_web_dashboard(
     generated_local_str = generated_local.strftime("%d %B %Y %H:%M:%S %Z")
     cache_bust = int(datetime.now(timezone.utc).timestamp())
     refresh = max(60, int(web_refresh_seconds))
+    current_day_mobile_src = (
+        f"current_day_predictions_mobile.png?v={cache_bust}"
+        if "current_day_predictions_mobile.png" in copied
+        else f"current_day_predictions.png?v={cache_bust}"
+    )
+    next_day_mobile_src = (
+        f"next_day_predictions_mobile.png?v={cache_bust}"
+        if "next_day_predictions_mobile.png" in copied
+        else f"next_day_predictions.png?v={cache_bust}"
+    )
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1687,16 +1724,30 @@ def publish_web_dashboard(
     h1 {{ margin: 0 0 8px 0; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
     .overview {{ color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }}
+    .overview-mobile {{ display: none; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }}
     .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }}
     .desc {{ margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }}
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
+    @media (max-width: 768px) {{
+      body {{ margin: 10px; }}
+      h1 {{ font-size: 24px; margin: 0 0 6px 0; }}
+      h2 {{ font-size: 20px; margin: 0 0 6px 0; }}
+      .meta {{ margin: 0 0 10px 0; font-size: 14px; }}
+      .overview {{ font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }}
+      .overview-desktop {{ display: none; }}
+      .overview-mobile {{ display: block; margin: 10px 0 0 0; }}
+      .grid {{ gap: 12px; }}
+      .card {{ padding: 8px; border-radius: 6px; }}
+      .desc {{ font-size: 14px; margin: 2px 0 8px 0; }}
+      img {{ max-height: 60vh; object-fit: contain; }}
+    }}
   </style>
 </head>
 <body>
   <h1>Super local wind prediction Valkenburgse meer</h1>
   <p class="meta">Last updated: {generated_local_str}</p>
-  <p class="overview">
+  <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local ML models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
     The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
@@ -1707,12 +1758,18 @@ def publish_web_dashboard(
     <div class="card">
       <h2>Current Day Prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
-      <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
+      <picture>
+        <source media="(max-width: 768px)" srcset="{current_day_mobile_src}">
+        <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
+      </picture>
     </div>
     <div class="card">
       <h2>Next Day Prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
-      <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
+      <picture>
+        <source media="(max-width: 768px)" srcset="{next_day_mobile_src}">
+        <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
+      </picture>
     </div>
     <div class="card">
       <h2>Day-ahead MAE History</h2>
@@ -1720,6 +1777,13 @@ def publish_web_dashboard(
       <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
     </div>
   </div>
+  <p class="overview overview-mobile">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local ML models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
+  </p>
 </body>
 </html>
 """
@@ -2097,6 +2161,7 @@ def main() -> None:
         )
 
     plot_path = out_dir / "next_day_predictions.png"
+    plot_path_mobile = out_dir / "next_day_predictions_mobile.png"
     prediction_generated_at_utc = datetime.now(timezone.utc).isoformat()
     prediction_update_local = datetime.now(ZoneInfo(args.local_timezone)).replace(minute=0, second=0, microsecond=0)
     prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
@@ -2107,6 +2172,15 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+    )
+    save_prediction_plot(
+        table,
+        plot_path_mobile,
+        local_tz=args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        mobile=True,
     )
 
     # --- Current day plot/table: actuals up to present + prediction for remaining day ---
@@ -2139,6 +2213,7 @@ def main() -> None:
     current_day_table_csv.to_csv(current_day_table_path, index=False)
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
+    current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
     save_current_day_plot(
         current_day_table,
         current_day_plot_path,
@@ -2146,6 +2221,15 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+    )
+    save_current_day_plot(
+        current_day_table,
+        current_day_plot_mobile_path,
+        args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        mobile=True,
     )
     archived_current_day_plot = None
     daily_mae_csv = None
@@ -2188,8 +2272,10 @@ def main() -> None:
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,
             next_day_png=plot_path,
+            next_day_png_mobile=plot_path_mobile,
             next_day_csv=table_path,
             current_day_png=current_day_plot_path,
+            current_day_png_mobile=current_day_plot_mobile_path,
             current_day_csv=current_day_table_path,
             daily_mae_png=daily_mae_png_src,
             daily_mae_csv=daily_mae_csv_src,

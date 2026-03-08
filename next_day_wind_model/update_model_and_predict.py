@@ -1799,7 +1799,7 @@ def publish_web_dashboard(
   </p>
   <div class="grid">
     <div class="card">
-      <h2>Current Day Prediction</h2>
+      <h2>Current-day prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
       <picture>
         <source media="(max-width: 768px)" srcset="{current_day_mobile_src}">
@@ -1807,7 +1807,7 @@ def publish_web_dashboard(
       </picture>
     </div>
     <div class="card">
-      <h2>Next Day Prediction</h2>
+      <h2>Next-day prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
       <picture>
         <source media="(max-width: 768px)" srcset="{next_day_mobile_src}">
@@ -1815,7 +1815,7 @@ def publish_web_dashboard(
       </picture>
     </div>
     <div class="card">
-      <h2>Day-ahead MAE History</h2>
+      <h2>Day-ahead historical performance</h2>
       <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead MAE for Harmonie and super-local predictions.</p>
       <picture>
         <source media="(max-width: 768px)" srcset="{daily_mae_mobile_src}">

@@ -18,9 +18,10 @@
 </head>
 <body>
   <h1>Super local wind prediction Valkenburgse meer</h1>
-  <p class="meta">Last updated: 08 March 2026 21:38:07 CET</p>
+  <p class="meta">Last updated: 08 March 2026 21:38:20 CET</p>
   <p class="overview">
-    <strong>What is the super local forecast?</strong> This dashboard combines two local ML models trained on historical forecast values and matching measured wind values from this location.
+    <strong>What is the super local forecast?</strong> This dashboard combines two local ML models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
@@ -29,17 +30,17 @@
     <div class="card">
       <h2>Current Day Prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
-      <img src="current_day_predictions.png?v=1773002287" alt="Current day prediction">
+      <img src="current_day_predictions.png?v=1773002300" alt="Current day prediction">
     </div>
     <div class="card">
       <h2>Next Day Prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
-      <img src="next_day_predictions.png?v=1773002287" alt="Next day prediction">
+      <img src="next_day_predictions.png?v=1773002300" alt="Next day prediction">
     </div>
     <div class="card">
       <h2>Day-ahead MAE History</h2>
       <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead MAE for Harmonie and super-local predictions.</p>
-      <img src="daily_mae_history.png?v=1773002287" alt="Day-ahead MAE history">
+      <img src="daily_mae_history.png?v=1773002300" alt="Day-ahead MAE history">
     </div>
   </div>
 </body>

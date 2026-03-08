@@ -1686,15 +1686,23 @@ def publish_web_dashboard(
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
+    .overview {{ color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }}
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }}
     .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }}
-    .desc {{ margin: 2px 0 10px 0; color: #444; font-size: 14px; }}
+    .desc {{ margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }}
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
   </style>
 </head>
 <body>
   <h1>Super local wind prediction Valkenburgse meer</h1>
   <p class="meta">Last updated: {generated_local_str}</p>
+  <p class="overview">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local ML models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
+  </p>
   <div class="grid">
     <div class="card">
       <h2>Current Day Prediction</h2>

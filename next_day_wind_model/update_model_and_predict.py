@@ -24,6 +24,8 @@ from data_pipeline import (
     _angle_add_deg,
     _build_forecast_feature_frame,
     _apply_standardizer,
+    _fit_standardizer,
+    _fit_target_scaler,
     build_all_direction_training_arrays,
     build_all_training_arrays,
     build_next_day_inference_input,
@@ -79,6 +81,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Chronological holdout fraction for validation (e.g. 0.2).",
+    )
+    parser.add_argument(
+        "--challenge-eval-split",
+        type=float,
+        default=0.15,
+        help="Chronological holdout fraction used for champion-vs-challenger promotion checks.",
+    )
+    parser.add_argument(
+        "--challenge-min-eval-samples",
+        type=int,
+        default=60,
+        help="Minimum number of chronological samples in challenger evaluation holdout.",
+    )
+    parser.add_argument(
+        "--promotion-margin-pct",
+        type=float,
+        default=1.0,
+        help="Required relative MAE improvement (percent) to promote challenger over champion.",
     )
     parser.add_argument(
         "--local-timezone",
@@ -387,6 +407,64 @@ def predict_direction_residual(
     return pred_dir.astype(np.float32)
 
 
+def _inverse_standardizer(X_scaled: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return X_scaled * std.reshape(1, 1, -1) + mean.reshape(1, 1, -1)
+
+
+def _predict_speed_batch(
+    model: nn.Module,
+    X_input: np.ndarray,
+    forecast_speed: np.ndarray,
+    y_mean: float,
+    y_std: float,
+    target_mode: str,
+    constraint_eps: float | None,
+    device: torch.device,
+) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        pred_scaled = model(torch.from_numpy(X_input).float().to(device)).cpu().numpy()
+    pred = pred_scaled * y_std + y_mean
+    mode = str(target_mode).strip().lower()
+    if mode == "residual":
+        pred = pred + forecast_speed
+    elif mode == "constrained_logratio":
+        eps = float(0.1 if constraint_eps is None else constraint_eps)
+        pred = np.exp(np.log(forecast_speed + eps) + pred)
+    elif mode != "absolute":
+        raise ValueError(f"Unsupported speed target mode: {target_mode}")
+    return pred.astype(np.float32)
+
+
+def _predict_direction_batch(
+    model: nn.Module,
+    X_input: np.ndarray,
+    forecast_dir: np.ndarray,
+    y_mean: float,
+    y_std: float,
+    device: torch.device,
+) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        pred_scaled = model(torch.from_numpy(X_input).float().to(device)).cpu().numpy()
+    pred_residual = pred_scaled * y_std + y_mean
+    pred_dir = _angle_add_deg(forecast_dir.astype(np.float32), pred_residual.astype(np.float32))
+    return pred_dir.astype(np.float32)
+
+
+def _angular_mae_deg(pred: np.ndarray, actual: np.ndarray) -> float:
+    diff = ((pred - actual + 180.0) % 360.0) - 180.0
+    return float(np.mean(np.abs(diff)))
+
+
+def _eval_start_index(n_samples: int, eval_fraction: float, min_eval_samples: int) -> int:
+    eval_n = max(int(round(n_samples * float(eval_fraction))), int(min_eval_samples))
+    eval_n = min(eval_n, n_samples - 2)
+    if eval_n < 1:
+        raise ValueError("Not enough samples to build challenger evaluation holdout.")
+    return int(n_samples - eval_n)
+
+
 def build_prediction_table(
     inference_input: dict,
     speed_pred: np.ndarray,
@@ -525,6 +603,14 @@ def _parse_iso_utc(ts: str | None) -> datetime | None:
     return dt
 
 
+def _parse_iso_series_utc(values: pd.Series) -> pd.Series:
+    parsed = [
+        _parse_iso_utc(None if pd.isna(v) else str(v))
+        for v in values
+    ]
+    return pd.to_datetime(parsed, utc=True)
+
+
 def _format_plot_meta_text(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
@@ -543,6 +629,17 @@ def _format_plot_meta_text(
         else "unknown"
     )
     return f"Last plot update: {pred_txt}\nLast prediction update: {pred_upd_txt}\nLast model training: {train_txt}"
+
+
+def _format_model_id(model_trained_at_utc: str | None, local_tz: str) -> str:
+    train_dt = _parse_iso_utc(model_trained_at_utc)
+    if train_dt is None:
+        return "unknown"
+    return train_dt.astimezone(ZoneInfo(local_tz)).strftime("%Y%m%d-%H%M")
+
+
+def _format_model_id_text(model_trained_at_utc: str | None, local_tz: str) -> str:
+    return f"Model ID: {_format_model_id(model_trained_at_utc, local_tz)}"
 
 
 def save_prediction_plot(
@@ -639,6 +736,18 @@ def save_prediction_plot(
         fontsize=meta_fs,
         color="black",
         clip_on=False,
+    )
+    ax.text(
+        0.985,
+        meta_y,
+        _format_model_id_text(model_trained_at_utc, local_tz),
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=meta_fs,
+        color="black",
+        clip_on=False,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
     )
 
     # Draw wind direction arrows under x-axis.
@@ -1207,6 +1316,33 @@ def maybe_archive_current_day_plot(
     return str(archived_path)
 
 
+def maybe_archive_next_day_plots(
+    next_day_plot_path: Path,
+    next_day_plot_mobile_path: Path | None,
+    out_dir: Path,
+    local_tz: str,
+    test_now_local_hour: int | None,
+) -> dict[str, str] | None:
+    now_local = _resolve_now_local(local_tz, test_now_local_hour)
+    if now_local.hour < 22:
+        return None
+
+    archive_dir = out_dir / "next_day_plot_archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = now_local.strftime("%Y%m%d-%H%M%S")
+
+    archived: dict[str, str] = {}
+    archived_desktop = archive_dir / f"{stamp}_next_day_predictions.png"
+    shutil.copy2(next_day_plot_path, archived_desktop)
+    archived["desktop"] = str(archived_desktop)
+
+    if next_day_plot_mobile_path is not None and next_day_plot_mobile_path.exists():
+        archived_mobile = archive_dir / f"{stamp}_next_day_predictions_mobile.png"
+        shutil.copy2(next_day_plot_mobile_path, archived_mobile)
+        archived["mobile"] = str(archived_mobile)
+    return archived
+
+
 def save_daily_mae_plot(
     history_csv: Path,
     plot_png: Path,
@@ -1421,6 +1557,57 @@ def save_daily_mae_plot(
     ax_bottom.legend(loc="upper left")
     y_top_data = float(np.nanmax([merged["mae_forecast"].max(), merged["mae_lstm"].max()]))
     ax_bottom.set_ylim(0.0, max(4.0, y_top_data * 1.08))
+
+    # Mark model-gate events where challenger was promoted.
+    gate_csv = history_csv.parent / "model_gate_eval_history.csv"
+    if gate_csv.exists():
+        try:
+            gate = pd.read_csv(gate_csv)
+        except Exception:
+            gate = pd.DataFrame()
+        if not gate.empty:
+            if "promote_speed" in gate.columns:
+                promoted_mask = gate["promote_speed"].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
+            else:
+                # Backward compatibility with older history files.
+                promoted_mask = gate.get("speed_selected", pd.Series(dtype=object)).astype(str).str.strip().str.lower().eq(
+                    "challenger"
+                )
+            gate = gate.loc[promoted_mask].copy()
+            if not gate.empty:
+                if "run_local_time" in gate.columns:
+                    run_dt = pd.to_datetime(gate["run_local_time"], errors="coerce", utc=True)
+                else:
+                    run_dt = _parse_iso_series_utc(gate.get("run_utc", pd.Series(dtype=object)))
+                run_dt = run_dt.dt.tz_convert(ZoneInfo(local_tz)).dt.tz_localize(None)
+                gate["run_dt_local"] = run_dt
+                gate = gate.dropna(subset=["run_dt_local"]).sort_values("run_dt_local")
+                gate = gate[(gate["run_dt_local"] >= x_start) & (gate["run_dt_local"] <= x_end)]
+
+                y_top = ax_bottom.get_ylim()[1]
+                for _, row in gate.iterrows():
+                    run_dt_local = row["run_dt_local"]
+                    model_id = str(row.get("speed_model_id_challenger", "")).strip() or "unknown"
+                    ax_bottom.axvline(
+                        run_dt_local,
+                        color="#2ca02c",
+                        linestyle="--",
+                        linewidth=1.1,
+                        alpha=0.85,
+                        zorder=1.5,
+                    )
+                    ax_bottom.annotate(
+                        f"model {model_id}",
+                        xy=(run_dt_local, y_top * 0.985),
+                        xytext=(3, -2),
+                        textcoords="offset points",
+                        ha="left",
+                        va="top",
+                        fontsize=7.5,
+                        color="#2ca02c",
+                        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+                        zorder=3,
+                    )
 
     for ax in (ax_top, ax_bottom):
         ax.margins(x=0, y=0)
@@ -1699,6 +1886,199 @@ def maybe_save_daily_mae_dayahead(
     return str(history_csv), str(history_png)
 
 
+def append_model_gate_eval_history(
+    history_csv: Path,
+    model_selection_gate: dict,
+    local_tz: str,
+) -> str | None:
+    if not model_selection_gate.get("enabled", False):
+        return None
+    if "speed_mae_challenger" not in model_selection_gate:
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(ZoneInfo(local_tz))
+    row = pd.DataFrame(
+        [
+            {
+                "run_utc": now_utc.isoformat(),
+                "run_local_time": now_local.isoformat(),
+                "speed_mae_champion": model_selection_gate.get("speed_mae_champion"),
+                "speed_mae_challenger": model_selection_gate.get("speed_mae_challenger"),
+                "direction_mae_champion_deg": model_selection_gate.get("direction_mae_champion"),
+                "direction_mae_challenger_deg": model_selection_gate.get("direction_mae_challenger"),
+                "speed_selected": model_selection_gate.get("speed_selected"),
+                "direction_selected": model_selection_gate.get("direction_selected"),
+                "speed_eval_samples": model_selection_gate.get("speed_eval_samples"),
+                "direction_eval_samples": model_selection_gate.get("direction_eval_samples"),
+                "promotion_margin_pct": model_selection_gate.get("promotion_margin_pct"),
+                "holdout_eval_split": model_selection_gate.get("holdout_eval_split"),
+                "holdout_eval_min_samples": model_selection_gate.get("holdout_eval_min_samples"),
+                "promote_speed": model_selection_gate.get("promote_speed"),
+                "promote_direction": model_selection_gate.get("promote_direction"),
+                "speed_model_id_champion": model_selection_gate.get("speed_model_id_champion"),
+                "speed_model_id_challenger": model_selection_gate.get("speed_model_id_challenger"),
+            }
+        ]
+    )
+    if history_csv.exists():
+        hist = pd.read_csv(history_csv)
+    else:
+        hist = pd.DataFrame(columns=row.columns)
+    hist = pd.concat([hist, row], ignore_index=True)
+    hist["run_utc"] = _parse_iso_series_utc(hist["run_utc"])
+    hist = hist.dropna(subset=["run_utc"]).sort_values("run_utc")
+    hist = hist.drop_duplicates(subset=["run_utc"], keep="last")
+    hist["run_utc"] = hist["run_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    hist.to_csv(history_csv, index=False)
+    return str(history_csv)
+
+
+def save_model_gate_eval_history_plot(
+    history_csv: Path,
+    plot_png: Path,
+    local_tz: str = "Europe/Amsterdam",
+    eval_details_csv: Path | None = None,
+) -> None:
+    champion_model_id = None
+    challenger_model_id = None
+    if history_csv.exists():
+        hist_for_id = pd.read_csv(history_csv)
+        if not hist_for_id.empty:
+            if "run_utc" in hist_for_id.columns:
+                hist_for_id["run_utc"] = _parse_iso_series_utc(hist_for_id["run_utc"])
+                hist_for_id = hist_for_id.dropna(subset=["run_utc"]).sort_values("run_utc")
+            if not hist_for_id.empty:
+                last_row = hist_for_id.iloc[-1]
+                champion_model_id = str(last_row.get("speed_model_id_champion", "")).strip() or None
+                challenger_model_id = str(last_row.get("speed_model_id_challenger", "")).strip() or None
+
+    challenger_label = (
+        f"Challenger prediction ({challenger_model_id})"
+        if challenger_model_id
+        else "Challenger prediction"
+    )
+    champion_label = (
+        f"Champion prediction ({champion_model_id})"
+        if champion_model_id
+        else "Champion prediction"
+    )
+
+    # Preferred view: full holdout period time series with champion/challenger predictions.
+    if eval_details_csv is not None and eval_details_csv.exists():
+        det = pd.read_csv(eval_details_csv)
+        if not det.empty and "target_time_utc" in det.columns:
+            det["target_time_utc"] = pd.to_datetime(det["target_time_utc"], errors="coerce", utc=True)
+            for col in ["actual_wind_speed", "champion_wind_speed", "challenger_wind_speed"]:
+                det[col] = pd.to_numeric(det.get(col), errors="coerce")
+            det = det.dropna(subset=["target_time_utc", "actual_wind_speed"])
+            if not det.empty:
+                x_local = det["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
+                mae_chall = float(np.mean(np.abs(det["challenger_wind_speed"] - det["actual_wind_speed"])))
+                mae_champ = float(np.mean(np.abs(det["champion_wind_speed"] - det["actual_wind_speed"])))
+
+                fig, ax = plt.subplots(figsize=(11.8, 5.2))
+                ax.plot(x_local, det["actual_wind_speed"], color="magenta", linewidth=1.8, label="Measured wind speed")
+                ax.plot(
+                    x_local,
+                    det["challenger_wind_speed"],
+                    color=LSTM_HIGHLIGHT_COLOR,
+                    linewidth=2.2,
+                    label=challenger_label,
+                )
+                ax.plot(
+                    x_local,
+                    det["champion_wind_speed"],
+                    color="#007A78",
+                    linewidth=1.8,
+                    label=champion_label,
+                )
+                ax.set_title("Model Gate Holdout Period (Speed)")
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Wind speed (kts)")
+                ax.grid(axis="y", alpha=0.3)
+                ax.legend(loc="upper left")
+                ax.margins(x=0, y=0)
+                ymax = np.nanmax(
+                    [
+                        det["actual_wind_speed"].max(skipna=True),
+                        det["challenger_wind_speed"].max(skipna=True),
+                        det["champion_wind_speed"].max(skipna=True),
+                        1.0,
+                    ]
+                )
+                ax.set_ylim(0.0, max(4.0, float(ymax) * 1.08))
+                date_locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+                ax.xaxis.set_major_locator(date_locator)
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+                ax.tick_params(axis="x", labelrotation=20, labelsize=10)
+                txt = (
+                    "Hourly MAE (eval holdout)\n"
+                    f"Challenger: {mae_chall:.2f} kts\n"
+                    f"Champion: {mae_champ:.2f} kts"
+                )
+                ax.text(
+                    0.985,
+                    0.985,
+                    txt,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=10,
+                    color="black",
+                    bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+                )
+                fig.tight_layout()
+                fig.savefig(plot_png, dpi=150)
+                plt.close(fig)
+                return
+
+    # Fallback: run-level trend if period details are unavailable.
+    if not history_csv.exists():
+        return
+    hist = pd.read_csv(history_csv)
+    if hist.empty:
+        return
+    for col in ["speed_mae_champion", "speed_mae_challenger"]:
+        hist[col] = pd.to_numeric(hist.get(col), errors="coerce")
+    if "run_local_time" in hist.columns:
+        run_dt = pd.to_datetime(hist["run_local_time"], errors="coerce")
+    else:
+        run_dt = _parse_iso_series_utc(hist.get("run_utc")).dt.tz_convert(ZoneInfo(local_tz))
+    hist["run_dt"] = run_dt
+    hist = hist.dropna(subset=["run_dt"]).sort_values("run_dt")
+    if hist.empty:
+        return
+    fig, ax = plt.subplots(figsize=(11.4, 4.8))
+    champ_mae_label = (
+        f"Champion holdout MAE ({champion_model_id})"
+        if champion_model_id
+        else "Champion holdout MAE"
+    )
+    chall_mae_label = (
+        f"Challenger holdout MAE ({challenger_model_id})"
+        if challenger_model_id
+        else "Challenger holdout MAE"
+    )
+    ax.plot(hist["run_dt"], hist["speed_mae_champion"], color="gray", linewidth=1.8, marker="o", markersize=3.0, label=champ_mae_label)
+    ax.plot(hist["run_dt"], hist["speed_mae_challenger"], color=LSTM_HIGHLIGHT_COLOR, linewidth=2.2, marker="o", markersize=3.0, label=chall_mae_label)
+    ax.set_title("Model Gate Holdout Comparison (Speed)")
+    ax.set_xlabel("Run date")
+    ax.set_ylabel("MAE (kts)")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(loc="upper right")
+    ax.margins(x=0, y=0)
+    ymax = np.nanmax([hist["speed_mae_champion"].max(skipna=True), hist["speed_mae_challenger"].max(skipna=True), 1.0])
+    ax.set_ylim(0.0, max(3.5, float(ymax) * 1.08))
+    date_locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    ax.xaxis.set_major_locator(date_locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.tick_params(axis="x", labelrotation=20, labelsize=10)
+    fig.tight_layout()
+    fig.savefig(plot_png, dpi=150)
+    plt.close(fig)
+
+
 def publish_web_dashboard(
     web_out_dir: Path,
     local_tz: str,
@@ -1712,6 +2092,8 @@ def publish_web_dashboard(
     daily_mae_png: Path | None,
     daily_mae_png_mobile: Path | None,
     daily_mae_csv: Path | None,
+    gate_eval_png: Path | None,
+    gate_eval_csv: Path | None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1725,6 +2107,8 @@ def publish_web_dashboard(
         (daily_mae_png, "daily_mae_history.png"),
         (daily_mae_png_mobile, "daily_mae_history_mobile.png"),
         (daily_mae_csv, "daily_mae_history.csv"),
+        (gate_eval_png, "model_gate_eval_history.png"),
+        (gate_eval_csv, "model_gate_eval_history.csv"),
     ]
     copied: dict[str, str] = {}
     for src, dst_name in publish_pairs:
@@ -1816,7 +2200,7 @@ def publish_web_dashboard(
     </div>
     <div class="card">
       <h2>Day-ahead historical performance</h2>
-      <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead MAE for Harmonie and super-local predictions.</p>
+      <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead Mean Absolute Error (MAE) for Harmonie and super-local predictions.</p>
       <picture>
         <source media="(max-width: 768px)" srcset="{daily_mae_mobile_src}">
         <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
@@ -1998,6 +2382,8 @@ def main() -> None:
         "y_std": out_dir / "y_std_direction.npy",
     }
     intraday_hparams = {}
+    model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
+    gate_eval_details_csv_src: Path | None = None
 
     if args.skip_training:
         for p in [
@@ -2031,48 +2417,107 @@ def main() -> None:
             "learning_rate": intraday_ckpt.get("learning_rate"),
             "recency_power": intraday_ckpt.get("recency_power"),
         }
+        model_selection_report = {"enabled": False, "reason": "skip_training"}
     else:
-        # --- Train constrained residual speed model (positive by construction) ---
-        speed_arrays = build_all_training_arrays(db_path, cfg, target_mode="residual")
+        if not (0.0 < float(args.challenge_eval_split) < 0.5):
+            raise ValueError("--challenge-eval-split must be > 0 and < 0.5.")
+
+        speed_target_mode = "constrained_logratio"
+        direction_target_mode = "residual"
         speed_constraint_eps = float(args.speed_constraint_eps)
-        speed_y_raw = np.log(speed_arrays["y_actual_all_raw"] + speed_constraint_eps) - np.log(
-            speed_arrays["y_forecast_all_raw"] + speed_constraint_eps
+        promotion_margin = max(0.0, float(args.promotion_margin_pct)) / 100.0
+
+        # Build full arrays once, then split chronologically into train/eval holdouts.
+        speed_arrays_full = build_all_training_arrays(db_path, cfg, target_mode="residual")
+        direction_arrays_full = build_all_direction_training_arrays(db_path, cfg)
+        n_samples_all_speed = int(speed_arrays_full["X_all"].shape[0])
+        n_samples_all_direction = int(direction_arrays_full["X_all"].shape[0])
+        feature_cols = speed_arrays_full["feature_cols"]
+
+        speed_X_raw_all = _inverse_standardizer(
+            speed_arrays_full["X_all"], speed_arrays_full["x_mean"], speed_arrays_full["x_std"]
+        ).astype(np.float32)
+        direction_X_raw_all = _inverse_standardizer(
+            direction_arrays_full["X_all"], direction_arrays_full["x_mean"], direction_arrays_full["x_std"]
+        ).astype(np.float32)
+        speed_y_raw_all = np.log(speed_arrays_full["y_actual_all_raw"] + speed_constraint_eps) - np.log(
+            speed_arrays_full["y_forecast_all_raw"] + speed_constraint_eps
         )
-        y_mean = float(speed_y_raw.mean())
-        y_std = float(speed_y_raw.std())
-        if y_std == 0.0:
-            y_std = 1.0
-        speed_arrays["y_mean"] = np.array([y_mean], dtype=np.float32)
-        speed_arrays["y_std"] = np.array([y_std], dtype=np.float32)
-        speed_y_scaled = (speed_y_raw - y_mean) / y_std
-        speed_model = NextDayLSTM(
-            n_features=speed_arrays["X_all"].shape[2],
-            target_hours=speed_y_scaled.shape[1],
+        direction_y_raw_all = (
+            direction_arrays_full["y_all"] * float(direction_arrays_full["y_std"][0])
+            + float(direction_arrays_full["y_mean"][0])
+        ).astype(np.float32)
+
+        speed_eval_start = _eval_start_index(
+            n_samples_all_speed, args.challenge_eval_split, args.challenge_min_eval_samples
+        )
+        direction_eval_start = _eval_start_index(
+            n_samples_all_direction, args.challenge_eval_split, args.challenge_min_eval_samples
+        )
+
+        speed_X_train_raw, speed_X_eval_raw = speed_X_raw_all[:speed_eval_start], speed_X_raw_all[speed_eval_start:]
+        speed_y_train_raw, speed_y_eval_raw = speed_y_raw_all[:speed_eval_start], speed_y_raw_all[speed_eval_start:]
+        speed_actual_eval = speed_arrays_full["y_actual_all_raw"][speed_eval_start:]
+        speed_forecast_eval = speed_arrays_full["y_forecast_all_raw"][speed_eval_start:]
+        speed_eval_anchor_times_utc = pd.to_datetime(speed_arrays_full["timestamps"][speed_eval_start:], utc=True)
+
+        direction_X_train_raw = direction_X_raw_all[:direction_eval_start]
+        direction_X_eval_raw = direction_X_raw_all[direction_eval_start:]
+        direction_y_train_raw = direction_y_raw_all[:direction_eval_start]
+        direction_actual_eval = direction_arrays_full["y_actual_all_raw"][direction_eval_start:]
+        direction_forecast_eval = direction_arrays_full["y_forecast_all_raw"][direction_eval_start:]
+
+        # Fit challenger scalers on the pre-evaluation training chunk only.
+        speed_x_mean, speed_x_std = _fit_standardizer(speed_X_train_raw)
+        speed_y_mean, speed_y_std = _fit_target_scaler(speed_y_train_raw)
+        speed_X_train = _apply_standardizer(speed_X_train_raw, speed_x_mean, speed_x_std).astype(np.float32)
+        speed_X_eval = _apply_standardizer(speed_X_eval_raw, speed_x_mean, speed_x_std).astype(np.float32)
+        speed_y_train = ((speed_y_train_raw - speed_y_mean) / speed_y_std).astype(np.float32)
+        challenger_speed_arrays = {
+            "x_mean": speed_x_mean.astype(np.float32),
+            "x_std": speed_x_std.astype(np.float32),
+            "y_mean": np.array([speed_y_mean], dtype=np.float32),
+            "y_std": np.array([speed_y_std], dtype=np.float32),
+        }
+
+        direction_x_mean, direction_x_std = _fit_standardizer(direction_X_train_raw)
+        direction_y_mean, direction_y_std = _fit_target_scaler(direction_y_train_raw)
+        direction_X_train = _apply_standardizer(direction_X_train_raw, direction_x_mean, direction_x_std).astype(np.float32)
+        direction_X_eval = _apply_standardizer(direction_X_eval_raw, direction_x_mean, direction_x_std).astype(np.float32)
+        direction_y_train = ((direction_y_train_raw - direction_y_mean) / direction_y_std).astype(np.float32)
+        challenger_direction_arrays = {
+            "x_mean": direction_x_mean.astype(np.float32),
+            "x_std": direction_x_std.astype(np.float32),
+            "y_mean": np.array([direction_y_mean], dtype=np.float32),
+            "y_std": np.array([direction_y_std], dtype=np.float32),
+        }
+
+        # Train challengers from scratch.
+        speed_model_challenger = NextDayLSTM(
+            n_features=speed_X_train.shape[2],
+            target_hours=speed_y_train.shape[1],
             output_activation="linear",
         ).to(device)
-        speed_model, speed_train_stats = train_with_validation(
-            model=speed_model,
-            X_all=speed_arrays["X_all"],
-            y_all=speed_y_scaled.astype(np.float32),
+        speed_model_challenger, speed_train_stats = train_with_validation(
+            model=speed_model_challenger,
+            X_all=speed_X_train,
+            y_all=speed_y_train,
             batch_size=args.batch_size,
             epochs=args.epochs,
             validation_split=args.validation_split,
             model_label="speed",
             device=device,
         )
-        speed_target_mode = "constrained_logratio"
 
-        # --- Train residual direction model ---
-        direction_arrays = build_all_direction_training_arrays(db_path, cfg)
-        direction_model = NextDayLSTM(
-            n_features=direction_arrays["X_all"].shape[2],
-            target_hours=direction_arrays["y_all"].shape[1],
+        direction_model_challenger = NextDayLSTM(
+            n_features=direction_X_train.shape[2],
+            target_hours=direction_y_train.shape[1],
             output_activation="linear",
         ).to(device)
-        direction_model, direction_train_stats = train_with_validation(
-            model=direction_model,
-            X_all=direction_arrays["X_all"],
-            y_all=direction_arrays["y_all"],
+        direction_model_challenger, direction_train_stats = train_with_validation(
+            model=direction_model_challenger,
+            X_all=direction_X_train,
+            y_all=direction_y_train,
             batch_size=args.batch_size,
             epochs=args.epochs,
             validation_split=args.validation_split,
@@ -2094,31 +2539,226 @@ def main() -> None:
             recency_power=float(args.intraday_recency_power),
         )
 
-        _save_model(
-            speed_model_path,
-            speed_model,
-            n_features=speed_arrays["X_all"].shape[2],
-            target_hours=speed_y_scaled.shape[1],
-            target_name="wind_speed",
+        champion_available = all(
+            p.exists()
+            for p in [
+                speed_model_path,
+                direction_model_path,
+                *speed_scalers_path.values(),
+                *direction_scalers_path.values(),
+            ]
+        )
+        promote_speed = True
+        promote_direction = True
+        champion_speed_mae = None
+        challenger_speed_eval_pred = _predict_speed_batch(
+            speed_model_challenger,
+            speed_X_eval,
+            speed_forecast_eval,
+            y_mean=float(challenger_speed_arrays["y_mean"][0]),
+            y_std=float(challenger_speed_arrays["y_std"][0]),
             target_mode=speed_target_mode,
-            output_activation="linear",
-            extra={"constraint_eps": speed_constraint_eps, "trained_at_utc": datetime.now(timezone.utc).isoformat()},
+            constraint_eps=speed_constraint_eps,
+            device=device,
         )
-        _save_model(
-            direction_model_path,
-            direction_model,
-            n_features=direction_arrays["X_all"].shape[2],
-            target_hours=direction_arrays["y_all"].shape[1],
-            target_name="wind_direction",
-            target_mode="residual",
-            output_activation="linear",
-            extra={"trained_at_utc": datetime.now(timezone.utc).isoformat()},
+        challenger_speed_mae = float(np.mean(np.abs(challenger_speed_eval_pred - speed_actual_eval)))
+        challenger_direction_mae = _angular_mae_deg(
+            _predict_direction_batch(
+                direction_model_challenger,
+                direction_X_eval,
+                direction_forecast_eval,
+                y_mean=float(challenger_direction_arrays["y_mean"][0]),
+                y_std=float(challenger_direction_arrays["y_std"][0]),
+                device=device,
+            ),
+            direction_actual_eval,
         )
+        now_train_utc = datetime.now(timezone.utc).isoformat()
+        challenger_speed_model_id = _format_model_id(now_train_utc, args.local_timezone)
+        champion_speed_model_id = "none"
+        champion_speed_ckpt = {}
+        champion_direction_ckpt = {}
+        champion_speed_eval_pred = np.full_like(challenger_speed_eval_pred, np.nan, dtype=np.float32)
+        if champion_available:
+            champion_speed_model, champion_speed_ckpt = _load_model(speed_model_path, device)
+            champion_direction_model, champion_direction_ckpt = _load_model(direction_model_path, device)
+            champion_speed_arrays = {k: np.load(v) for k, v in speed_scalers_path.items()}
+            champion_direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
+            champion_speed_mode = str(champion_speed_ckpt.get("target_mode", "residual")).strip().lower()
+            champion_speed_eps = champion_speed_ckpt.get("constraint_eps", None)
+            champion_speed_model_id = _format_model_id(
+                _resolve_model_trained_utc(champion_speed_ckpt, speed_model_path),
+                args.local_timezone,
+            )
+
+            speed_X_eval_champion = _apply_standardizer(
+                speed_X_eval_raw, champion_speed_arrays["x_mean"], champion_speed_arrays["x_std"]
+            ).astype(np.float32)
+            direction_X_eval_champion = _apply_standardizer(
+                direction_X_eval_raw, champion_direction_arrays["x_mean"], champion_direction_arrays["x_std"]
+            ).astype(np.float32)
+
+            champion_speed_eval_pred = _predict_speed_batch(
+                champion_speed_model,
+                speed_X_eval_champion,
+                speed_forecast_eval,
+                y_mean=float(champion_speed_arrays["y_mean"][0]),
+                y_std=float(champion_speed_arrays["y_std"][0]),
+                target_mode=champion_speed_mode,
+                constraint_eps=champion_speed_eps,
+                device=device,
+            )
+            champion_speed_mae = float(np.mean(np.abs(champion_speed_eval_pred - speed_actual_eval)))
+            champion_direction_mae = _angular_mae_deg(
+                _predict_direction_batch(
+                    champion_direction_model,
+                    direction_X_eval_champion,
+                    direction_forecast_eval,
+                    y_mean=float(champion_direction_arrays["y_mean"][0]),
+                    y_std=float(champion_direction_arrays["y_std"][0]),
+                    device=device,
+                ),
+                direction_actual_eval,
+            )
+
+            promote_speed = challenger_speed_mae <= champion_speed_mae * (1.0 - promotion_margin)
+            promote_direction = challenger_direction_mae <= champion_direction_mae * (1.0 - promotion_margin)
+            model_selection_report = {
+                "enabled": True,
+                "holdout_eval_split": float(args.challenge_eval_split),
+                "holdout_eval_min_samples": int(args.challenge_min_eval_samples),
+                "promotion_margin_pct": float(args.promotion_margin_pct),
+                "speed_eval_samples": int(len(speed_X_eval)),
+                "direction_eval_samples": int(len(direction_X_eval)),
+                "speed_mae_champion": float(champion_speed_mae),
+                "speed_mae_challenger": float(challenger_speed_mae),
+                "direction_mae_champion": float(champion_direction_mae),
+                "direction_mae_challenger": float(challenger_direction_mae),
+                "promote_speed": bool(promote_speed),
+                "promote_direction": bool(promote_direction),
+                "speed_model_id_champion": champion_speed_model_id,
+                "speed_model_id_challenger": challenger_speed_model_id,
+            }
+            print(
+                f"Model gate | speed MAE champion={champion_speed_mae:.4f}, challenger={challenger_speed_mae:.4f}, "
+                f"promoted={promote_speed}"
+            )
+            print(
+                f"Model gate | direction MAE champion={champion_direction_mae:.4f}, "
+                f"challenger={challenger_direction_mae:.4f}, promoted={promote_direction}"
+            )
+        else:
+            model_selection_report = {
+                "enabled": True,
+                "reason": "no_existing_champion",
+                "speed_eval_samples": int(len(speed_X_eval)),
+                "direction_eval_samples": int(len(direction_X_eval)),
+                "speed_mae_challenger": float(challenger_speed_mae),
+                "direction_mae_challenger": float(challenger_direction_mae),
+                "promote_speed": True,
+                "promote_direction": True,
+                "speed_model_id_champion": champion_speed_model_id,
+                "speed_model_id_challenger": challenger_speed_model_id,
+            }
+            print("Model gate | no existing champion found, promoting challenger models.")
+
+        # Select production speed model.
+        if promote_speed:
+            speed_model = speed_model_challenger
+            speed_arrays = challenger_speed_arrays
+            model_last_trained_at_utc = now_train_utc
+            _save_model(
+                speed_model_path,
+                speed_model,
+                n_features=speed_X_train.shape[2],
+                target_hours=speed_y_train.shape[1],
+                target_name="wind_speed",
+                target_mode=speed_target_mode,
+                output_activation="linear",
+                extra={"constraint_eps": speed_constraint_eps, "trained_at_utc": now_train_utc},
+            )
+            np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
+            np.save(speed_scalers_path["x_std"], speed_arrays["x_std"])
+            np.save(speed_scalers_path["y_mean"], speed_arrays["y_mean"])
+            np.save(speed_scalers_path["y_std"], speed_arrays["y_std"])
+            model_selection_report["speed_selected"] = "challenger"
+        else:
+            speed_model = champion_speed_model
+            speed_arrays = champion_speed_arrays
+            speed_target_mode = str(champion_speed_ckpt.get("target_mode", "residual")).strip().lower()
+            speed_constraint_eps = champion_speed_ckpt.get("constraint_eps", None)
+            model_last_trained_at_utc = _resolve_model_trained_utc(champion_speed_ckpt, speed_model_path)
+            model_selection_report["speed_selected"] = "champion"
+
+        # Select production direction model.
+        if promote_direction:
+            direction_model = direction_model_challenger
+            direction_arrays = challenger_direction_arrays
+            _save_model(
+                direction_model_path,
+                direction_model,
+                n_features=direction_X_train.shape[2],
+                target_hours=direction_y_train.shape[1],
+                target_name="wind_direction",
+                target_mode=direction_target_mode,
+                output_activation="linear",
+                extra={"trained_at_utc": now_train_utc},
+            )
+            np.save(direction_scalers_path["x_mean"], direction_arrays["x_mean"])
+            np.save(direction_scalers_path["x_std"], direction_arrays["x_std"])
+            np.save(direction_scalers_path["y_mean"], direction_arrays["y_mean"])
+            np.save(direction_scalers_path["y_std"], direction_arrays["y_std"])
+            model_selection_report["direction_selected"] = "challenger"
+        else:
+            direction_model = champion_direction_model
+            direction_arrays = champion_direction_arrays
+            direction_target_mode = str(champion_direction_ckpt.get("target_mode", "residual")).strip().lower()
+            model_selection_report["direction_selected"] = "champion"
+
+        print(
+            "Production selection | "
+            f"speed={model_selection_report.get('speed_selected')} | "
+            f"direction={model_selection_report.get('direction_selected')}"
+        )
+
+        # Save full holdout-period speed predictions for challenger vs champion comparisons.
+        n_eval, horizon = challenger_speed_eval_pred.shape
+        if n_eval > 0 and horizon > 0:
+            details_dir = out_dir / "model_gate_eval_details"
+            details_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            gate_eval_details_csv = details_dir / f"{stamp}_model_gate_eval_speed.csv"
+
+            anchor_ns = speed_eval_anchor_times_utc.astype("int64").to_numpy()
+            target_ns = (
+                np.repeat(anchor_ns, horizon)
+                + np.tile(np.arange(1, horizon + 1, dtype=np.int64), n_eval) * 3_600_000_000_000
+            )
+            raw_eval = pd.DataFrame(
+                {
+                    "target_time_utc": pd.to_datetime(target_ns, utc=True),
+                    "actual_wind_speed": speed_actual_eval.reshape(-1).astype(float),
+                    "forecast_wind_speed": speed_forecast_eval.reshape(-1).astype(float),
+                    "challenger_wind_speed": challenger_speed_eval_pred.reshape(-1).astype(float),
+                    "champion_wind_speed": champion_speed_eval_pred.reshape(-1).astype(float),
+                }
+            )
+            agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
+            agg_eval["n_overlaps"] = raw_eval.groupby("target_time_utc").size().to_numpy()
+            agg_eval["abs_err_challenger"] = np.abs(agg_eval["challenger_wind_speed"] - agg_eval["actual_wind_speed"])
+            agg_eval["abs_err_champion"] = np.abs(agg_eval["champion_wind_speed"] - agg_eval["actual_wind_speed"])
+            agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            agg_eval.to_csv(gate_eval_details_csv, index=False)
+            gate_eval_details_csv_src = gate_eval_details_csv
+            model_selection_report["speed_eval_details_csv"] = str(gate_eval_details_csv)
+
         save_intraday_model(
             intraday_model_path,
             intraday_bundle,
             extra={
-                "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+                "trained_at_utc": now_train_utc,
                 "hidden1": int(args.intraday_hidden1),
                 "hidden2": int(args.intraday_hidden2),
                 "dropout": float(args.intraday_dropout),
@@ -2126,20 +2766,6 @@ def main() -> None:
                 "recency_power": float(args.intraday_recency_power),
             },
         )
-
-        np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
-        np.save(speed_scalers_path["x_std"], speed_arrays["x_std"])
-        np.save(speed_scalers_path["y_mean"], speed_arrays["y_mean"])
-        np.save(speed_scalers_path["y_std"], speed_arrays["y_std"])
-        np.save(direction_scalers_path["x_mean"], direction_arrays["x_mean"])
-        np.save(direction_scalers_path["x_std"], direction_arrays["x_std"])
-        np.save(direction_scalers_path["y_mean"], direction_arrays["y_mean"])
-        np.save(direction_scalers_path["y_std"], direction_arrays["y_std"])
-        n_samples_all_speed = int(speed_arrays["X_all"].shape[0])
-        n_samples_all_direction = int(direction_arrays["X_all"].shape[0])
-        feature_cols = speed_arrays["feature_cols"]
-        direction_target_mode = "residual"
-        model_last_trained_at_utc = datetime.now(timezone.utc).isoformat()
         intraday_hparams = {
             "hidden1": int(args.intraday_hidden1),
             "hidden2": int(args.intraday_hidden2),
@@ -2278,9 +2904,36 @@ def main() -> None:
         mobile=True,
     )
     archived_current_day_plot = None
+    archived_next_day_plots: dict[str, str] | None = None
     daily_mae_csv = None
     daily_mae_png = None
+    gate_eval_history_csv = out_dir / "model_gate_eval_history.csv"
+    gate_eval_history_png = out_dir / "model_gate_eval_history.png"
+    gate_eval_history_csv_src: Path | None = None
+    gate_eval_history_png_src: Path | None = None
+    if not args.skip_training:
+        appended_gate_csv = append_model_gate_eval_history(
+            gate_eval_history_csv,
+            model_selection_gate=model_selection_report,
+            local_tz=args.local_timezone,
+        )
+        if appended_gate_csv is not None:
+            gate_eval_history_csv_src = Path(appended_gate_csv)
+            save_model_gate_eval_history_plot(
+                gate_eval_history_csv_src,
+                gate_eval_history_png,
+                local_tz=args.local_timezone,
+                eval_details_csv=gate_eval_details_csv_src,
+            )
+            gate_eval_history_png_src = gate_eval_history_png
     if not is_test_mode:
+        archived_next_day_plots = maybe_archive_next_day_plots(
+            next_day_plot_path=plot_path,
+            next_day_plot_mobile_path=plot_path_mobile,
+            out_dir=out_dir,
+            local_tz=args.local_timezone,
+            test_now_local_hour=args.test_now_local_hour,
+        )
         archived_current_day_plot = maybe_archive_current_day_plot(
             current_day_plot_path=current_day_plot_path,
             out_dir=out_dir,
@@ -2326,6 +2979,22 @@ def main() -> None:
                 mobile_last_months=3,
             )
             daily_mae_png_mobile_src = daily_mae_png_mobile_refresh
+        if gate_eval_history_csv_src is None and gate_eval_history_csv.exists():
+            gate_eval_history_csv_src = gate_eval_history_csv
+        if gate_eval_details_csv_src is None:
+            details_dir = out_dir / "model_gate_eval_details"
+            if details_dir.exists():
+                detail_files = sorted(details_dir.glob("*_model_gate_eval_speed.csv"))
+                if detail_files:
+                    gate_eval_details_csv_src = detail_files[-1]
+        if gate_eval_history_csv_src is not None:
+            save_model_gate_eval_history_plot(
+                gate_eval_history_csv_src,
+                gate_eval_history_png,
+                local_tz=args.local_timezone,
+                eval_details_csv=gate_eval_details_csv_src,
+            )
+            gate_eval_history_png_src = gate_eval_history_png
         web_publish = publish_web_dashboard(
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
@@ -2339,6 +3008,8 @@ def main() -> None:
             daily_mae_png=daily_mae_png_src,
             daily_mae_png_mobile=daily_mae_png_mobile_src,
             daily_mae_csv=daily_mae_csv_src,
+            gate_eval_png=gate_eval_history_png_src,
+            gate_eval_csv=gate_eval_history_csv_src,
         )
         if args.git_auto_push_pages:
             repo_root = Path(__file__).resolve().parents[1]
@@ -2393,11 +3064,20 @@ def main() -> None:
         "prediction_table_csv": str(table_path),
         "dayahead_snapshot_csv": dayahead_snapshot_csv,
         "prediction_plot_png": str(plot_path),
+        "next_day_plot_archived_png": None
+        if archived_next_day_plots is None
+        else archived_next_day_plots.get("desktop"),
+        "next_day_plot_archived_mobile_png": None
+        if archived_next_day_plots is None
+        else archived_next_day_plots.get("mobile"),
         "current_day_table_csv": str(current_day_table_path),
         "current_day_plot_png": str(current_day_plot_path),
         "current_day_plot_archived_png": archived_current_day_plot,
         "daily_mae_history_csv": daily_mae_csv,
         "daily_mae_history_png": daily_mae_png,
+        "model_gate_eval_history_csv": None if gate_eval_history_csv_src is None else str(gate_eval_history_csv_src),
+        "model_gate_eval_history_png": None if gate_eval_history_png_src is None else str(gate_eval_history_png_src),
+        "model_gate_eval_details_csv": None if gate_eval_details_csv_src is None else str(gate_eval_details_csv_src),
         "web_dashboard_dir": None if web_publish is None else str(Path(args.web_out_dir).resolve()),
         "web_dashboard_files": web_publish,
         "web_dashboard_git_publish": git_publish,
@@ -2415,6 +3095,10 @@ def main() -> None:
         "intraday_learning_rate": intraday_hparams.get("learning_rate"),
         "intraday_recency_power": intraday_hparams.get("recency_power"),
         "data_refresh": refresh_info,
+        "model_selection_gate": model_selection_report,
+        "challenge_eval_split": args.challenge_eval_split,
+        "challenge_min_eval_samples": args.challenge_min_eval_samples,
+        "promotion_margin_pct": args.promotion_margin_pct,
         "max_forecast_age_hours": args.max_forecast_age_hours,
         "expected_update_hour_utc": args.expected_update_hour_utc,
         "validation_split": args.validation_split,
@@ -2436,6 +3120,11 @@ def main() -> None:
     print(f"Current-day plot saved to: {current_day_plot_path}")
     if is_test_mode:
         print("Test mode active: skipped daily archive/history updates and preserved production current-day outputs.")
+    if archived_next_day_plots is not None:
+        if "desktop" in archived_next_day_plots:
+            print(f"Next-day plot archived to: {archived_next_day_plots['desktop']}")
+        if "mobile" in archived_next_day_plots:
+            print(f"Next-day mobile plot archived to: {archived_next_day_plots['mobile']}")
     if archived_current_day_plot is not None:
         print(f"Current-day plot archived to: {archived_current_day_plot}")
     if daily_mae_csv is not None and daily_mae_png is not None:

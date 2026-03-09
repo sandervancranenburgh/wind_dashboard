@@ -32,7 +32,7 @@
 </head>
 <body>
   <h1>Super local wind prediction Valkenburgse meer</h1>
-  <p class="meta">Last updated: 09 March 2026 22:14:10 CET</p>
+  <p class="meta">Last updated: 09 March 2026 22:20:10 CET</p>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
     The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
@@ -45,31 +45,31 @@
       <h2>Current-day prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
       <picture>
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1773090850">
-        <img src="current_day_predictions.png?v=1773090850" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1773091210">
+        <img src="current_day_predictions.png?v=1773091210" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
       <h2>Next-day prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
       <picture>
-        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1773090850">
-        <img src="next_day_predictions.png?v=1773090850" alt="Next day prediction">
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1773091210">
+        <img src="next_day_predictions.png?v=1773091210" alt="Next day prediction">
       </picture>
     </div>
     <div class="card">
       <h2>Day-ahead historical performance</h2>
       <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead Mean Absolute Error (MAE) for Harmonie and super-local predictions.</p>
       <picture>
-        <source media="(max-width: 768px)" srcset="daily_mae_history_mobile.png?v=1773090850">
-        <img src="daily_mae_history.png?v=1773090850" alt="Day-ahead MAE history">
+        <source media="(max-width: 768px)" srcset="daily_mae_history_mobile.png?v=1773091210">
+        <img src="daily_mae_history.png?v=1773091210" alt="Day-ahead MAE history">
       </picture>
     </div>
 
     <div class="card">
       <h2>Model gate holdout comparison</h2>
       <p class="desc">Evaluation holdout only: challenger versus current champion for the next-day model. Lower MAE means better generalization.</p>
-      <img src="model_gate_eval_history.png?v=1773090850" alt="Model gate holdout comparison">
+      <img src="model_gate_eval_history.png?v=1773091210" alt="Model gate holdout comparison">
     </div>
 
   </div>

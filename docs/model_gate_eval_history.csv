@@ -1,2 +1,2 @@
 run_utc,run_local_time,speed_mae_champion,speed_mae_challenger,direction_mae_champion_deg,direction_mae_challenger_deg,speed_selected,direction_selected,speed_eval_samples,direction_eval_samples,promotion_margin_pct,holdout_eval_split,holdout_eval_min_samples
-2026-03-09T20:58:51Z,2026-03-09T21:58:51.522840+01:00,1.9780080318450928,2.145627975463867,19.536649703979492,20.28876304626465,champion,champion,557,557,1.0,0.15,60
+2026-03-09T20:58:51Z,2026-03-09T21:58:51.522840+01:00,1.9780080318450928,2.145627975463867,19.53664970397949,20.28876304626465,champion,champion,557,557,1.0,0.15,60

@@ -1,7 +1,8 @@
-date,run_local_time,mae_forecast,mae_lstm,n_points,details_csv
-2026-03-02,2026-03-02T22:25:05.197763+01:00,2.716923096905584,2.2618256910987524,23,
-2026-03-03,2026-03-03T22:25:05.722906+01:00,2.353571952523097,2.2447484665266844,23,next_day_wind_model/artifacts/daily_error_details/20260303_actual_forecast_lstm.csv
-2026-03-04,2026-03-04T22:25:05.476584+01:00,1.7869215918623882,0.9381864666938782,23,next_day_wind_model/artifacts/daily_error_details/20260304_actual_forecast_lstm.csv
-2026-03-05,2026-03-05T22:25:06.284547+01:00,2.597858014314071,1.1976075587065325,23,next_day_wind_model/artifacts/daily_error_details/20260305_actual_forecast_lstm.csv
-2026-03-06,2026-03-06T22:56:06.384980+01:00,1.978602622794272,1.266524805772773,229,next_day_wind_model/artifacts/daily_error_details/20260306_actual_forecast_lstm.csv
-2026-03-07,2026-03-07T22:56:07.351659+01:00,1.6078602642992177,1.0534945440084134,229,next_day_wind_model/artifacts/daily_error_details/20260307_actual_forecast_lstm.csv
+date,run_local_time,mae_forecast,mae_lstm,n_points,details_csv,evaluation_type,issue_local_time,avg_actual_wind_speed,avg_forecast_wind_speed,avg_lstm_wind_speed,snapshot_csv
+2026-03-02,2026-03-02T22:25:05.197763+01:00,2.716923096905584,2.2618256910987524,23,,legacy_current_day,,,,,
+2026-03-03,2026-03-03T22:25:05.722906+01:00,2.353571952523097,2.2447484665266844,23,next_day_wind_model/artifacts/daily_error_details/20260303_actual_forecast_lstm.csv,legacy_current_day,,,,,
+2026-03-04,2026-03-04T22:25:05.476584+01:00,1.7869215918623882,0.9381864666938782,23,next_day_wind_model/artifacts/daily_error_details/20260304_actual_forecast_lstm.csv,legacy_current_day,,,,,
+2026-03-05,2026-03-05T22:25:06.284547+01:00,2.597858014314071,1.1976075587065325,23,next_day_wind_model/artifacts/daily_error_details/20260305_actual_forecast_lstm.csv,legacy_current_day,,,,,
+2026-03-06,2026-03-06T22:56:06.384980+01:00,1.978602622794272,1.266524805772773,229,next_day_wind_model/artifacts/daily_error_details/20260306_actual_forecast_lstm.csv,legacy_current_day,,,,,
+2026-03-07,2026-03-07T22:56:07.351659+01:00,1.6078602642992177,1.0534945440084134,229,next_day_wind_model/artifacts/daily_error_details/20260307_actual_forecast_lstm.csv,legacy_current_day,,,,,
+2026-03-09,2026-03-09T22:36:09.499434+01:00,2.161351909184727,1.1799036360459079,22,next_day_wind_model/artifacts/daily_error_details/20260309_dayahead_actual_forecast_lstm.csv,day_ahead_frozen,2026-03-08T11:25:07.743889+01:00,1.2740547893798668,3.3636363636363638,2.0493949563636367,next_day_wind_model/artifacts/dayahead_snapshots/20260308-112507_target_20260309.csv

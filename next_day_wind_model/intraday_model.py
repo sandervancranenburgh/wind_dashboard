@@ -58,6 +58,7 @@ class IntradayBundle:
     x_std: np.ndarray
     y_mean: float
     y_std: float
+    rollout_calibration: dict | None = None
 
 
 @dataclass
@@ -145,6 +146,16 @@ def build_intraday_training_xy(db_path: Path, cfg: DatasetConfig) -> tuple[np.nd
     X = np.stack(X_list).astype(np.float32)
     y = np.array(y_list, dtype=np.float32)
     return X, y
+
+
+def _build_intraday_training_frame(db_path: Path, cfg: DatasetConfig) -> pd.DataFrame:
+    frame = _build_training_frame(db_path, cfg).copy()
+    frame = frame.sort_index()
+    need_cols = ["forecast_avg", "forecast_max", "forecast_dir", "actual_avg", "month_sin", "month_cos"]
+    frame = frame.dropna(subset=need_cols)
+    if len(frame) < 50:
+        raise ValueError("Not enough rows to train intraday model.")
+    return frame
 
 
 def _fit_intraday_from_arrays(
@@ -235,6 +246,159 @@ def _fit_intraday_from_arrays(
     return bundle, float(best_val)
 
 
+def _predict_intraday_step(
+    bundle: IntradayBundle,
+    x: np.ndarray,
+    forecast_next: float,
+    device: torch.device,
+) -> float:
+    x_s = (x - bundle.x_mean) / bundle.x_std
+    with torch.no_grad():
+        pred_res_s = float(bundle.model(torch.from_numpy(x_s).float().unsqueeze(0).to(device)).cpu().numpy()[0])
+    pred_res = pred_res_s * bundle.y_std + bundle.y_mean
+    return max(0.0, float(forecast_next + pred_res))
+
+
+def _build_intraday_feature_row(
+    frame: pd.DataFrame,
+    actual_series: np.ndarray,
+    i: int,
+) -> np.ndarray:
+    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
+    fc_max = frame["forecast_max"].to_numpy(dtype=np.float32)
+    fc_dir = frame["forecast_dir"].to_numpy(dtype=np.float32)
+    month_sin = frame["month_sin"].to_numpy(dtype=np.float32)
+    month_cos = frame["month_cos"].to_numpy(dtype=np.float32)
+    timestamp = frame.index[i]
+    res_t = actual_series[i] - fc_avg[i]
+    res_t_1 = actual_series[i - 1] - fc_avg[i - 1]
+    res_t_2 = actual_series[i - 2] - fc_avg[i - 2]
+    hour_ang = 2.0 * np.pi * (float(timestamp.hour) / 24.0)
+    return np.array(
+        [
+            fc_avg[i],
+            fc_max[i],
+            fc_avg[i + 1],
+            fc_max[i + 1],
+            np.sin(np.deg2rad(fc_dir[i])),
+            np.cos(np.deg2rad(fc_dir[i])),
+            np.sin(np.deg2rad(fc_dir[i + 1])),
+            np.cos(np.deg2rad(fc_dir[i + 1])),
+            actual_series[i],
+            actual_series[i - 1],
+            actual_series[i - 2],
+            res_t,
+            res_t_1,
+            res_t_2,
+            np.sin(hour_ang),
+            np.cos(hour_ang),
+            month_sin[i],
+            month_cos[i],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _fit_intraday_rollout_calibration(
+    bundle: IntradayBundle,
+    frame: pd.DataFrame,
+    sample_split_idx: int,
+    device: torch.device,
+    max_horizon: int = 12,
+) -> dict | None:
+    if sample_split_idx < 20:
+        return None
+
+    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
+    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
+    first_anchor = int(sample_split_idx + 2)
+    last_anchor = int(len(frame) - max_horizon - 1)
+    if first_anchor >= last_anchor:
+        return None
+
+    rows: list[dict] = []
+    for anchor in range(first_anchor, last_anchor):
+        recursive_actual = actual.copy()
+        recursive_actual[anchor + 1 :] = np.nan
+        for horizon in range(1, max_horizon + 1):
+            i = anchor + horizon - 1
+            x = _build_intraday_feature_row(frame, recursive_actual, i)
+            pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(fc_avg[i + 1]), device=device)
+            recursive_actual[i + 1] = pred_speed
+            rows.append(
+                {
+                    "horizon": horizon,
+                    "forecast": float(fc_avg[i + 1]),
+                    "pred_recursive": float(pred_speed),
+                    "actual": float(actual[i + 1]),
+                }
+            )
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    weights: list[float] = []
+    prev_weight = 1.0
+    for horizon in range(1, max_horizon + 1):
+        subset = df[df["horizon"] == horizon]
+        if subset.empty or horizon == 1:
+            weights.append(prev_weight)
+            continue
+        forecast = subset["forecast"].to_numpy(dtype=np.float32)
+        pred = subset["pred_recursive"].to_numpy(dtype=np.float32)
+        actual_vals = subset["actual"].to_numpy(dtype=np.float32)
+        best_weight = prev_weight
+        best_mae = float(np.mean(np.abs(np.maximum(0.0, forecast + prev_weight * (pred - forecast)) - actual_vals)))
+        for weight in np.arange(0.8, prev_weight + 0.001, 0.05):
+            cand = np.maximum(0.0, forecast + float(weight) * (pred - forecast))
+            mae = float(np.mean(np.abs(cand - actual_vals)))
+            if mae + 1e-9 < best_mae:
+                best_mae = mae
+                best_weight = float(weight)
+        weights.append(best_weight)
+        prev_weight = best_weight
+
+    weights_arr = np.asarray(weights, dtype=np.float32)
+    horizon_idx = df["horizon"].to_numpy(dtype=int) - 1
+    calibrated = np.maximum(
+        0.0,
+        df["forecast"].to_numpy(dtype=np.float32)
+        + weights_arr[horizon_idx] * (df["pred_recursive"].to_numpy(dtype=np.float32) - df["forecast"].to_numpy(dtype=np.float32)),
+    )
+    baseline_mae = float(np.mean(np.abs(df["pred_recursive"].to_numpy(dtype=np.float32) - df["actual"].to_numpy(dtype=np.float32))))
+    calibrated_mae = float(np.mean(np.abs(calibrated - df["actual"].to_numpy(dtype=np.float32))))
+    improvement_abs = baseline_mae - calibrated_mae
+    if improvement_abs <= 1e-4:
+        return None
+    return {
+        "enabled": True,
+        "max_horizon": int(max_horizon),
+        "weights": [float(w) for w in weights_arr.tolist()],
+        "baseline_mae": float(baseline_mae),
+        "calibrated_mae": float(calibrated_mae),
+        "improvement_abs": float(improvement_abs),
+        "improvement_pct": float(improvement_abs / max(baseline_mae, 1e-6)),
+        "n_rows": int(len(df)),
+    }
+
+
+def _apply_intraday_rollout_calibration(
+    pred_speed: float,
+    forecast_speed: float,
+    future_horizon: int,
+    rollout_calibration: dict | None,
+) -> float:
+    if future_horizon <= 0 or not rollout_calibration or not bool(rollout_calibration.get("enabled", False)):
+        return float(pred_speed)
+    weights = rollout_calibration.get("weights") or []
+    if not weights:
+        return float(pred_speed)
+    horizon_idx = min(int(future_horizon) - 1, len(weights) - 1)
+    weight = float(weights[horizon_idx])
+    return max(0.0, float(forecast_speed) + weight * (float(pred_speed) - float(forecast_speed)))
+
+
 def train_intraday_model(
     db_path: Path,
     cfg: DatasetConfig,
@@ -248,6 +412,7 @@ def train_intraday_model(
     learning_rate: float = 1e-3,
     recency_power: float = 1.0,
 ) -> tuple[IntradayBundle, dict]:
+    training_frame = _build_intraday_training_frame(db_path, cfg)
     X_all, y_all = build_intraday_training_xy(db_path, cfg)
     n = len(X_all)
     split_idx = int(n * (1.0 - validation_split))
@@ -273,6 +438,12 @@ def train_intraday_model(
         params=params,
         device=device,
     )
+    bundle.rollout_calibration = _fit_intraday_rollout_calibration(
+        bundle=bundle,
+        frame=training_frame,
+        sample_split_idx=split_idx,
+        device=device,
+    )
     stats = {
         "n_samples": int(n),
         "n_train": int(len(X_train)),
@@ -284,6 +455,7 @@ def train_intraday_model(
         "dropout": float(dropout),
         "learning_rate": float(learning_rate),
         "recency_power": float(recency_power),
+        "rollout_calibration": bundle.rollout_calibration,
     }
     return bundle, stats
 
@@ -301,6 +473,7 @@ def save_intraday_model(path: Path, bundle: IntradayBundle, extra: dict | None =
         "hidden1": int(getattr(bundle.model.net[0], "out_features", 128)),
         "hidden2": int(getattr(bundle.model.net[3], "out_features", 64)),
         "dropout": float(getattr(bundle.model.net[2], "p", 0.1)),
+        "rollout_calibration": bundle.rollout_calibration,
     }
     if extra:
         payload.update(extra)
@@ -323,6 +496,7 @@ def load_intraday_model(path: Path, device: torch.device) -> tuple[IntradayBundl
         x_std=np.asarray(ckpt["x_std"], dtype=np.float32),
         y_mean=float(ckpt["y_mean"]),
         y_std=float(ckpt["y_std"]),
+        rollout_calibration=ckpt.get("rollout_calibration"),
     )
     return bundle, ckpt
 
@@ -401,11 +575,15 @@ def predict_intraday_day_speed(
             ],
             dtype=np.float32,
         )
-        x_s = (x - bundle.x_mean) / bundle.x_std
-        with torch.no_grad():
-            pred_res_s = float(bundle.model(torch.from_numpy(x_s).float().unsqueeze(0).to(device)).cpu().numpy()[0])
-        pred_res = pred_res_s * bundle.y_std + bundle.y_mean
-        pred_speed = max(0.0, fc_avg_t1 + pred_res)
+        pred_speed = _predict_intraday_step(bundle, x, forecast_next=fc_avg_t1, device=device)
+        if h > now_hour_local:
+            future_horizon = int((h - now_hour_local).total_seconds() / 3600.0)
+            pred_speed = _apply_intraday_rollout_calibration(
+                pred_speed=pred_speed,
+                forecast_speed=fc_avg_t1,
+                future_horizon=future_horizon,
+                rollout_calibration=bundle.rollout_calibration,
+            )
         pred_full[h_idx] = float(pred_speed)
 
         # Recursive update only for unknown/future points.

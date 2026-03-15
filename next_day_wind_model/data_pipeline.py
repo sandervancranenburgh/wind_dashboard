@@ -487,6 +487,7 @@ def build_next_day_inference_input(
         "forecast_min_next24": forecast_min_next,
         "forecast_max_next24": forecast_max_next,
         "forecast_dir_next24": forecast_dir_next,
+        "anchor_forecast_dir": np.float32(history_frame["forecast_dir"].iloc[-1]),
         "target_times": np.array([t.isoformat() for t in target_times]),
         "anchor_time": anchor_time.isoformat(),
         "reference_observation_time": latest_obs.isoformat(),

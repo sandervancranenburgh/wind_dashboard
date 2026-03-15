@@ -366,6 +366,327 @@ def train_with_validation(
     return model, stats
 
 
+def _validation_start_index(n_samples: int, validation_split: float) -> int:
+    if not (0.0 < validation_split < 0.5):
+        raise ValueError("validation_split must be > 0 and < 0.5.")
+    if n_samples < 2:
+        raise ValueError("Need at least two samples for a validation split.")
+    split_idx = int(n_samples * (1.0 - validation_split))
+    split_idx = max(1, min(split_idx, n_samples - 1))
+    return int(split_idx)
+
+
+def _extract_speed_regime_signal(
+    pred_speed: np.ndarray,
+    forecast_speed: np.ndarray,
+    signal: str,
+) -> np.ndarray:
+    pred_arr = np.asarray(pred_speed, dtype=np.float32)
+    forecast_arr = np.asarray(forecast_speed, dtype=np.float32)
+    mode = str(signal).strip().lower()
+    if mode == "pred_max":
+        return pred_arr.max(axis=1).astype(np.float32)
+    if mode == "pred_mean":
+        return pred_arr.mean(axis=1).astype(np.float32)
+    if mode == "forecast_max":
+        return forecast_arr.max(axis=1).astype(np.float32)
+    if mode == "forecast_mean":
+        return forecast_arr.mean(axis=1).astype(np.float32)
+    raise ValueError(f"Unsupported speed regime signal: {signal}")
+
+
+def _build_speed_calibration_context(
+    anchor_dir_deg: np.ndarray | pd.Series | list[float] | float,
+    target_times_utc: pd.DatetimeIndex | pd.Series | np.ndarray | list[str] | str,
+) -> dict:
+    anchor_dir_arr = np.asarray(anchor_dir_deg, dtype=np.float32).reshape(-1)
+    if np.isscalar(target_times_utc) or isinstance(target_times_utc, str):
+        target_times = pd.DatetimeIndex([pd.to_datetime(target_times_utc, utc=True)])
+    else:
+        target_times = pd.to_datetime(target_times_utc, utc=True)
+        if isinstance(target_times, pd.Timestamp):
+            target_times = pd.DatetimeIndex([target_times])
+    target_month = np.asarray(target_times.month, dtype=np.int16).reshape(-1)
+    if anchor_dir_arr.shape[0] != target_month.shape[0]:
+        raise ValueError("anchor_dir_deg and target_times_utc must have the same length.")
+    return {
+        "anchor_dir_deg": anchor_dir_arr.astype(np.float32),
+        "target_month": target_month.astype(np.int16),
+    }
+
+
+def _speed_calibration_feature_matrix(
+    signal_values: np.ndarray,
+    speed_calibration_context: dict | None,
+    signal_mean: float | None = None,
+    signal_std: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    signal_arr = np.asarray(signal_values, dtype=np.float32).reshape(-1)
+    n = signal_arr.shape[0]
+    if speed_calibration_context is None:
+        anchor_dir = np.zeros(n, dtype=np.float32)
+        target_month = np.ones(n, dtype=np.int16)
+    else:
+        anchor_dir = np.asarray(speed_calibration_context.get("anchor_dir_deg"), dtype=np.float32).reshape(-1)
+        target_month = np.asarray(speed_calibration_context.get("target_month"), dtype=np.int16).reshape(-1)
+        if anchor_dir.shape[0] != n or target_month.shape[0] != n:
+            raise ValueError("Speed calibration context length must match the number of samples.")
+
+    sig_mean = float(signal_arr.mean()) if signal_mean is None else float(signal_mean)
+    sig_std = float(signal_arr.std()) if signal_std is None else float(signal_std)
+    if sig_std <= 0.0:
+        sig_std = 1.0
+    sig_norm = ((signal_arr - sig_mean) / sig_std).astype(np.float32)
+
+    dir_rad = np.deg2rad(anchor_dir.astype(np.float32))
+    dir_sin = np.sin(dir_rad).astype(np.float32)
+    dir_cos = np.cos(dir_rad).astype(np.float32)
+    month_angle = (2.0 * np.pi * (target_month.astype(np.float32) - 1.0)) / 12.0
+    month_sin = np.sin(month_angle).astype(np.float32)
+    month_cos = np.cos(month_angle).astype(np.float32)
+
+    features = np.column_stack(
+        [
+            np.ones(n, dtype=np.float32),
+            sig_norm,
+            dir_sin,
+            dir_cos,
+            month_sin,
+            month_cos,
+            sig_norm * dir_sin,
+            sig_norm * dir_cos,
+            sig_norm * month_sin,
+            sig_norm * month_cos,
+        ]
+    ).astype(np.float32)
+    return features, {
+        "signal_mean": sig_mean,
+        "signal_std": sig_std,
+        "feature_names": [
+            "bias",
+            "signal_norm",
+            "dir_sin",
+            "dir_cos",
+            "month_sin",
+            "month_cos",
+            "signal_x_dir_sin",
+            "signal_x_dir_cos",
+            "signal_x_month_sin",
+            "signal_x_month_cos",
+        ],
+    }
+
+
+def _fit_threshold_speed_calibration(
+    pred_arr: np.ndarray,
+    forecast_arr: np.ndarray,
+    actual_arr: np.ndarray,
+    signal_values: np.ndarray,
+    signal: str,
+) -> dict | None:
+    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    sig_min = float(np.min(signal_values))
+    sig_max = float(np.max(signal_values))
+    if not np.isfinite(sig_min) or not np.isfinite(sig_max) or sig_max - sig_min < 0.5:
+        return None
+
+    start_grid = np.arange(max(0.0, np.floor(sig_min * 2.0) / 2.0), np.ceil(sig_max * 2.0) / 2.0 + 0.5, 0.5)
+    min_scale_grid = np.arange(0.0, 1.01, 0.05)
+    best_mae = baseline_mae
+    best_params: tuple[float, float, float] | None = None
+
+    for start in start_grid:
+        end_grid = np.arange(start + 0.5, np.ceil((sig_max + 2.0) * 2.0) / 2.0 + 0.5, 0.5)
+        for end in end_grid:
+            t = np.clip((signal_values - start) / (end - start), 0.0, 1.0).astype(np.float32)
+            for min_scale in min_scale_grid:
+                scale = (1.0 + (float(min_scale) - 1.0) * t).astype(np.float32)
+                cand = forecast_arr + scale[:, None] * (pred_arr - forecast_arr)
+                cand = np.maximum(cand, 0.0).astype(np.float32)
+                mae = float(np.mean(np.abs(cand - actual_arr)))
+                if mae + 1e-9 < best_mae:
+                    best_mae = mae
+                    best_params = (float(start), float(end), float(min_scale))
+
+    if best_params is None:
+        return None
+
+    start, end, min_scale = best_params
+    improvement_abs = baseline_mae - best_mae
+    if improvement_abs <= 1e-6:
+        return None
+    return {
+        "enabled": True,
+        "type": "threshold_v1",
+        "signal": str(signal),
+        "start": float(start),
+        "end": float(end),
+        "min_scale": float(min_scale),
+        "baseline_mae": float(baseline_mae),
+        "calibrated_mae": float(best_mae),
+        "improvement_abs": float(improvement_abs),
+        "improvement_pct": float(improvement_abs / max(baseline_mae, 1e-6)),
+        "n_samples": int(pred_arr.shape[0]),
+    }
+
+
+def _fit_contextual_speed_calibration(
+    pred_arr: np.ndarray,
+    forecast_arr: np.ndarray,
+    actual_arr: np.ndarray,
+    signal_values: np.ndarray,
+    speed_calibration_context: dict | None,
+    signal: str,
+) -> dict | None:
+    if speed_calibration_context is None:
+        return None
+
+    delta = (pred_arr - forecast_arr).astype(np.float32)
+    target_delta = (actual_arr - forecast_arr).astype(np.float32)
+    denom = np.sum(delta * delta, axis=1).astype(np.float32)
+    informative = denom > 1e-6
+    if int(np.sum(informative)) < 32:
+        return None
+
+    target_scale = np.ones(pred_arr.shape[0], dtype=np.float32)
+    numer = np.sum(delta * target_delta, axis=1).astype(np.float32)
+    target_scale[informative] = np.clip(numer[informative] / denom[informative], 0.0, 1.0)
+
+    X, feature_meta = _speed_calibration_feature_matrix(signal_values, speed_calibration_context)
+    mean_denom = float(np.mean(denom[informative])) if informative.any() else 1.0
+    sample_w = np.sqrt(np.clip(denom / max(mean_denom, 1e-6), 0.25, 4.0)).astype(np.float32)
+
+    best_coef: np.ndarray | None = None
+    best_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    best_ridge = None
+    xt = X.astype(np.float64)
+    yt = target_scale.astype(np.float64)
+    wt = sample_w.astype(np.float64)
+    identity = np.eye(xt.shape[1], dtype=np.float64)
+    identity[0, 0] = 0.0
+
+    for ridge in (0.1, 0.5, 1.0, 2.0, 5.0, 10.0):
+        xw = xt * wt[:, None]
+        yw = yt * wt
+        try:
+            coef = np.linalg.solve(xw.T @ xw + float(ridge) * identity, xw.T @ yw).astype(np.float32)
+        except np.linalg.LinAlgError:
+            continue
+        scale = np.clip(xt @ coef.astype(np.float64), 0.0, 1.0).astype(np.float32)
+        cand = forecast_arr + scale[:, None] * delta
+        cand = np.maximum(cand, 0.0).astype(np.float32)
+        mae = float(np.mean(np.abs(cand - actual_arr)))
+        if mae + 1e-9 < best_mae:
+            best_mae = mae
+            best_coef = coef
+            best_ridge = float(ridge)
+
+    if best_coef is None:
+        return None
+
+    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    improvement_abs = baseline_mae - best_mae
+    if improvement_abs <= 1e-6:
+        return None
+    return {
+        "enabled": True,
+        "type": "contextual_linear_v2",
+        "signal": str(signal),
+        "signal_mean": float(feature_meta["signal_mean"]),
+        "signal_std": float(feature_meta["signal_std"]),
+        "feature_names": feature_meta["feature_names"],
+        "coefficients": [float(v) for v in best_coef.tolist()],
+        "ridge": best_ridge,
+        "baseline_mae": float(baseline_mae),
+        "calibrated_mae": float(best_mae),
+        "improvement_abs": float(improvement_abs),
+        "improvement_pct": float(improvement_abs / max(baseline_mae, 1e-6)),
+        "n_samples": int(pred_arr.shape[0]),
+    }
+
+
+def fit_speed_regime_calibration(
+    pred_speed: np.ndarray,
+    forecast_speed: np.ndarray,
+    actual_speed: np.ndarray,
+    speed_calibration_context: dict | None = None,
+    signal: str = "pred_max",
+) -> dict | None:
+    pred_arr = np.asarray(pred_speed, dtype=np.float32)
+    forecast_arr = np.asarray(forecast_speed, dtype=np.float32)
+    actual_arr = np.asarray(actual_speed, dtype=np.float32)
+    if pred_arr.ndim != 2 or forecast_arr.shape != pred_arr.shape or actual_arr.shape != pred_arr.shape:
+        raise ValueError("Speed calibration expects (samples, horizon) arrays of identical shape.")
+    if pred_arr.shape[0] < 32:
+        return None
+
+    signal_values = _extract_speed_regime_signal(pred_arr, forecast_arr, signal)
+    threshold_cal = _fit_threshold_speed_calibration(pred_arr, forecast_arr, actual_arr, signal_values, signal)
+    contextual_cal = _fit_contextual_speed_calibration(
+        pred_arr,
+        forecast_arr,
+        actual_arr,
+        signal_values,
+        speed_calibration_context,
+        signal,
+    )
+    candidates = [c for c in [threshold_cal, contextual_cal] if c is not None]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: float(c["calibrated_mae"]))
+
+
+def apply_speed_regime_calibration(
+    pred_speed: np.ndarray,
+    forecast_speed: np.ndarray,
+    speed_calibration: dict | None,
+    speed_calibration_context: dict | None = None,
+) -> np.ndarray:
+    if not speed_calibration or not bool(speed_calibration.get("enabled", False)):
+        return np.asarray(pred_speed, dtype=np.float32)
+
+    pred_arr = np.asarray(pred_speed, dtype=np.float32)
+    forecast_arr = np.asarray(forecast_speed, dtype=np.float32)
+    if pred_arr.shape != forecast_arr.shape:
+        raise ValueError("pred_speed and forecast_speed must have the same shape for calibration.")
+
+    input_was_vector = pred_arr.ndim == 1
+    if input_was_vector:
+        pred_arr = pred_arr[np.newaxis, :]
+        forecast_arr = forecast_arr[np.newaxis, :]
+    elif pred_arr.ndim != 2:
+        raise ValueError("Speed calibration expects a 1D or 2D prediction array.")
+
+    cal_type = str(speed_calibration.get("type", "threshold_v1")).strip().lower()
+    signal_values = _extract_speed_regime_signal(
+        pred_arr,
+        forecast_arr,
+        str(speed_calibration.get("signal", "pred_max")),
+    )
+    if cal_type == "contextual_linear_v2":
+        features, _ = _speed_calibration_feature_matrix(
+            signal_values,
+            speed_calibration_context,
+            signal_mean=float(speed_calibration.get("signal_mean", 0.0)),
+            signal_std=float(speed_calibration.get("signal_std", 1.0)),
+        )
+        coef = np.asarray(speed_calibration.get("coefficients", []), dtype=np.float32)
+        if coef.shape[0] != features.shape[1]:
+            raise ValueError("Speed contextual calibration coefficients do not match feature dimensions.")
+        scale = np.clip(features @ coef, 0.0, 1.0).astype(np.float32)
+    else:
+        start = float(speed_calibration["start"])
+        end = float(speed_calibration["end"])
+        min_scale = float(speed_calibration["min_scale"])
+        t = np.clip((signal_values - start) / max(end - start, 1e-6), 0.0, 1.0).astype(np.float32)
+        scale = (1.0 + (min_scale - 1.0) * t).astype(np.float32)
+    calibrated = forecast_arr + scale[:, None] * (pred_arr - forecast_arr)
+    calibrated = np.maximum(calibrated, 0.0).astype(np.float32)
+    if input_was_vector:
+        return calibrated[0].astype(np.float32)
+    return calibrated.astype(np.float32)
+
+
 def predict_speed(
     model: nn.Module,
     X_input: np.ndarray,
@@ -374,6 +695,8 @@ def predict_speed(
     y_std: float,
     target_mode: str,
     constraint_eps: float | None,
+    speed_calibration: dict | None,
+    speed_calibration_context: dict | None,
     device: torch.device,
 ) -> np.ndarray:
     model.eval()
@@ -388,6 +711,7 @@ def predict_speed(
         pred = np.exp(np.log(forecast_speed + eps) + pred)
     elif mode != "absolute":
         raise ValueError(f"Unsupported speed target mode: {target_mode}")
+    pred = apply_speed_regime_calibration(pred, forecast_speed, speed_calibration, speed_calibration_context)
     return pred.astype(np.float32)
 
 
@@ -419,6 +743,8 @@ def _predict_speed_batch(
     y_std: float,
     target_mode: str,
     constraint_eps: float | None,
+    speed_calibration: dict | None,
+    speed_calibration_context: dict | None,
     device: torch.device,
 ) -> np.ndarray:
     model.eval()
@@ -433,6 +759,7 @@ def _predict_speed_batch(
         pred = np.exp(np.log(forecast_speed + eps) + pred)
     elif mode != "absolute":
         raise ValueError(f"Unsupported speed target mode: {target_mode}")
+    pred = apply_speed_regime_calibration(pred, forecast_speed, speed_calibration, speed_calibration_context)
     return pred.astype(np.float32)
 
 
@@ -1015,6 +1342,8 @@ def save_current_day_plot(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
+    prior_prediction_tables: list[pd.DataFrame] | None = None,
+    fixed_origin_mae_metrics: list[dict] | None = None,
     mobile: bool = False,
 ) -> None:
     table = table.copy()
@@ -1026,6 +1355,7 @@ def save_current_day_plot(
         raise ValueError("No rows available in 08:00-22:00 range for current-day plotting.")
 
     x = np.arange(len(table))
+    x_lookup = {ts: idx for idx, ts in enumerate(table["time_local"])}
     first_dt = table["time_local"].iloc[0]
     day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
@@ -1089,6 +1419,49 @@ def save_current_day_plot(
         zorder=5,
     )
 
+    overlay_tables = prior_prediction_tables or []
+    if overlay_tables:
+        overlay_alpha_start = 0.10 if mobile else 0.08
+        overlay_alpha_end = 0.28 if mobile else 0.22
+        overlay_lw = 1.0 if mobile else 0.9
+        overlay_alphas = np.linspace(overlay_alpha_start, overlay_alpha_end, len(overlay_tables), dtype=float)
+        for overlay_table, overlay_alpha in zip(overlay_tables, overlay_alphas):
+            overlay = overlay_table.copy()
+            if "time_local" not in overlay.columns or "lstm_pred_wind_speed" not in overlay.columns:
+                continue
+            overlay["time_local"] = pd.to_datetime(overlay["time_local"], utc=True, errors="coerce").dt.tz_convert(
+                ZoneInfo(local_tz)
+            )
+            overlay = overlay.dropna(subset=["time_local"]).copy()
+            if overlay.empty:
+                continue
+            overlay = overlay[
+                (overlay["time_local"].dt.hour >= 8)
+                & (
+                    (overlay["time_local"].dt.hour < 22)
+                    | ((overlay["time_local"].dt.hour == 22) & (overlay["time_local"].dt.minute == 0))
+                )
+            ].copy()
+            if overlay.empty:
+                continue
+            overlay_x = np.array([x_lookup.get(ts, np.nan) for ts in overlay["time_local"]], dtype=float)
+            overlay_y = overlay["lstm_pred_wind_speed"].to_numpy(dtype=float)
+            valid = (~np.isnan(overlay_x)) & (~np.isnan(overlay_y))
+            if valid.sum() < 2:
+                continue
+            overlay_x = overlay_x[valid]
+            overlay_y = overlay_y[valid]
+            order = np.argsort(overlay_x)
+            ax.plot(
+                overlay_x[order],
+                overlay_y[order],
+                color=LSTM_HIGHLIGHT_COLOR,
+                linewidth=overlay_lw,
+                alpha=float(overlay_alpha),
+                zorder=2,
+                label="_nolegend_",
+            )
+
     # Vertical line at present hour boundary (first predicted hour).
     future_idx = np.where(table["is_future"].to_numpy(dtype=bool))[0]
 
@@ -1148,30 +1521,155 @@ def save_current_day_plot(
     ax.set_xlim(-0.05, len(table) - 1.0 + 0.02)
     ax.set_ylim(y_lower, y_upper)
 
+    metric_map = {
+        int(metric.get("lookback_hours", 0)): metric
+        for metric in (fixed_origin_mae_metrics or [])
+    }
+
+    superlocal_color = "#d62728"
+    measured_color = "#cc33cc"
+    harmonie_color = "#666666"
+    better_color = "#2ca02c"
+    worse_color = "#d62728"
+    neutral_color = "black"
+    metric_fontfamily = "monospace"
+
     actual_idx = np.where(~np.isnan(actual_avg))[0]
     if len(actual_idx) > 0:
+        latest_actual_idx = int(actual_idx[-1])
+        latest_actual_value = float(actual_avg[latest_actual_idx])
         # Mark "now" at the latest available measured point on the dense timeline.
-        ax.axvline(float(actual_idx[-1]), color="gray", linestyle="--", linewidth=1.0)
+        ax.axvline(float(latest_actual_idx), color="gray", linestyle="--", linewidth=1.0)
+        ax.annotate(
+            f"{int(round(latest_actual_value))} kts",
+            xy=(latest_actual_idx, latest_actual_value),
+            xytext=(-8, -12) if latest_actual_idx >= len(table) - 3 else (6, -12),
+            textcoords="offset points",
+            ha="right" if latest_actual_idx >= len(table) - 3 else "left",
+            va="top",
+            fontsize=max(mae_fs - 1, 8),
+            color=measured_color,
+            zorder=8,
+            clip_on=True,
+        )
 
-    mae_fc, mae_lstm, _ = compute_running_mae(table)
-    mse_text = (
-        f"Running mean absolute error\n"
-        f"Super local vs measured wind: {mae_lstm:.2f} kts\n"
-        f"Harmonie vs measured wind: {mae_fc:.2f} kts"
+    def _metric_value_colors(metric: dict | None) -> tuple[str, str]:
+        if not metric or not metric.get("available", False):
+            return neutral_color, neutral_color
+        mae_superlocal = float(metric["mae_superlocal"])
+        mae_harmonie = float(metric["mae_harmonie"])
+        if np.isclose(mae_superlocal, mae_harmonie):
+            return better_color, better_color
+        if mae_superlocal < mae_harmonie:
+            return better_color, worse_color
+        return worse_color, better_color
+
+    def _metric_left_label(model_label: str, model_color: str) -> HPacker:
+        padded_model_label = model_label.ljust(len("Super local"))
+        return HPacker(
+            children=[
+                TextArea(
+                    padded_model_label,
+                    textprops={"fontsize": mae_fs, "color": model_color, "fontfamily": metric_fontfamily},
+                ),
+                TextArea(" vs ", textprops={"fontsize": mae_fs, "color": "black", "fontfamily": metric_fontfamily}),
+                TextArea("Measured", textprops={"fontsize": mae_fs, "color": measured_color, "fontfamily": metric_fontfamily}),
+            ],
+            align="center",
+            pad=0,
+            sep=0,
+        )
+
+    def _metric_line(
+        model_label: str,
+        model_color: str,
+        hours: int,
+        value_text: str,
+        value_color: str,
+    ) -> HPacker:
+        return HPacker(
+            children=[
+                _metric_left_label(model_label, model_color),
+                TextArea("  ", textprops={"fontsize": mae_fs, "color": "black", "fontfamily": metric_fontfamily}),
+                TextArea(
+                    f"{hours} hr interval: ",
+                    textprops={"fontsize": mae_fs, "color": "black", "fontfamily": metric_fontfamily},
+                ),
+                TextArea(
+                    value_text,
+                    textprops={
+                        "fontsize": mae_fs,
+                        "color": value_color,
+                        "fontweight": "bold" if value_text != "n/a" else "normal",
+                        "fontfamily": metric_fontfamily,
+                    },
+                ),
+            ],
+            align="center",
+            pad=0,
+            sep=0,
+        )
+
+    metric_lines: list[TextArea | HPacker] = [
+        TextArea(
+            "Running mean absolute error",
+            textprops={
+                "fontsize": mae_fs,
+                "fontweight": "bold",
+                "color": "black",
+                "fontfamily": metric_fontfamily,
+            },
+        )
+    ]
+    for hours in (3, 6):
+        metric = metric_map.get(hours)
+        superlocal_value_color, harmonie_value_color = _metric_value_colors(metric)
+        if metric and metric.get("available", False):
+            mae_superlocal_txt = f"{float(metric['mae_superlocal']):.2f} kts"
+            mae_harmonie_txt = f"{float(metric['mae_harmonie']):.2f} kts"
+        else:
+            mae_superlocal_txt = "n/a"
+            mae_harmonie_txt = "n/a"
+        metric_lines.append(
+            _metric_line(
+                "Super local",
+                superlocal_color,
+                hours,
+                mae_superlocal_txt,
+                superlocal_value_color,
+            )
+        )
+        metric_lines.append(
+            _metric_line(
+                "Harmonie",
+                harmonie_color,
+                hours,
+                mae_harmonie_txt,
+                harmonie_value_color,
+            )
+        )
+
+    mse_box = VPacker(
+        children=metric_lines,
+        align="left",
+        pad=0,
+        sep=1,
     )
-    ax.text(
-        0.985,
-        meta_y,
-        mse_text,
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=mae_fs,
-        color="black",
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
-        zorder=7,
-        clip_on=False,
+    mse_anchored = AnchoredOffsetbox(
+        loc="upper right",
+        child=mse_box,
+        pad=0.2,
+        frameon=True,
+        bbox_to_anchor=(0.992, meta_y + (0.092 if mobile else 0.076)),
+        bbox_transform=ax.transAxes,
+        borderpad=0.35,
     )
+    mse_anchored.patch.set_facecolor("white")
+    mse_anchored.patch.set_alpha(0.7)
+    mse_anchored.patch.set_edgecolor("none")
+    mse_anchored.set_zorder(7)
+    ax.add_artist(mse_anchored)
+
     ax.text(
         0.015,
         meta_y,
@@ -1739,6 +2237,191 @@ def save_dayahead_snapshot(
     return str(snapshot_path)
 
 
+def save_current_day_snapshot(
+    out_dir: Path,
+    table: pd.DataFrame,
+    local_tz: str,
+    prediction_generated_at_utc: str,
+) -> str:
+    table_local = table.copy()
+    if table_local.empty:
+        raise ValueError("Current-day snapshot requires a non-empty table.")
+    pred_dt = _parse_iso_utc(prediction_generated_at_utc)
+    if pred_dt is None:
+        pred_dt = datetime.now(timezone.utc)
+    pred_local = pred_dt.astimezone(ZoneInfo(local_tz))
+    target_day_local = pd.to_datetime(table_local["time_local"]).dt.tz_convert(ZoneInfo(local_tz)).iloc[0].date()
+    snapshot_dir = out_dir / "current_day_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / (
+        f"{pred_local.strftime('%Y%m%d-%H%M%S')}_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    )
+    snap = table_local.copy()
+    snap["issued_at_utc"] = pred_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snap["issued_at_local"] = pred_local.strftime("%Y-%m-%dT%H:%M:%S%z")
+    snap["target_day_local"] = target_day_local.isoformat()
+    snap["time_local"] = pd.to_datetime(snap["time_local"]).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    snap.to_csv(snapshot_path, index=False)
+    return str(snapshot_path)
+
+
+def _find_current_day_snapshot_paths(
+    out_dir: Path,
+    target_day_local: date,
+    max_snapshots: int = 10,
+) -> list[Path]:
+    snapshot_dir = out_dir / "current_day_snapshots"
+    if not snapshot_dir.exists():
+        return []
+    pattern = f"*_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    matches = sorted(snapshot_dir.glob(pattern))
+    if not matches:
+        return []
+    max_n = max(0, int(max_snapshots))
+    if max_n == 0:
+        return []
+    return matches[-max_n:]
+
+
+def load_current_day_prediction_history(
+    out_dir: Path,
+    target_day_local: date,
+    local_tz: str,
+    max_snapshots: int = 10,
+) -> list[pd.DataFrame]:
+    snapshots: list[pd.DataFrame] = []
+    tz = ZoneInfo(local_tz)
+    for path in _find_current_day_snapshot_paths(out_dir, target_day_local, max_snapshots=max_snapshots):
+        try:
+            snap = pd.read_csv(path)
+        except Exception:
+            continue
+        if snap.empty or "time_local" not in snap.columns or "lstm_pred_wind_speed" not in snap.columns:
+            continue
+        snap["time_local"] = pd.to_datetime(snap["time_local"], utc=True, errors="coerce").dt.tz_convert(tz)
+        if "issued_at_local" in snap.columns:
+            snap["issued_at_local"] = pd.to_datetime(snap["issued_at_local"], utc=True, errors="coerce").dt.tz_convert(tz)
+        elif "issued_at_utc" in snap.columns:
+            snap["issued_at_local"] = pd.to_datetime(snap["issued_at_utc"], utc=True, errors="coerce").dt.tz_convert(tz)
+        snap = snap.dropna(subset=["time_local"]).copy()
+        if snap.empty:
+            continue
+        snapshots.append(snap.sort_values("time_local").reset_index(drop=True))
+    return snapshots
+
+
+def compute_fixed_origin_current_day_mae(
+    current_table: pd.DataFrame,
+    prior_prediction_tables: list[pd.DataFrame] | None,
+    lookback_hours: tuple[int, ...] = (1, 3, 6),
+) -> list[dict]:
+    if current_table.empty:
+        return []
+    history = prior_prediction_tables or []
+    if not history:
+        return []
+
+    hourly_actual = current_table.copy()
+    hourly_actual = hourly_actual[
+        hourly_actual["time_local"].dt.minute.eq(0) & hourly_actual["actual_wind_speed"].notna()
+    ][["time_local", "actual_wind_speed"]].drop_duplicates(subset=["time_local"])
+    if hourly_actual.empty:
+        return []
+    eval_end = hourly_actual["time_local"].max()
+    actual_by_time = hourly_actual.set_index("time_local")["actual_wind_speed"]
+
+    snapshots: list[tuple[pd.Timestamp, pd.DataFrame]] = []
+    for snap in history:
+        if snap.empty or "issued_at_local" not in snap.columns:
+            continue
+        issued_series = snap["issued_at_local"].dropna()
+        if issued_series.empty:
+            continue
+        issued_at = pd.to_datetime(issued_series.iloc[0])
+        snap_hourly = snap.copy()
+        snap_hourly = snap_hourly[snap_hourly["time_local"].dt.minute.eq(0)].copy()
+        if snap_hourly.empty:
+            continue
+        snapshots.append((issued_at, snap_hourly))
+    if not snapshots:
+        return []
+    snapshots.sort(key=lambda item: item[0])
+
+    metrics: list[dict] = []
+    for lookback in lookback_hours:
+        cutoff = eval_end - pd.Timedelta(hours=int(lookback))
+        eligible = [item for item in snapshots if item[0] <= cutoff]
+        if not eligible:
+            metrics.append(
+                {
+                    "lookback_hours": int(lookback),
+                    "available": False,
+                    "snapshot_issued_at_local": None,
+                    "actual_issue_age_hours": None,
+                    "point_count": 0,
+                    "mae_superlocal": None,
+                    "mae_harmonie": None,
+                }
+            )
+            continue
+
+        issued_at, snap = eligible[-1]
+        snap_eval = snap.copy()
+        if "is_future" in snap_eval.columns:
+            snap_eval = snap_eval[snap_eval["is_future"].astype(bool)]
+        snap_eval = snap_eval[(snap_eval["time_local"] > issued_at) & (snap_eval["time_local"] <= eval_end)].copy()
+        snap_eval = snap_eval.dropna(subset=["forecast_wind_speed", "lstm_pred_wind_speed"])
+        if snap_eval.empty:
+            metrics.append(
+                {
+                    "lookback_hours": int(lookback),
+                    "available": False,
+                    "snapshot_issued_at_local": issued_at.isoformat(),
+                    "actual_issue_age_hours": float((eval_end - issued_at).total_seconds() / 3600.0),
+                    "point_count": 0,
+                    "mae_superlocal": None,
+                    "mae_harmonie": None,
+                }
+            )
+            continue
+
+        merged = snap_eval.merge(
+            actual_by_time.rename("actual_wind_speed"),
+            left_on="time_local",
+            right_index=True,
+            how="inner",
+        )
+        if merged.empty:
+            metrics.append(
+                {
+                    "lookback_hours": int(lookback),
+                    "available": False,
+                    "snapshot_issued_at_local": issued_at.isoformat(),
+                    "actual_issue_age_hours": float((eval_end - issued_at).total_seconds() / 3600.0),
+                    "point_count": 0,
+                    "mae_superlocal": None,
+                    "mae_harmonie": None,
+                }
+            )
+            continue
+
+        mae_sl = float(np.mean(np.abs(merged["lstm_pred_wind_speed"] - merged["actual_wind_speed"])))
+        mae_fc = float(np.mean(np.abs(merged["forecast_wind_speed"] - merged["actual_wind_speed"])))
+        metrics.append(
+            {
+                "lookback_hours": int(lookback),
+                "available": True,
+                "snapshot_issued_at_local": issued_at.isoformat(),
+                "actual_issue_age_hours": float((eval_end - issued_at).total_seconds() / 3600.0),
+                "point_count": int(len(merged)),
+                "mae_superlocal": mae_sl,
+                "mae_harmonie": mae_fc,
+            }
+        )
+
+    return metrics
+
+
 def _find_dayahead_snapshot(out_dir: Path, target_day_local: date) -> Path | None:
     snapshot_dir = out_dir / "dayahead_snapshots"
     if not snapshot_dir.exists():
@@ -2145,7 +2828,7 @@ def publish_web_dashboard(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="{refresh}">
-  <title>Super local wind prediction Valkenburgse meer</title>
+  <title>Super local wind prediction beta Valkenburgse meer</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
@@ -2172,7 +2855,7 @@ def publish_web_dashboard(
   </style>
 </head>
 <body>
-  <h1>Super local wind prediction Valkenburgse meer</h1>
+  <h1>Super local wind prediction beta Valkenburgse meer</h1>
   <p class="meta">Last updated: {generated_local_str}</p>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
@@ -2384,6 +3067,7 @@ def main() -> None:
     intraday_hparams = {}
     model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
     gate_eval_details_csv_src: Path | None = None
+    speed_calibration: dict | None = None
 
     if args.skip_training:
         for p in [
@@ -2403,6 +3087,7 @@ def main() -> None:
         speed_target_mode = str(speed_ckpt.get("target_mode", "residual")).strip().lower()
         direction_target_mode = str(direction_ckpt.get("target_mode", "residual")).strip().lower()
         speed_constraint_eps = speed_ckpt.get("constraint_eps", None)
+        speed_calibration = speed_ckpt.get("speed_regime_calibration")
         model_last_trained_at_utc = _resolve_model_trained_utc(speed_ckpt, speed_model_path)
         speed_train_stats = None
         direction_train_stats = None
@@ -2457,9 +3142,20 @@ def main() -> None:
 
         speed_X_train_raw, speed_X_eval_raw = speed_X_raw_all[:speed_eval_start], speed_X_raw_all[speed_eval_start:]
         speed_y_train_raw, speed_y_eval_raw = speed_y_raw_all[:speed_eval_start], speed_y_raw_all[speed_eval_start:]
+        speed_actual_train = speed_arrays_full["y_actual_all_raw"][:speed_eval_start]
         speed_actual_eval = speed_arrays_full["y_actual_all_raw"][speed_eval_start:]
+        speed_forecast_train = speed_arrays_full["y_forecast_all_raw"][:speed_eval_start]
         speed_forecast_eval = speed_arrays_full["y_forecast_all_raw"][speed_eval_start:]
+        speed_train_anchor_times_utc = pd.to_datetime(speed_arrays_full["timestamps"][:speed_eval_start], utc=True)
         speed_eval_anchor_times_utc = pd.to_datetime(speed_arrays_full["timestamps"][speed_eval_start:], utc=True)
+        speed_train_calibration_context = _build_speed_calibration_context(
+            anchor_dir_deg=speed_X_train_raw[:, -1, 2],
+            target_times_utc=speed_train_anchor_times_utc + pd.Timedelta(hours=1),
+        )
+        speed_eval_calibration_context = _build_speed_calibration_context(
+            anchor_dir_deg=speed_X_eval_raw[:, -1, 2],
+            target_times_utc=speed_eval_anchor_times_utc + pd.Timedelta(hours=1),
+        )
 
         direction_X_train_raw = direction_X_raw_all[:direction_eval_start]
         direction_X_eval_raw = direction_X_raw_all[direction_eval_start:]
@@ -2507,6 +3203,28 @@ def main() -> None:
             validation_split=args.validation_split,
             model_label="speed",
             device=device,
+        )
+        speed_calibration_start = _validation_start_index(len(speed_X_train), args.validation_split)
+        challenger_speed_calibration = fit_speed_regime_calibration(
+            pred_speed=_predict_speed_batch(
+                speed_model_challenger,
+                speed_X_train[speed_calibration_start:],
+                speed_forecast_train[speed_calibration_start:],
+                y_mean=float(challenger_speed_arrays["y_mean"][0]),
+                y_std=float(challenger_speed_arrays["y_std"][0]),
+                target_mode=speed_target_mode,
+                constraint_eps=speed_constraint_eps,
+                speed_calibration=None,
+                speed_calibration_context=None,
+                device=device,
+            ),
+            forecast_speed=speed_forecast_train[speed_calibration_start:],
+            actual_speed=speed_actual_train[speed_calibration_start:],
+            speed_calibration_context={
+                "anchor_dir_deg": speed_train_calibration_context["anchor_dir_deg"][speed_calibration_start:],
+                "target_month": speed_train_calibration_context["target_month"][speed_calibration_start:],
+            },
+            signal="pred_max",
         )
 
         direction_model_challenger = NextDayLSTM(
@@ -2559,6 +3277,8 @@ def main() -> None:
             y_std=float(challenger_speed_arrays["y_std"][0]),
             target_mode=speed_target_mode,
             constraint_eps=speed_constraint_eps,
+            speed_calibration=challenger_speed_calibration,
+            speed_calibration_context=speed_eval_calibration_context,
             device=device,
         )
         challenger_speed_mae = float(np.mean(np.abs(challenger_speed_eval_pred - speed_actual_eval)))
@@ -2578,6 +3298,7 @@ def main() -> None:
         champion_speed_model_id = "none"
         champion_speed_ckpt = {}
         champion_direction_ckpt = {}
+        champion_speed_calibration = None
         champion_speed_eval_pred = np.full_like(challenger_speed_eval_pred, np.nan, dtype=np.float32)
         if champion_available:
             champion_speed_model, champion_speed_ckpt = _load_model(speed_model_path, device)
@@ -2586,6 +3307,7 @@ def main() -> None:
             champion_direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
             champion_speed_mode = str(champion_speed_ckpt.get("target_mode", "residual")).strip().lower()
             champion_speed_eps = champion_speed_ckpt.get("constraint_eps", None)
+            champion_speed_calibration = champion_speed_ckpt.get("speed_regime_calibration")
             champion_speed_model_id = _format_model_id(
                 _resolve_model_trained_utc(champion_speed_ckpt, speed_model_path),
                 args.local_timezone,
@@ -2606,6 +3328,8 @@ def main() -> None:
                 y_std=float(champion_speed_arrays["y_std"][0]),
                 target_mode=champion_speed_mode,
                 constraint_eps=champion_speed_eps,
+                speed_calibration=champion_speed_calibration,
+                speed_calibration_context=speed_eval_calibration_context,
                 device=device,
             )
             champion_speed_mae = float(np.mean(np.abs(champion_speed_eval_pred - speed_actual_eval)))
@@ -2632,6 +3356,8 @@ def main() -> None:
                 "direction_eval_samples": int(len(direction_X_eval)),
                 "speed_mae_champion": float(champion_speed_mae),
                 "speed_mae_challenger": float(challenger_speed_mae),
+                "speed_regime_calibration_challenger": challenger_speed_calibration,
+                "speed_regime_calibration_champion": champion_speed_calibration,
                 "direction_mae_champion": float(champion_direction_mae),
                 "direction_mae_challenger": float(challenger_direction_mae),
                 "promote_speed": bool(promote_speed),
@@ -2654,6 +3380,7 @@ def main() -> None:
                 "speed_eval_samples": int(len(speed_X_eval)),
                 "direction_eval_samples": int(len(direction_X_eval)),
                 "speed_mae_challenger": float(challenger_speed_mae),
+                "speed_regime_calibration_challenger": challenger_speed_calibration,
                 "direction_mae_challenger": float(challenger_direction_mae),
                 "promote_speed": True,
                 "promote_direction": True,
@@ -2666,6 +3393,7 @@ def main() -> None:
         if promote_speed:
             speed_model = speed_model_challenger
             speed_arrays = challenger_speed_arrays
+            speed_calibration = challenger_speed_calibration
             model_last_trained_at_utc = now_train_utc
             _save_model(
                 speed_model_path,
@@ -2675,7 +3403,11 @@ def main() -> None:
                 target_name="wind_speed",
                 target_mode=speed_target_mode,
                 output_activation="linear",
-                extra={"constraint_eps": speed_constraint_eps, "trained_at_utc": now_train_utc},
+                extra={
+                    "constraint_eps": speed_constraint_eps,
+                    "trained_at_utc": now_train_utc,
+                    "speed_regime_calibration": speed_calibration,
+                },
             )
             np.save(speed_scalers_path["x_mean"], speed_arrays["x_mean"])
             np.save(speed_scalers_path["x_std"], speed_arrays["x_std"])
@@ -2687,6 +3419,7 @@ def main() -> None:
             speed_arrays = champion_speed_arrays
             speed_target_mode = str(champion_speed_ckpt.get("target_mode", "residual")).strip().lower()
             speed_constraint_eps = champion_speed_ckpt.get("constraint_eps", None)
+            speed_calibration = champion_speed_calibration
             model_last_trained_at_utc = _resolve_model_trained_utc(champion_speed_ckpt, speed_model_path)
             model_selection_report["speed_selected"] = "champion"
 
@@ -2786,6 +3519,10 @@ def main() -> None:
         x_mean=direction_arrays["x_mean"],
         x_std=direction_arrays["x_std"],
     )
+    speed_inference_calibration_context = _build_speed_calibration_context(
+        anchor_dir_deg=float(inference_input_speed["anchor_forecast_dir"]),
+        target_times_utc=pd.to_datetime([inference_input_speed["target_times"][0]], utc=True),
+    )
 
     speed_pred = predict_speed(
         model=speed_model,
@@ -2795,6 +3532,8 @@ def main() -> None:
         y_std=float(speed_arrays["y_std"][0]),
         target_mode=speed_target_mode,
         constraint_eps=speed_constraint_eps,
+        speed_calibration=speed_calibration,
+        speed_calibration_context=speed_inference_calibration_context,
         device=device,
     )
     direction_pred = predict_direction_residual(
@@ -2883,6 +3622,24 @@ def main() -> None:
     current_day_table_csv = current_day_table.copy()
     current_day_table_csv["time_local"] = current_day_table_csv["time_local"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     current_day_table_csv.to_csv(current_day_table_path, index=False)
+    current_day_snapshot_csv = None
+    current_day_prior_prediction_tables: list[pd.DataFrame] = []
+    current_day_fixed_origin_mae: list[dict] = []
+    if not is_test_mode and not current_day_table.empty:
+        current_day_target_local = pd.to_datetime(current_day_table["time_local"]).dt.tz_convert(
+            ZoneInfo(args.local_timezone)
+        ).iloc[0].date()
+        current_day_prior_prediction_tables = load_current_day_prediction_history(
+            out_dir=out_dir,
+            target_day_local=current_day_target_local,
+            local_tz=args.local_timezone,
+            max_snapshots=10,
+        )
+        current_day_fixed_origin_mae = compute_fixed_origin_current_day_mae(
+            current_table=current_day_table,
+            prior_prediction_tables=current_day_prior_prediction_tables,
+            lookback_hours=(1, 3, 6),
+        )
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
     current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
@@ -2893,6 +3650,8 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        prior_prediction_tables=current_day_prior_prediction_tables,
+        fixed_origin_mae_metrics=current_day_fixed_origin_mae,
     )
     save_current_day_plot(
         current_day_table,
@@ -2901,8 +3660,17 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        prior_prediction_tables=current_day_prior_prediction_tables,
+        fixed_origin_mae_metrics=current_day_fixed_origin_mae,
         mobile=True,
     )
+    if not is_test_mode:
+        current_day_snapshot_csv = save_current_day_snapshot(
+            out_dir=out_dir,
+            table=current_day_table,
+            local_tz=args.local_timezone,
+            prediction_generated_at_utc=prediction_generated_at_utc,
+        )
     archived_current_day_plot = None
     archived_next_day_plots: dict[str, str] | None = None
     daily_mae_csv = None
@@ -3037,6 +3805,7 @@ def main() -> None:
         "feature_cols": feature_cols,
         "speed_model_target": speed_target_mode,
         "speed_constraint_eps": speed_constraint_eps,
+        "speed_regime_calibration": speed_calibration,
         "direction_model_target": direction_target_mode,
         "best_train_loss_speed": None if speed_train_stats is None else float(speed_train_stats["best_train_loss"]),
         "best_train_loss_eval_speed": None if speed_train_stats is None else float(speed_train_stats["best_train_loss_eval"]),
@@ -3071,6 +3840,8 @@ def main() -> None:
         if archived_next_day_plots is None
         else archived_next_day_plots.get("mobile"),
         "current_day_table_csv": str(current_day_table_path),
+        "current_day_snapshot_csv": current_day_snapshot_csv,
+        "current_day_fixed_origin_mae": current_day_fixed_origin_mae,
         "current_day_plot_png": str(current_day_plot_path),
         "current_day_plot_archived_png": archived_current_day_plot,
         "daily_mae_history_csv": daily_mae_csv,
@@ -3094,6 +3865,7 @@ def main() -> None:
         "intraday_dropout": intraday_hparams.get("dropout"),
         "intraday_learning_rate": intraday_hparams.get("learning_rate"),
         "intraday_recency_power": intraday_hparams.get("recency_power"),
+        "intraday_rollout_calibration": getattr(intraday_bundle, "rollout_calibration", None),
         "data_refresh": refresh_info,
         "model_selection_gate": model_selection_report,
         "challenge_eval_split": args.challenge_eval_split,

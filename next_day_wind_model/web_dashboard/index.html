@@ -4,39 +4,74 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="900">
-  <title>Super local wind prediction Valkenburgse meer</title>
+  <title>Super local wind prediction beta Valkenburgse meer</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; color: #111; }
     h1 { margin: 0 0 8px 0; }
     .meta { color: #555; margin: 0 0 16px 0; }
+    .overview { color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }
+    .overview-mobile { display: none; }
     .grid { display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }
+    .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
     img { width: 100%; height: auto; display: block; border-radius: 6px; }
-    a { color: #0a58ca; text-decoration: none; margin-right: 12px; }
-    a:hover { text-decoration: underline; }
+    @media (max-width: 768px) {
+      body { margin: 10px; }
+      h1 { font-size: 24px; margin: 0 0 6px 0; }
+      h2 { font-size: 20px; margin: 0 0 6px 0; }
+      .meta { margin: 0 0 10px 0; font-size: 14px; }
+      .overview { font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }
+      .overview-desktop { display: none; }
+      .overview-mobile { display: block; margin: 10px 0 0 0; }
+      .grid { gap: 12px; }
+      .card { padding: 8px; border-radius: 6px; }
+      .desc { font-size: 14px; margin: 2px 0 8px 0; }
+      img { max-height: 60vh; object-fit: contain; }
+    }
   </style>
 </head>
 <body>
-  <h1>Super local wind prediction Valkenburgse meer</h1>
-  <p class="meta">Last updated: 03 March 2026 09:34:00 CET</p>
-  <p>
-    <a href="next_day_predictions.csv">Next-day table CSV</a>
-    <a href="current_day_predictions.csv">Current-day table CSV</a>
-    <a href="daily_mae_history.csv">Daily MAE history CSV</a>
+  <h1>Super local wind prediction beta Valkenburgse meer</h1>
+  <p class="meta">Last updated: 15 March 2026 18:19:59 CET</p>
+  <p class="overview overview-desktop">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
   </p>
   <div class="grid">
     <div class="card">
-      <h2>Current Day Prediction</h2>
-      <img src="current_day_predictions.png?v=1772526840" alt="Current day prediction">
+      <h2>Current-day prediction</h2>
+      <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
+      <picture>
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1773595199">
+        <img src="current_day_predictions.png?v=1773595199" alt="Current day prediction">
+      </picture>
     </div>
     <div class="card">
-      <h2>Next Day Prediction</h2>
-      <img src="next_day_predictions.png?v=1772526840" alt="Next day prediction">
+      <h2>Next-day prediction</h2>
+      <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
+      <picture>
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1773595199">
+        <img src="next_day_predictions.png?v=1773595199" alt="Next day prediction">
+      </picture>
     </div>
     <div class="card">
-      <h2>Daily MAE History</h2>
-      <img src="daily_mae_history.png?v=1772526840" alt="Daily MAE history">
+      <h2>Day-ahead historical performance</h2>
+      <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead Mean Absolute Error (MAE) for Harmonie and super-local predictions.</p>
+      <picture>
+        <source media="(max-width: 768px)" srcset="daily_mae_history_mobile.png?v=1773595199">
+        <img src="daily_mae_history.png?v=1773595199" alt="Day-ahead MAE history">
+      </picture>
     </div>
   </div>
+  <p class="overview overview-mobile">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
+  </p>
 </body>
 </html>

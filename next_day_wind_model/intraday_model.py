@@ -59,6 +59,7 @@ class IntradayBundle:
     y_mean: float
     y_std: float
     rollout_calibration: dict | None = None
+    continuity_calibration: dict | None = None
 
 
 @dataclass
@@ -399,6 +400,173 @@ def _apply_intraday_rollout_calibration(
     return max(0.0, float(forecast_speed) + weight * (float(pred_speed) - float(forecast_speed)))
 
 
+def _simulate_intraday_recursive_forecast(
+    bundle: IntradayBundle,
+    frame: pd.DataFrame,
+    anchor: int,
+    device: torch.device,
+    max_horizon: int,
+) -> np.ndarray:
+    if anchor < 2 or anchor >= len(frame) - 1 or max_horizon <= 0:
+        return np.array([], dtype=np.float32)
+
+    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
+    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
+    recursive_actual = actual.copy()
+    recursive_actual[anchor + 1 :] = np.nan
+
+    preds: list[float] = []
+    for horizon in range(1, int(max_horizon) + 1):
+        i = anchor + horizon - 1
+        if i + 1 >= len(frame):
+            break
+        x = _build_intraday_feature_row(frame, recursive_actual, i)
+        pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(fc_avg[i + 1]), device=device)
+        pred_speed = _apply_intraday_rollout_calibration(
+            pred_speed=pred_speed,
+            forecast_speed=float(fc_avg[i + 1]),
+            future_horizon=horizon,
+            rollout_calibration=bundle.rollout_calibration,
+        )
+        recursive_actual[i + 1] = pred_speed
+        preds.append(float(pred_speed))
+    return np.asarray(preds, dtype=np.float32)
+
+
+def _fit_intraday_continuity_calibration(
+    bundle: IntradayBundle,
+    frame: pd.DataFrame,
+    sample_split_idx: int,
+    device: torch.device,
+    max_horizon: int = 12,
+) -> dict | None:
+    if sample_split_idx < 24:
+        return None
+
+    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
+    first_anchor = int(max(sample_split_idx + 3, 3))
+    last_anchor = int(len(frame) - max_horizon - 1)
+    if first_anchor >= last_anchor:
+        return None
+
+    rows: list[dict] = []
+    for anchor in range(first_anchor, last_anchor):
+        prev_preds = _simulate_intraday_recursive_forecast(
+            bundle=bundle,
+            frame=frame,
+            anchor=anchor - 1,
+            device=device,
+            max_horizon=max_horizon + 1,
+        )
+        curr_preds = _simulate_intraday_recursive_forecast(
+            bundle=bundle,
+            frame=frame,
+            anchor=anchor,
+            device=device,
+            max_horizon=max_horizon,
+        )
+        if len(prev_preds) < 2 or len(curr_preds) < 1:
+            continue
+        usable_horizon = min(max_horizon, len(curr_preds), len(prev_preds) - 1)
+        for horizon in range(1, usable_horizon + 1):
+            target_idx = anchor + horizon
+            if target_idx >= len(actual):
+                break
+            rows.append(
+                {
+                    "horizon": horizon,
+                    "prev_pred": float(prev_preds[horizon]),
+                    "curr_pred": float(curr_preds[horizon - 1]),
+                    "actual": float(actual[target_idx]),
+                }
+            )
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    weights: list[float] = []
+    prev_weight = 0.35
+    for horizon in range(1, max_horizon + 1):
+        subset = df[df["horizon"] == horizon]
+        if subset.empty:
+            weights.append(prev_weight)
+            continue
+        prev_pred = subset["prev_pred"].to_numpy(dtype=np.float32)
+        curr_pred = subset["curr_pred"].to_numpy(dtype=np.float32)
+        actual_vals = subset["actual"].to_numpy(dtype=np.float32)
+        search_start = 0.2 if horizon == 1 else prev_weight
+        best_weight = float(prev_weight if horizon > 1 else 1.0)
+        best_mae = float(np.mean(np.abs(prev_pred + best_weight * (curr_pred - prev_pred) - actual_vals)))
+        for weight in np.arange(search_start, 1.001, 0.05):
+            cand = np.maximum(0.0, prev_pred + float(weight) * (curr_pred - prev_pred))
+            mae = float(np.mean(np.abs(cand - actual_vals)))
+            if mae + 1e-9 < best_mae:
+                best_mae = mae
+                best_weight = float(weight)
+        weights.append(best_weight)
+        prev_weight = best_weight
+
+    weights_arr = np.asarray(weights, dtype=np.float32)
+    horizon_idx = df["horizon"].to_numpy(dtype=int) - 1
+    calibrated = np.maximum(
+        0.0,
+        df["prev_pred"].to_numpy(dtype=np.float32)
+        + weights_arr[horizon_idx] * (df["curr_pred"].to_numpy(dtype=np.float32) - df["prev_pred"].to_numpy(dtype=np.float32)),
+    )
+    baseline_mae = float(np.mean(np.abs(df["curr_pred"].to_numpy(dtype=np.float32) - df["actual"].to_numpy(dtype=np.float32))))
+    calibrated_mae = float(np.mean(np.abs(calibrated - df["actual"].to_numpy(dtype=np.float32))))
+    improvement_abs = baseline_mae - calibrated_mae
+    if improvement_abs <= 1e-4:
+        return None
+    return {
+        "enabled": True,
+        "max_horizon": int(max_horizon),
+        "weights": [float(w) for w in weights_arr.tolist()],
+        "baseline_mae": float(baseline_mae),
+        "calibrated_mae": float(calibrated_mae),
+        "improvement_abs": float(improvement_abs),
+        "improvement_pct": float(improvement_abs / max(baseline_mae, 1e-6)),
+        "n_rows": int(len(df)),
+    }
+
+
+def _apply_intraday_continuity_calibration(
+    pred_speed: float,
+    previous_issue_speed: float | None,
+    future_horizon: int,
+    continuity_calibration: dict | None,
+) -> float:
+    if future_horizon <= 0 or previous_issue_speed is None:
+        return float(pred_speed)
+    if pd.isna(previous_issue_speed):
+        return float(pred_speed)
+    if not continuity_calibration or not bool(continuity_calibration.get("enabled", False)):
+        return float(pred_speed)
+    weights = continuity_calibration.get("weights") or []
+    if not weights:
+        return float(pred_speed)
+    horizon_idx = min(int(future_horizon) - 1, len(weights) - 1)
+    weight = float(weights[horizon_idx])
+    return max(0.0, float(previous_issue_speed) + weight * (float(pred_speed) - float(previous_issue_speed)))
+
+
+def _default_intraday_continuity_calibration(max_horizon: int = 12) -> dict:
+    base_weights = [0.35, 0.50, 0.65, 0.78, 0.88, 0.94]
+    weights = [float(base_weights[min(h - 1, len(base_weights) - 1)]) for h in range(1, int(max_horizon) + 1)]
+    return {
+        "enabled": True,
+        "type": "default_v1",
+        "max_horizon": int(max_horizon),
+        "weights": weights,
+        "baseline_mae": None,
+        "calibrated_mae": None,
+        "improvement_abs": None,
+        "improvement_pct": None,
+        "n_rows": 0,
+    }
+
+
 def train_intraday_model(
     db_path: Path,
     cfg: DatasetConfig,
@@ -444,6 +612,14 @@ def train_intraday_model(
         sample_split_idx=split_idx,
         device=device,
     )
+    bundle.continuity_calibration = _fit_intraday_continuity_calibration(
+        bundle=bundle,
+        frame=training_frame,
+        sample_split_idx=split_idx,
+        device=device,
+    )
+    if bundle.continuity_calibration is None:
+        bundle.continuity_calibration = _default_intraday_continuity_calibration()
     stats = {
         "n_samples": int(n),
         "n_train": int(len(X_train)),
@@ -456,6 +632,7 @@ def train_intraday_model(
         "learning_rate": float(learning_rate),
         "recency_power": float(recency_power),
         "rollout_calibration": bundle.rollout_calibration,
+        "continuity_calibration": bundle.continuity_calibration,
     }
     return bundle, stats
 
@@ -474,6 +651,7 @@ def save_intraday_model(path: Path, bundle: IntradayBundle, extra: dict | None =
         "hidden2": int(getattr(bundle.model.net[3], "out_features", 64)),
         "dropout": float(getattr(bundle.model.net[2], "p", 0.1)),
         "rollout_calibration": bundle.rollout_calibration,
+        "continuity_calibration": bundle.continuity_calibration,
     }
     if extra:
         payload.update(extra)
@@ -497,6 +675,7 @@ def load_intraday_model(path: Path, device: torch.device) -> tuple[IntradayBundl
         y_mean=float(ckpt["y_mean"]),
         y_std=float(ckpt["y_std"]),
         rollout_calibration=ckpt.get("rollout_calibration"),
+        continuity_calibration=ckpt.get("continuity_calibration") or _default_intraday_continuity_calibration(),
     )
     return bundle, ckpt
 
@@ -512,6 +691,7 @@ def predict_intraday_day_speed(
     bundle: IntradayBundle,
     forecast_frame_local: pd.DataFrame,
     actual_hourly_local: pd.Series,
+    previous_issue_forecast: pd.Series | None,
     day_start_local: pd.Timestamp,
     day_end_local: pd.Timestamp,
     now_hour_local: pd.Timestamp,
@@ -583,6 +763,15 @@ def predict_intraday_day_speed(
                 forecast_speed=fc_avg_t1,
                 future_horizon=future_horizon,
                 rollout_calibration=bundle.rollout_calibration,
+            )
+            previous_issue_speed = None
+            if previous_issue_forecast is not None:
+                previous_issue_speed = previous_issue_forecast.get(h, np.nan)
+            pred_speed = _apply_intraday_continuity_calibration(
+                pred_speed=pred_speed,
+                previous_issue_speed=previous_issue_speed,
+                future_horizon=future_horizon,
+                continuity_calibration=bundle.continuity_calibration,
             )
         pred_full[h_idx] = float(pred_speed)
 

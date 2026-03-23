@@ -1814,7 +1814,7 @@ def save_current_day_plot(
                 "Harmonie",
                 harmonie_color,
                 hours,
-                interval_color,
+                harmonie_color,
                 mae_harmonie_txt,
                 harmonie_value_color,
             )
@@ -1831,7 +1831,7 @@ def save_current_day_plot(
         child=mse_box,
         pad=0.2,
         frameon=True,
-        bbox_to_anchor=(0.992, meta_y + (0.092 if mobile else 0.076)),
+        bbox_to_anchor=(0.992, meta_y + (0.13 if mobile else 0.11)),
         bbox_transform=ax.transAxes,
         borderpad=0.35,
     )
@@ -2016,7 +2016,7 @@ def save_daily_mae_plot(
     history_csv: Path,
     plot_png: Path,
     local_tz: str = "Europe/Amsterdam",
-    mobile_last_months: int | None = None,
+    last_months: int | None = 3,
 ) -> None:
     if not history_csv.exists():
         return
@@ -2135,8 +2135,8 @@ def save_daily_mae_plot(
     month_end_current = next_month - timedelta(days=1)
 
     first_day = merged.index.min().to_pydatetime().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if mobile_last_months is not None and int(mobile_last_months) > 0:
-        months = int(mobile_last_months)
+    if last_months is not None and int(last_months) > 0:
+        months = int(last_months)
         start_current_month = month_start_current
         start_target_month = start_current_month
         for _ in range(max(0, months - 1)):
@@ -2802,7 +2802,7 @@ def maybe_save_daily_mae_dayahead(
     hist.to_csv(history_csv, index=False)
 
     history_png = out_dir / "daily_mae_history.png"
-    save_daily_mae_plot(history_csv, history_png, local_tz=local_tz)
+    save_daily_mae_plot(history_csv, history_png, local_tz=local_tz, last_months=3)
     return str(history_csv), str(history_png)
 
 
@@ -2822,6 +2822,7 @@ def append_model_gate_eval_history(
         [
             {
                 "run_utc": now_utc.isoformat(),
+                "speed_mae_forecast": model_selection_gate.get("speed_mae_forecast"),
                 "run_local_time": now_local.isoformat(),
                 "speed_mae_champion": model_selection_gate.get("speed_mae_champion"),
                 "speed_mae_challenger": model_selection_gate.get("speed_mae_challenger"),
@@ -2860,8 +2861,12 @@ def save_model_gate_eval_history_plot(
     local_tz: str = "Europe/Amsterdam",
     eval_details_csv: Path | None = None,
 ) -> None:
+    challenger_color = "#1f77b4"
+    champion_color = "#ff7f0e"
+    harmonie_color = "gray"
     champion_model_id = None
     challenger_model_id = None
+    harmonie_label = "Harmonie prediction"
     if history_csv.exists():
         hist_for_id = pd.read_csv(history_csv)
         if not hist_for_id.empty:
@@ -2889,66 +2894,163 @@ def save_model_gate_eval_history_plot(
         det = pd.read_csv(eval_details_csv)
         if not det.empty and "target_time_utc" in det.columns:
             det["target_time_utc"] = pd.to_datetime(det["target_time_utc"], errors="coerce", utc=True)
-            for col in ["actual_wind_speed", "champion_wind_speed", "challenger_wind_speed"]:
+            for col in ["actual_wind_speed", "forecast_wind_speed", "champion_wind_speed", "challenger_wind_speed"]:
                 det[col] = pd.to_numeric(det.get(col), errors="coerce")
             det = det.dropna(subset=["target_time_utc", "actual_wind_speed"])
             if not det.empty:
-                x_local = det["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
-                mae_chall = float(np.mean(np.abs(det["challenger_wind_speed"] - det["actual_wind_speed"])))
-                mae_champ = float(np.mean(np.abs(det["champion_wind_speed"] - det["actual_wind_speed"])))
+                det = det.sort_values("target_time_utc").reset_index(drop=True)
+                holdout_weeks = max(
+                    1,
+                    int(
+                        round(
+                            (
+                                (det["target_time_utc"].max() - det["target_time_utc"].min())
+                                / pd.Timedelta(days=7)
+                            )
+                        )
+                    ),
+                )
+                full_forecast_abs_err = np.abs(det["forecast_wind_speed"] - det["actual_wind_speed"])
+                full_champ_abs_err = np.abs(det["champion_wind_speed"] - det["actual_wind_speed"])
+                full_chall_abs_err = np.abs(det["challenger_wind_speed"] - det["actual_wind_speed"])
+                mae_forecast = float(np.nanmean(full_forecast_abs_err))
+                mae_chall = float(np.nanmean(full_chall_abs_err))
+                mae_champ = float(np.nanmean(full_champ_abs_err))
 
-                fig, ax = plt.subplots(figsize=(11.8, 5.2))
-                ax.plot(x_local, det["actual_wind_speed"], color="magenta", linewidth=1.8, label="Measured wind speed")
-                ax.plot(
+                cutoff_utc = det["target_time_utc"].max() - pd.Timedelta(days=14)
+                det_view = det[det["target_time_utc"] >= cutoff_utc].copy()
+                if det_view.empty:
+                    return
+                x_local = det_view["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
+                x_start_local = x_local.min()
+                x_end_local = x_local.max()
+                det_view["forecast_abs_err"] = np.abs(det_view["forecast_wind_speed"] - det_view["actual_wind_speed"])
+                det_view["champion_abs_err"] = np.abs(det_view["champion_wind_speed"] - det_view["actual_wind_speed"])
+                det_view["challenger_abs_err"] = np.abs(det_view["challenger_wind_speed"] - det_view["actual_wind_speed"])
+
+                fig, (ax_top, ax_bottom) = plt.subplots(
+                    2,
+                    1,
+                    sharex=True,
+                    figsize=(11.4, 6.8),
+                    gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.40},
+                )
+
+                ax_top.plot(x_local, det_view["actual_wind_speed"], color="magenta", linewidth=1.5, label="Measured wind speed")
+                ax_top.plot(
                     x_local,
-                    det["challenger_wind_speed"],
-                    color=LSTM_HIGHLIGHT_COLOR,
-                    linewidth=2.2,
+                    det_view["forecast_wind_speed"],
+                    color=harmonie_color,
+                    linewidth=1.4,
+                    label=harmonie_label,
+                )
+                ax_top.plot(
+                    x_local,
+                    det_view["challenger_wind_speed"],
+                    color=challenger_color,
+                    linewidth=1.5,
                     label=challenger_label,
                 )
-                ax.plot(
+                ax_top.plot(
                     x_local,
-                    det["champion_wind_speed"],
-                    color="#007A78",
-                    linewidth=1.8,
+                    det_view["champion_wind_speed"],
+                    color=champion_color,
+                    linewidth=1.5,
                     label=champion_label,
                 )
-                ax.set_title("Model Gate Holdout Period (Speed)")
-                ax.set_xlabel("Time")
-                ax.set_ylabel("Wind speed (kts)")
-                ax.grid(axis="y", alpha=0.3)
-                ax.legend(loc="upper left")
-                ax.margins(x=0, y=0)
+                ax_top.set_title("Next-day model selection: wind speed")
+                ax_top.set_ylabel("Wind speed (kts)")
+                ax_top.grid(axis="y", alpha=0.3)
+                ax_top.legend(loc="upper left")
+                ax_top.margins(x=0, y=0)
+                ax_top.set_xlim(x_start_local, x_end_local)
                 ymax = np.nanmax(
                     [
-                        det["actual_wind_speed"].max(skipna=True),
-                        det["challenger_wind_speed"].max(skipna=True),
-                        det["champion_wind_speed"].max(skipna=True),
+                        det_view["actual_wind_speed"].max(skipna=True),
+                        det_view["forecast_wind_speed"].max(skipna=True),
+                        det_view["challenger_wind_speed"].max(skipna=True),
+                        det_view["champion_wind_speed"].max(skipna=True),
                         1.0,
                     ]
                 )
-                ax.set_ylim(0.0, max(4.0, float(ymax) * 1.08))
-                date_locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
-                ax.xaxis.set_major_locator(date_locator)
-                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-                ax.tick_params(axis="x", labelrotation=20, labelsize=10)
-                txt = (
-                    "Hourly MAE (eval holdout)\n"
-                    f"Challenger: {mae_chall:.2f} kts\n"
-                    f"Champion: {mae_champ:.2f} kts"
+                _apply_speed_background(
+                    ax_top,
+                    float(ymax) * 1.08,
+                    x_left=mdates.date2num(x_start_local.to_pydatetime()),
+                    x_right=mdates.date2num(x_end_local.to_pydatetime()),
                 )
-                ax.text(
-                    0.985,
-                    0.985,
-                    txt,
-                    transform=ax.transAxes,
-                    ha="right",
-                    va="top",
-                    fontsize=10,
-                    color="black",
-                    bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+                ax_top.set_ylim(0.0, max(4.0, float(ymax) * 1.08))
+
+                ax_bottom.plot(
+                    x_local,
+                    det_view["forecast_abs_err"],
+                    color=harmonie_color,
+                    linewidth=1.3,
+                    label=f"Harmonie ({mae_forecast:.2f} kts)",
                 )
-                fig.tight_layout()
+                ax_bottom.plot(
+                    x_local,
+                    det_view["challenger_abs_err"],
+                    color=challenger_color,
+                    linewidth=1.4,
+                    label=f"Challenger ({mae_chall:.2f} kts)",
+                )
+                ax_bottom.plot(
+                    x_local,
+                    det_view["champion_abs_err"],
+                    color=champion_color,
+                    linewidth=1.4,
+                    label=f"Champion ({mae_champ:.2f} kts)",
+                )
+                ax_bottom.axhline(
+                    mae_forecast,
+                    color=harmonie_color,
+                    linestyle="--",
+                    linewidth=1.1,
+                    alpha=0.9,
+                    label="_nolegend_",
+                )
+                ax_bottom.axhline(
+                    mae_chall,
+                    color=challenger_color,
+                    linestyle="--",
+                    linewidth=1.1,
+                    alpha=0.9,
+                    label="_nolegend_",
+                )
+                ax_bottom.axhline(
+                    mae_champ,
+                    color=champion_color,
+                    linestyle="--",
+                    linewidth=1.1,
+                    alpha=0.9,
+                    label="_nolegend_",
+                )
+                ax_bottom.set_title(f"Next-day model selection based on {holdout_weeks} weeks of hold-out data")
+                ax_bottom.set_ylabel("Absolute error (kts)")
+                ax_bottom.set_xlabel("Time")
+                ax_bottom.grid(axis="y", alpha=0.3)
+                ax_bottom.legend(loc="upper right")
+                ax_bottom.margins(x=0, y=0)
+                ax_bottom.set_xlim(x_start_local, x_end_local)
+                mae_top = np.nanmax(
+                    [
+                        det_view["forecast_abs_err"].max(skipna=True),
+                        det_view["challenger_abs_err"].max(skipna=True),
+                        det_view["champion_abs_err"].max(skipna=True),
+                        mae_forecast,
+                        mae_chall,
+                        mae_champ,
+                        1.0,
+                    ]
+                )
+                ax_bottom.set_ylim(0.0, max(3.5, float(mae_top) * 1.08))
+                date_locator = mdates.DayLocator(interval=3)
+                ax_bottom.xaxis.set_major_locator(date_locator)
+                ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+                ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
+
+                fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
                 fig.savefig(plot_png, dpi=150)
                 plt.close(fig)
                 return
@@ -2959,7 +3061,7 @@ def save_model_gate_eval_history_plot(
     hist = pd.read_csv(history_csv)
     if hist.empty:
         return
-    for col in ["speed_mae_champion", "speed_mae_challenger"]:
+    for col in ["speed_mae_forecast", "speed_mae_champion", "speed_mae_challenger", "speed_eval_samples"]:
         hist[col] = pd.to_numeric(hist.get(col), errors="coerce")
     if "run_local_time" in hist.columns:
         run_dt = pd.to_datetime(hist["run_local_time"], errors="coerce")
@@ -2969,7 +3071,13 @@ def save_model_gate_eval_history_plot(
     hist = hist.dropna(subset=["run_dt"]).sort_values("run_dt")
     if hist.empty:
         return
-    fig, ax = plt.subplots(figsize=(11.4, 4.8))
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(11.4, 6.8),
+        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.40},
+    )
     champ_mae_label = (
         f"Champion holdout MAE ({champion_model_id})"
         if champion_model_id
@@ -2980,21 +3088,83 @@ def save_model_gate_eval_history_plot(
         if challenger_model_id
         else "Challenger holdout MAE"
     )
-    ax.plot(hist["run_dt"], hist["speed_mae_champion"], color="gray", linewidth=1.8, marker="o", markersize=3.0, label=champ_mae_label)
-    ax.plot(hist["run_dt"], hist["speed_mae_challenger"], color=LSTM_HIGHLIGHT_COLOR, linewidth=2.2, marker="o", markersize=3.0, label=chall_mae_label)
-    ax.set_title("Model Gate Holdout Comparison (Speed)")
-    ax.set_xlabel("Run date")
-    ax.set_ylabel("MAE (kts)")
-    ax.grid(axis="y", alpha=0.3)
-    ax.legend(loc="upper right")
-    ax.margins(x=0, y=0)
-    ymax = np.nanmax([hist["speed_mae_champion"].max(skipna=True), hist["speed_mae_challenger"].max(skipna=True), 1.0])
-    ax.set_ylim(0.0, max(3.5, float(ymax) * 1.08))
+    forecast_mae_label = "Harmonie holdout MAE"
+    promoted_speed = hist.get("promote_speed", pd.Series(False, index=hist.index)).astype(str).str.strip().str.lower().isin(
+        ["true", "1", "yes"]
+    )
+    ax_top.plot(
+        hist["run_dt"],
+        hist["speed_eval_samples"],
+        color="#444444",
+        linewidth=1.4,
+        marker="o",
+        markersize=3.0,
+        label="Holdout samples",
+    )
+    if promoted_speed.any():
+        ax_top.scatter(
+            hist.loc[promoted_speed, "run_dt"],
+            hist.loc[promoted_speed, "speed_eval_samples"],
+            color="#2ca02c",
+            s=34,
+            zorder=3,
+            label="Promotion run",
+        )
+    ax_top.set_title("Next-day model selection: evaluation coverage")
+    ax_top.set_ylabel("Samples")
+    ax_top.grid(axis="y", alpha=0.3)
+    ax_top.legend(loc="upper left")
+    ax_top.margins(x=0, y=0)
+    samples_top = np.nanmax([hist["speed_eval_samples"].max(skipna=True), 1.0])
+    ax_top.set_ylim(0.0, max(10.0, float(samples_top) * 1.08))
+
+    ax_bottom.plot(
+        hist["run_dt"],
+        hist["speed_mae_champion"],
+        color=champion_color,
+        linewidth=1.4,
+        marker="o",
+        markersize=3.0,
+        label=champ_mae_label,
+    )
+    ax_bottom.plot(
+        hist["run_dt"],
+        hist["speed_mae_forecast"],
+        color=harmonie_color,
+        linewidth=1.3,
+        marker="o",
+        markersize=3.0,
+        label=forecast_mae_label,
+    )
+    ax_bottom.plot(
+        hist["run_dt"],
+        hist["speed_mae_challenger"],
+        color=challenger_color,
+        linewidth=1.4,
+        marker="o",
+        markersize=3.0,
+        label=chall_mae_label,
+    )
+    ax_bottom.set_title("Next-day model selection: mean absolute error")
+    ax_bottom.set_xlabel("Run date")
+    ax_bottom.set_ylabel("MAE (kts)")
+    ax_bottom.grid(axis="y", alpha=0.3)
+    ax_bottom.legend(loc="upper right")
+    ax_bottom.margins(x=0, y=0)
+    ymax = np.nanmax(
+        [
+            hist["speed_mae_forecast"].max(skipna=True),
+            hist["speed_mae_champion"].max(skipna=True),
+            hist["speed_mae_challenger"].max(skipna=True),
+            1.0,
+        ]
+    )
+    ax_bottom.set_ylim(0.0, max(3.5, float(ymax) * 1.08))
     date_locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
-    ax.xaxis.set_major_locator(date_locator)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    ax.tick_params(axis="x", labelrotation=20, labelsize=10)
-    fig.tight_layout()
+    ax_bottom.xaxis.set_major_locator(date_locator)
+    ax_bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
+    ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
 
@@ -3059,6 +3229,15 @@ def publish_web_dashboard(
         if "daily_mae_history_mobile.png" in copied
         else f"daily_mae_history.png?v={cache_bust}"
     )
+    gate_eval_card = ""
+    if "model_gate_eval_history.png" in copied:
+        gate_eval_src = f"model_gate_eval_history.png?v={cache_bust}"
+        gate_eval_card = f"""
+    <div class="card">
+      <h2>Model-gate evaluation history</h2>
+      <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
+      <img src="{gate_eval_src}" alt="Model gate evaluation history">
+    </div>"""
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3118,14 +3297,7 @@ def publish_web_dashboard(
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
       </picture>
     </div>
-    <div class="card">
-      <h2>Day-ahead historical performance</h2>
-      <p class="desc">Historical model performance: top panel shows daily mean wind speed, bottom panel shows day-ahead Mean Absolute Error (MAE) for Harmonie and super-local predictions.</p>
-      <picture>
-        <source media="(max-width: 768px)" srcset="{daily_mae_mobile_src}">
-        <img src="daily_mae_history.png?v={cache_bust}" alt="Day-ahead MAE history">
-      </picture>
-    </div>
+{gate_eval_card}
   </div>
   <p class="overview overview-mobile">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
@@ -3570,6 +3742,7 @@ def main() -> None:
                 device=device,
             )
             champion_speed_mae = float(np.mean(np.abs(champion_speed_eval_pred - speed_actual_eval)))
+            forecast_speed_mae = float(np.mean(np.abs(speed_forecast_eval - speed_actual_eval)))
             champion_direction_mae = _angular_mae_deg(
                 _predict_direction_batch(
                     champion_direction_model,
@@ -3591,6 +3764,7 @@ def main() -> None:
                 "promotion_margin_pct": float(args.promotion_margin_pct),
                 "speed_eval_samples": int(len(speed_X_eval)),
                 "direction_eval_samples": int(len(direction_X_eval)),
+                "speed_mae_forecast": float(forecast_speed_mae),
                 "speed_mae_champion": float(champion_speed_mae),
                 "speed_mae_challenger": float(challenger_speed_mae),
                 "speed_regime_calibration_challenger": challenger_speed_calibration,
@@ -3603,7 +3777,7 @@ def main() -> None:
                 "speed_model_id_challenger": challenger_speed_model_id,
             }
             print(
-                f"Model gate | speed MAE champion={champion_speed_mae:.4f}, challenger={challenger_speed_mae:.4f}, "
+                f"Model gate | speed MAE forecast={forecast_speed_mae:.4f}, champion={champion_speed_mae:.4f}, challenger={challenger_speed_mae:.4f}, "
                 f"promoted={promote_speed}"
             )
             print(
@@ -3616,6 +3790,7 @@ def main() -> None:
                 "reason": "no_existing_champion",
                 "speed_eval_samples": int(len(speed_X_eval)),
                 "direction_eval_samples": int(len(direction_X_eval)),
+                "speed_mae_forecast": float(np.mean(np.abs(speed_forecast_eval - speed_actual_eval))),
                 "speed_mae_challenger": float(challenger_speed_mae),
                 "speed_regime_calibration_challenger": challenger_speed_calibration,
                 "direction_mae_challenger": float(challenger_direction_mae),
@@ -3715,6 +3890,7 @@ def main() -> None:
             )
             agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
             agg_eval["n_overlaps"] = raw_eval.groupby("target_time_utc").size().to_numpy()
+            agg_eval["abs_err_forecast"] = np.abs(agg_eval["forecast_wind_speed"] - agg_eval["actual_wind_speed"])
             agg_eval["abs_err_challenger"] = np.abs(agg_eval["challenger_wind_speed"] - agg_eval["actual_wind_speed"])
             agg_eval["abs_err_champion"] = np.abs(agg_eval["champion_wind_speed"] - agg_eval["actual_wind_speed"])
             agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
@@ -3994,14 +4170,19 @@ def main() -> None:
         # Always refresh daily MAE plot from CSV when available, not only after end-of-day save.
         if daily_mae_csv_src is not None:
             daily_mae_png_refresh = out_dir / "daily_mae_history.png"
-            save_daily_mae_plot(daily_mae_csv_src, daily_mae_png_refresh, local_tz=args.local_timezone)
+            save_daily_mae_plot(
+                daily_mae_csv_src,
+                daily_mae_png_refresh,
+                local_tz=args.local_timezone,
+                last_months=3,
+            )
             daily_mae_png_src = daily_mae_png_refresh
             daily_mae_png_mobile_refresh = out_dir / "daily_mae_history_mobile.png"
             save_daily_mae_plot(
                 daily_mae_csv_src,
                 daily_mae_png_mobile_refresh,
                 local_tz=args.local_timezone,
-                mobile_last_months=3,
+                last_months=3,
             )
             daily_mae_png_mobile_src = daily_mae_png_mobile_refresh
         if gate_eval_history_csv_src is None and gate_eval_history_csv.exists():

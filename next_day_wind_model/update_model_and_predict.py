@@ -2861,6 +2861,14 @@ def save_model_gate_eval_history_plot(
     local_tz: str = "Europe/Amsterdam",
     eval_details_csv: Path | None = None,
 ) -> None:
+    def _model_id_date_label(model_id: str | None) -> str | None:
+        value = str(model_id or "").strip()
+        if not value:
+            return None
+        if len(value) >= 8 and value[:8].isdigit():
+            return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+        return value
+
     challenger_color = "#1f77b4"
     champion_color = "#ff7f0e"
     harmonie_color = "gray"
@@ -2879,14 +2887,14 @@ def save_model_gate_eval_history_plot(
                 challenger_model_id = str(last_row.get("speed_model_id_challenger", "")).strip() or None
 
     challenger_label = (
-        f"Challenger prediction ({challenger_model_id})"
+        f"Challenger ({_model_id_date_label(challenger_model_id)})"
         if challenger_model_id
-        else "Challenger prediction"
+        else "Challenger"
     )
     champion_label = (
-        f"Champion prediction ({champion_model_id})"
+        f"Champion ({_model_id_date_label(champion_model_id)})"
         if champion_model_id
-        else "Champion prediction"
+        else "Champion"
     )
 
     # Preferred view: full holdout period time series with champion/challenger predictions.
@@ -2917,13 +2925,14 @@ def save_model_gate_eval_history_plot(
                 mae_chall = float(np.nanmean(full_chall_abs_err))
                 mae_champ = float(np.nanmean(full_champ_abs_err))
 
-                cutoff_utc = det["target_time_utc"].max() - pd.Timedelta(days=14)
+                x_end_utc = det["target_time_utc"].max()
+                cutoff_utc = x_end_utc - pd.Timedelta(days=14)
                 det_view = det[det["target_time_utc"] >= cutoff_utc].copy()
                 if det_view.empty:
                     return
                 x_local = det_view["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
-                x_start_local = x_local.min()
-                x_end_local = x_local.max()
+                x_end_local = x_end_utc.tz_convert(ZoneInfo(local_tz))
+                x_start_local = x_end_local - pd.Timedelta(days=14)
                 det_view["forecast_abs_err"] = np.abs(det_view["forecast_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["champion_abs_err"] = np.abs(det_view["champion_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["challenger_abs_err"] = np.abs(det_view["challenger_wind_speed"] - det_view["actual_wind_speed"])
@@ -2936,32 +2945,31 @@ def save_model_gate_eval_history_plot(
                     gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.40},
                 )
 
-                ax_top.plot(x_local, det_view["actual_wind_speed"], color="magenta", linewidth=1.5, label="Measured wind speed")
+                ax_top.plot(x_local, det_view["actual_wind_speed"], color="magenta", linewidth=1.5, label="_nolegend_")
                 ax_top.plot(
                     x_local,
                     det_view["forecast_wind_speed"],
                     color=harmonie_color,
                     linewidth=1.4,
-                    label=harmonie_label,
+                    label="_nolegend_",
                 )
                 ax_top.plot(
                     x_local,
                     det_view["challenger_wind_speed"],
                     color=challenger_color,
                     linewidth=1.5,
-                    label=challenger_label,
+                    label="_nolegend_",
                 )
                 ax_top.plot(
                     x_local,
                     det_view["champion_wind_speed"],
                     color=champion_color,
                     linewidth=1.5,
-                    label=champion_label,
+                    label="_nolegend_",
                 )
                 ax_top.set_title("Next-day model selection: wind speed")
                 ax_top.set_ylabel("Wind speed (kts)")
                 ax_top.grid(axis="y", alpha=0.3)
-                ax_top.legend(loc="upper left")
                 ax_top.margins(x=0, y=0)
                 ax_top.set_xlim(x_start_local, x_end_local)
                 ymax = np.nanmax(
@@ -2980,6 +2988,76 @@ def save_model_gate_eval_history_plot(
                     x_right=mdates.date2num(x_end_local.to_pydatetime()),
                 )
                 ax_top.set_ylim(0.0, max(4.0, float(ymax) * 1.08))
+
+                top_legend_labels = [
+                    "Measurement",
+                    "Harmonie",
+                    challenger_label,
+                    champion_label,
+                ]
+
+                def _split_top_label(label: str) -> tuple[str, str]:
+                    if " (" in label and label.endswith(")"):
+                        name, suffix = label.split(" (", 1)
+                        return name, f"({suffix}"
+                    return label, ""
+
+                split_top_labels = [_split_top_label(label) for label in top_legend_labels]
+                top_name_width = max(len(name) for name, _ in split_top_labels)
+                top_date_width = max(len(date_txt) for _, date_txt in split_top_labels)
+
+                def _top_legend_entry(text: str, color: str) -> HPacker:
+                    label_name, label_date = _split_top_label(text)
+                    padded_name = label_name.ljust(top_name_width)
+                    padded_date = label_date.ljust(top_date_width)
+                    return HPacker(
+                        children=[
+                            TextArea(
+                                "━━ ",
+                                textprops={"fontsize": 9, "color": color, "fontweight": "bold", "fontfamily": "monospace"},
+                            ),
+                            TextArea(
+                                f"{padded_name} ",
+                                textprops={"fontsize": 9, "color": "black", "fontfamily": "monospace"},
+                            ),
+                            TextArea(
+                                padded_date,
+                                textprops={"fontsize": 9, "color": "black", "fontfamily": "monospace"},
+                            ),
+                        ],
+                        align="center",
+                        pad=0,
+                        sep=0,
+                    )
+
+                top_legend_box = VPacker(
+                    children=[
+                        TextArea(
+                            "Wind speed: measurement & prediction",
+                            textprops={"fontsize": 9, "color": "black", "fontweight": "bold"},
+                        ),
+                        _top_legend_entry("Measurement", "magenta"),
+                        _top_legend_entry("Harmonie", harmonie_color),
+                        _top_legend_entry(challenger_label, challenger_color),
+                        _top_legend_entry(champion_label, champion_color),
+                    ],
+                    align="left",
+                    pad=0,
+                    sep=1,
+                )
+                top_legend = AnchoredOffsetbox(
+                    loc="upper left",
+                    child=top_legend_box,
+                    pad=0.2,
+                    frameon=True,
+                    bbox_to_anchor=(0.01, 0.995),
+                    bbox_transform=ax_top.transAxes,
+                    borderpad=0.35,
+                )
+                top_legend.patch.set_facecolor("white")
+                top_legend.patch.set_alpha(0.78)
+                top_legend.patch.set_edgecolor("none")
+                ax_top.add_artist(top_legend)
 
                 ax_bottom.plot(
                     x_local,
@@ -3026,11 +3104,12 @@ def save_model_gate_eval_history_plot(
                     alpha=0.9,
                     label="_nolegend_",
                 )
-                ax_bottom.set_title(f"Next-day model selection based on {holdout_weeks} weeks of hold-out data")
+                ax_bottom.set_title(
+                    f"Hourly mean absolute error\nPerformance for model selection based on {holdout_weeks} weeks of hold-out data"
+                )
                 ax_bottom.set_ylabel("Absolute error (kts)")
                 ax_bottom.set_xlabel("Time")
                 ax_bottom.grid(axis="y", alpha=0.3)
-                ax_bottom.legend(loc="upper right")
                 ax_bottom.margins(x=0, y=0)
                 ax_bottom.set_xlim(x_start_local, x_end_local)
                 mae_top = np.nanmax(
@@ -3049,6 +3128,75 @@ def save_model_gate_eval_history_plot(
                 ax_bottom.xaxis.set_major_locator(date_locator)
                 ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
                 ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
+
+                bottom_legend_labels = [
+                    ("Harmonie", mae_forecast, harmonie_color),
+                    (challenger_label, mae_chall, challenger_color),
+                    (champion_label, mae_champ, champion_color),
+                ]
+                def _split_legend_label(label: str) -> tuple[str, str]:
+                    if " (" in label and label.endswith(")"):
+                        name, suffix = label.split(" (", 1)
+                        return name, f"({suffix}"
+                    return label, ""
+
+                split_bottom_labels = [(_split_legend_label(label), value, color) for label, value, color in bottom_legend_labels]
+                legend_name_width = max(len(name) for (name, _), _, _ in split_bottom_labels)
+                legend_date_width = max(len(date_txt) for (_, date_txt), _, _ in split_bottom_labels)
+
+                def _mae_legend_entry(model_label: str, value: float, color: str) -> HPacker:
+                    model_name, model_date = _split_legend_label(model_label)
+                    padded_name = model_name.ljust(legend_name_width)
+                    padded_date = model_date.ljust(legend_date_width)
+                    return HPacker(
+                        children=[
+                            TextArea(
+                                "━━ ",
+                                textprops={"fontsize": 9, "color": color, "fontweight": "bold", "fontfamily": "monospace"},
+                            ),
+                            TextArea(
+                                f"{padded_name} ",
+                                textprops={"fontsize": 9, "color": "black", "fontfamily": "monospace"},
+                            ),
+                            TextArea(
+                                f"{padded_date} ",
+                                textprops={"fontsize": 9, "color": "black", "fontfamily": "monospace"},
+                            ),
+                            TextArea(
+                                f"{value:>4.2f} kts",
+                                textprops={"fontsize": 9, "color": color, "fontweight": "bold", "fontfamily": "monospace"},
+                            ),
+                        ],
+                        align="center",
+                        pad=0,
+                        sep=0,
+                    )
+
+                bottom_legend_box = VPacker(
+                    children=[
+                        TextArea(
+                            "Mean absolute error (hourly)",
+                            textprops={"fontsize": 9, "color": "black", "fontweight": "bold"},
+                        ),
+                        *[_mae_legend_entry(label, value, color) for label, value, color in bottom_legend_labels],
+                    ],
+                    align="left",
+                    pad=0,
+                    sep=1,
+                )
+                bottom_legend = AnchoredOffsetbox(
+                    loc="upper right",
+                    child=bottom_legend_box,
+                    pad=0.2,
+                    frameon=True,
+                    bbox_to_anchor=(0.99, 0.995),
+                    bbox_transform=ax_bottom.transAxes,
+                    borderpad=0.35,
+                )
+                bottom_legend.patch.set_facecolor("white")
+                bottom_legend.patch.set_alpha(0.78)
+                bottom_legend.patch.set_edgecolor("none")
+                ax_bottom.add_artist(bottom_legend)
 
                 fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
                 fig.savefig(plot_png, dpi=150)
@@ -3113,7 +3261,7 @@ def save_model_gate_eval_history_plot(
     ax_top.set_title("Next-day model selection: evaluation coverage")
     ax_top.set_ylabel("Samples")
     ax_top.grid(axis="y", alpha=0.3)
-    ax_top.legend(loc="upper left")
+    ax_top.legend(loc="upper left", fontsize=9)
     ax_top.margins(x=0, y=0)
     samples_top = np.nanmax([hist["speed_eval_samples"].max(skipna=True), 1.0])
     ax_top.set_ylim(0.0, max(10.0, float(samples_top) * 1.08))
@@ -3149,7 +3297,7 @@ def save_model_gate_eval_history_plot(
     ax_bottom.set_xlabel("Run date")
     ax_bottom.set_ylabel("MAE (kts)")
     ax_bottom.grid(axis="y", alpha=0.3)
-    ax_bottom.legend(loc="upper right")
+    ax_bottom.legend(loc="upper right", fontsize=9)
     ax_bottom.margins(x=0, y=0)
     ymax = np.nanmax(
         [

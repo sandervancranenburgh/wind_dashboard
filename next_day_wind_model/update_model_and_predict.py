@@ -2907,6 +2907,8 @@ def save_model_gate_eval_history_plot(
             det = det.dropna(subset=["target_time_utc", "actual_wind_speed"])
             if not det.empty:
                 det = det.sort_values("target_time_utc").reset_index(drop=True)
+                display_window_days = 14
+                display_window_weeks = max(1, int(round(display_window_days / 7)))
                 holdout_weeks = max(
                     1,
                     int(
@@ -2926,13 +2928,13 @@ def save_model_gate_eval_history_plot(
                 mae_champ = float(np.nanmean(full_champ_abs_err))
 
                 x_end_utc = det["target_time_utc"].max()
-                cutoff_utc = x_end_utc - pd.Timedelta(days=14)
+                cutoff_utc = x_end_utc - pd.Timedelta(days=display_window_days)
                 det_view = det[det["target_time_utc"] >= cutoff_utc].copy()
                 if det_view.empty:
                     return
                 x_local = det_view["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
                 x_end_local = x_end_utc.tz_convert(ZoneInfo(local_tz))
-                x_start_local = x_end_local - pd.Timedelta(days=14)
+                x_start_local = x_end_local - pd.Timedelta(days=display_window_days)
                 det_view["forecast_abs_err"] = np.abs(det_view["forecast_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["champion_abs_err"] = np.abs(det_view["champion_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["challenger_abs_err"] = np.abs(det_view["challenger_wind_speed"] - det_view["actual_wind_speed"])
@@ -3105,7 +3107,7 @@ def save_model_gate_eval_history_plot(
                     label="_nolegend_",
                 )
                 ax_bottom.set_title(
-                    f"Hourly mean absolute error\nPerformance for model selection based on {holdout_weeks} weeks of hold-out data"
+                    f"Hourly mean absolute error\nShowing last {display_window_weeks} weeks; model selection based on {holdout_weeks} weeks of hold-out data"
                 )
                 ax_bottom.set_ylabel("Absolute error (kts)")
                 ax_bottom.set_xlabel("Time")

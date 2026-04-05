@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from data_pipeline import DatasetConfig, _build_training_frame
+from data_pipeline import DatasetConfig, _load_observations, build_anchor_forecast_context
 
 
 FEATURE_COLS = [
@@ -33,6 +34,8 @@ FEATURE_COLS = [
     "month_sin",
     "month_cos",
 ]
+
+INTRADAY_CALIBRATION_HORIZON = 12
 
 
 class IntradayResidualMLP(nn.Module):
@@ -81,62 +84,162 @@ def _fit_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-def build_intraday_training_xy(db_path: Path, cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
-    frame = _build_training_frame(db_path, cfg).copy()
-    frame = frame.sort_index()
-    if frame.empty:
+def _load_hourly_observations(db_path: Path, cfg: DatasetConfig) -> pd.DataFrame:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        obs = _load_observations(conn, cfg.site)
+    finally:
+        conn.close()
+    return obs.sort_index()
+
+
+def _build_intraday_anchor_contexts(
+    db_path: Path,
+    cfg: DatasetConfig,
+    max_horizon: int = INTRADAY_CALIBRATION_HORIZON,
+) -> list[dict]:
+    obs = _load_hourly_observations(db_path, cfg)
+    if obs.empty:
         raise ValueError("No rows available for intraday model training.")
 
-    # Keep only rows where actuals + required forecasts exist.
-    need_cols = ["forecast_avg", "forecast_max", "forecast_dir", "actual_avg", "month_sin", "month_cos"]
-    frame = frame.dropna(subset=need_cols)
-    if len(frame) < 50:
+    contexts: list[dict] = []
+    total = len(obs)
+    horizon = int(max_horizon)
+    for i in range(2, total - horizon):
+        anchor_time = obs.index[i]
+        history_times = obs.index[i - 2 : i + 1]
+        target_times = obs.index[i + 1 : i + 1 + horizon]
+        context = build_anchor_forecast_context(
+            db_path=db_path,
+            cfg=cfg,
+            anchor_time=anchor_time,
+            history_times=history_times,
+            target_times=target_times,
+        )
+        history_frame = context["history_frame"]
+        target_frame = context["target_frame"]
+        if history_frame is None or target_frame is None:
+            continue
+
+        actual_series = np.concatenate(
+            [
+                obs.iloc[i - 2 : i + 1]["actual_avg"].to_numpy(dtype=np.float32),
+                obs.iloc[i + 1 : i + 1 + horizon]["actual_avg"].to_numpy(dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        forecast_avg_series = np.concatenate(
+            [
+                history_frame["forecast_avg"].to_numpy(dtype=np.float32),
+                target_frame["forecast_avg"].to_numpy(dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        forecast_max_series = np.concatenate(
+            [
+                history_frame["forecast_max"].to_numpy(dtype=np.float32),
+                target_frame["forecast_max"].to_numpy(dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        forecast_dir_series = np.concatenate(
+            [
+                history_frame["forecast_dir"].to_numpy(dtype=np.float32),
+                target_frame["forecast_dir"].to_numpy(dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        if (
+            np.isnan(actual_series).any()
+            or np.isnan(forecast_avg_series).any()
+            or np.isnan(forecast_max_series).any()
+            or np.isnan(forecast_dir_series).any()
+        ):
+            continue
+        contexts.append(
+            {
+                "anchor_time": anchor_time,
+                "actual_series": actual_series,
+                "forecast_avg_series": forecast_avg_series,
+                "forecast_max_series": forecast_max_series,
+                "forecast_dir_series": forecast_dir_series,
+            }
+        )
+
+    if len(contexts) < 50:
         raise ValueError("Not enough rows to train intraday model.")
+    return contexts
+
+
+def _month_cycle(ts: pd.Timestamp) -> tuple[float, float]:
+    angle = (2.0 * np.pi * (float(ts.month) - 1.0)) / 12.0
+    return float(np.sin(angle)), float(np.cos(angle))
+
+
+def _build_intraday_feature_row_from_context(
+    context: dict,
+    realized_series: np.ndarray,
+    step: int,
+) -> np.ndarray:
+    forecast_avg = np.asarray(context["forecast_avg_series"], dtype=np.float32)
+    forecast_max = np.asarray(context["forecast_max_series"], dtype=np.float32)
+    forecast_dir = np.asarray(context["forecast_dir_series"], dtype=np.float32)
+    actual = np.asarray(realized_series, dtype=np.float32)
+
+    curr_idx = int(step + 2)
+    next_idx = int(step + 3)
+    current_time = pd.Timestamp(context["anchor_time"]) + pd.Timedelta(hours=int(step))
+    month_sin, month_cos = _month_cycle(current_time)
+    hour_ang = 2.0 * np.pi * (float(current_time.hour) / 24.0)
+
+    fc_avg_t = float(forecast_avg[curr_idx])
+    fc_avg_t1 = float(forecast_avg[next_idx])
+    fc_max_t = float(forecast_max[curr_idx])
+    fc_max_t1 = float(forecast_max[next_idx])
+    fc_dir_t = float(forecast_dir[curr_idx])
+    fc_dir_t1 = float(forecast_dir[next_idx])
+    a_t = float(actual[curr_idx])
+    a_t_1 = float(actual[curr_idx - 1])
+    a_t_2 = float(actual[curr_idx - 2])
+    res_t = a_t - fc_avg_t
+    res_t_1 = a_t_1 - float(forecast_avg[curr_idx - 1])
+    res_t_2 = a_t_2 - float(forecast_avg[curr_idx - 2])
+
+    return np.array(
+        [
+            fc_avg_t,
+            fc_max_t,
+            fc_avg_t1,
+            fc_max_t1,
+            np.sin(np.deg2rad(fc_dir_t)),
+            np.cos(np.deg2rad(fc_dir_t)),
+            np.sin(np.deg2rad(fc_dir_t1)),
+            np.cos(np.deg2rad(fc_dir_t1)),
+            a_t,
+            a_t_1,
+            a_t_2,
+            res_t,
+            res_t_1,
+            res_t_2,
+            np.sin(hour_ang),
+            np.cos(hour_ang),
+            month_sin,
+            month_cos,
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_intraday_training_xy(
+    db_path: Path,
+    cfg: DatasetConfig,
+    contexts: list[dict] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    contexts = _build_intraday_anchor_contexts(db_path, cfg) if contexts is None else contexts
 
     X_list: list[np.ndarray] = []
     y_list: list[float] = []
-
-    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
-    fc_max = frame["forecast_max"].to_numpy(dtype=np.float32)
-    fc_dir = frame["forecast_dir"].to_numpy(dtype=np.float32)
-    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
-    month_sin = frame["month_sin"].to_numpy(dtype=np.float32)
-    month_cos = frame["month_cos"].to_numpy(dtype=np.float32)
-    idx = frame.index
-
-    # Feature time is t=i, target is residual at t+1.
-    for i in range(2, len(frame) - 1):
-        if np.isnan([fc_avg[i], fc_avg[i + 1], fc_max[i], fc_max[i + 1], fc_dir[i], fc_dir[i + 1], actual[i], actual[i - 1], actual[i - 2]]).any():
-            continue
-        res_t = actual[i] - fc_avg[i]
-        res_t_1 = actual[i - 1] - fc_avg[i - 1]
-        res_t_2 = actual[i - 2] - fc_avg[i - 2]
-        hour = idx[i].hour
-        hour_ang = 2.0 * np.pi * (float(hour) / 24.0)
-        x = np.array(
-            [
-                fc_avg[i],
-                fc_max[i],
-                fc_avg[i + 1],
-                fc_max[i + 1],
-                np.sin(np.deg2rad(fc_dir[i])),
-                np.cos(np.deg2rad(fc_dir[i])),
-                np.sin(np.deg2rad(fc_dir[i + 1])),
-                np.cos(np.deg2rad(fc_dir[i + 1])),
-                actual[i],
-                actual[i - 1],
-                actual[i - 2],
-                res_t,
-                res_t_1,
-                res_t_2,
-                np.sin(hour_ang),
-                np.cos(hour_ang),
-                month_sin[i],
-                month_cos[i],
-            ],
-            dtype=np.float32,
-        )
-        y = float(actual[i + 1] - fc_avg[i + 1])  # next-hour residual
+    for context in contexts:
+        actual_series = np.asarray(context["actual_series"], dtype=np.float32)
+        forecast_avg = np.asarray(context["forecast_avg_series"], dtype=np.float32)
+        x = _build_intraday_feature_row_from_context(context, actual_series[:3], step=0)
+        y = float(actual_series[3] - forecast_avg[3])
         if np.isnan(x).any() or np.isnan(y):
             continue
         X_list.append(x)
@@ -147,16 +250,6 @@ def build_intraday_training_xy(db_path: Path, cfg: DatasetConfig) -> tuple[np.nd
     X = np.stack(X_list).astype(np.float32)
     y = np.array(y_list, dtype=np.float32)
     return X, y
-
-
-def _build_intraday_training_frame(db_path: Path, cfg: DatasetConfig) -> pd.DataFrame:
-    frame = _build_training_frame(db_path, cfg).copy()
-    frame = frame.sort_index()
-    need_cols = ["forecast_avg", "forecast_max", "forecast_dir", "actual_avg", "month_sin", "month_cos"]
-    frame = frame.dropna(subset=need_cols)
-    if len(frame) < 50:
-        raise ValueError("Not enough rows to train intraday model.")
-    return frame
 
 
 def _fit_intraday_from_arrays(
@@ -300,9 +393,40 @@ def _build_intraday_feature_row(
     )
 
 
+def _simulate_intraday_recursive_forecast_from_context(
+    bundle: IntradayBundle,
+    context: dict,
+    device: torch.device,
+    max_horizon: int,
+) -> np.ndarray:
+    if max_horizon <= 0:
+        return np.array([], dtype=np.float32)
+
+    forecast_avg = np.asarray(context["forecast_avg_series"], dtype=np.float32)
+    actual_series = np.asarray(context["actual_series"], dtype=np.float32)
+    usable = min(int(max_horizon), len(forecast_avg) - 3, len(actual_series) - 3)
+    if usable <= 0:
+        return np.array([], dtype=np.float32)
+
+    recursive_actual = actual_series[:3].astype(np.float32).copy()
+    preds: list[float] = []
+    for step in range(usable):
+        x = _build_intraday_feature_row_from_context(context, recursive_actual, step)
+        pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(forecast_avg[step + 3]), device=device)
+        pred_speed = _apply_intraday_rollout_calibration(
+            pred_speed=pred_speed,
+            forecast_speed=float(forecast_avg[step + 3]),
+            future_horizon=step + 1,
+            rollout_calibration=bundle.rollout_calibration,
+        )
+        recursive_actual = np.append(recursive_actual, np.float32(pred_speed))
+        preds.append(float(pred_speed))
+    return np.asarray(preds, dtype=np.float32)
+
+
 def _fit_intraday_rollout_calibration(
     bundle: IntradayBundle,
-    frame: pd.DataFrame,
+    contexts: list[dict],
     sample_split_idx: int,
     device: torch.device,
     max_horizon: int = 12,
@@ -310,28 +434,29 @@ def _fit_intraday_rollout_calibration(
     if sample_split_idx < 20:
         return None
 
-    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
-    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
-    first_anchor = int(sample_split_idx + 2)
-    last_anchor = int(len(frame) - max_horizon - 1)
-    if first_anchor >= last_anchor:
+    eval_contexts = contexts[sample_split_idx:]
+    if not eval_contexts:
         return None
 
     rows: list[dict] = []
-    for anchor in range(first_anchor, last_anchor):
-        recursive_actual = actual.copy()
-        recursive_actual[anchor + 1 :] = np.nan
-        for horizon in range(1, max_horizon + 1):
-            i = anchor + horizon - 1
-            x = _build_intraday_feature_row(frame, recursive_actual, i)
-            pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(fc_avg[i + 1]), device=device)
-            recursive_actual[i + 1] = pred_speed
+    for context in eval_contexts:
+        forecast_avg = np.asarray(context["forecast_avg_series"], dtype=np.float32)
+        actual_series = np.asarray(context["actual_series"], dtype=np.float32)
+        usable = min(int(max_horizon), len(forecast_avg) - 3, len(actual_series) - 3)
+        if usable <= 0:
+            continue
+
+        recursive_actual = actual_series[:3].astype(np.float32).copy()
+        for step in range(usable):
+            x = _build_intraday_feature_row_from_context(context, recursive_actual, step)
+            pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(forecast_avg[step + 3]), device=device)
+            recursive_actual = np.append(recursive_actual, np.float32(pred_speed))
             rows.append(
                 {
-                    "horizon": horizon,
-                    "forecast": float(fc_avg[i + 1]),
+                    "horizon": step + 1,
+                    "forecast": float(forecast_avg[step + 3]),
                     "pred_recursive": float(pred_speed),
-                    "actual": float(actual[i + 1]),
+                    "actual": float(actual_series[step + 3]),
                 }
             )
 
@@ -400,42 +525,9 @@ def _apply_intraday_rollout_calibration(
     return max(0.0, float(forecast_speed) + weight * (float(pred_speed) - float(forecast_speed)))
 
 
-def _simulate_intraday_recursive_forecast(
-    bundle: IntradayBundle,
-    frame: pd.DataFrame,
-    anchor: int,
-    device: torch.device,
-    max_horizon: int,
-) -> np.ndarray:
-    if anchor < 2 or anchor >= len(frame) - 1 or max_horizon <= 0:
-        return np.array([], dtype=np.float32)
-
-    fc_avg = frame["forecast_avg"].to_numpy(dtype=np.float32)
-    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
-    recursive_actual = actual.copy()
-    recursive_actual[anchor + 1 :] = np.nan
-
-    preds: list[float] = []
-    for horizon in range(1, int(max_horizon) + 1):
-        i = anchor + horizon - 1
-        if i + 1 >= len(frame):
-            break
-        x = _build_intraday_feature_row(frame, recursive_actual, i)
-        pred_speed = _predict_intraday_step(bundle, x, forecast_next=float(fc_avg[i + 1]), device=device)
-        pred_speed = _apply_intraday_rollout_calibration(
-            pred_speed=pred_speed,
-            forecast_speed=float(fc_avg[i + 1]),
-            future_horizon=horizon,
-            rollout_calibration=bundle.rollout_calibration,
-        )
-        recursive_actual[i + 1] = pred_speed
-        preds.append(float(pred_speed))
-    return np.asarray(preds, dtype=np.float32)
-
-
 def _fit_intraday_continuity_calibration(
     bundle: IntradayBundle,
-    frame: pd.DataFrame,
+    contexts: list[dict],
     sample_split_idx: int,
     device: torch.device,
     max_horizon: int = 12,
@@ -443,41 +535,41 @@ def _fit_intraday_continuity_calibration(
     if sample_split_idx < 24:
         return None
 
-    actual = frame["actual_avg"].to_numpy(dtype=np.float32)
-    first_anchor = int(max(sample_split_idx + 3, 3))
-    last_anchor = int(len(frame) - max_horizon - 1)
-    if first_anchor >= last_anchor:
+    if sample_split_idx >= len(contexts):
         return None
 
     rows: list[dict] = []
-    for anchor in range(first_anchor, last_anchor):
-        prev_preds = _simulate_intraday_recursive_forecast(
+    for idx in range(max(int(sample_split_idx), 1), len(contexts)):
+        prev_context = contexts[idx - 1]
+        curr_context = contexts[idx]
+        prev_anchor = pd.Timestamp(prev_context["anchor_time"])
+        curr_anchor = pd.Timestamp(curr_context["anchor_time"])
+        if curr_anchor - prev_anchor != pd.Timedelta(hours=1):
+            continue
+
+        prev_preds = _simulate_intraday_recursive_forecast_from_context(
             bundle=bundle,
-            frame=frame,
-            anchor=anchor - 1,
+            context=prev_context,
             device=device,
             max_horizon=max_horizon + 1,
         )
-        curr_preds = _simulate_intraday_recursive_forecast(
+        curr_preds = _simulate_intraday_recursive_forecast_from_context(
             bundle=bundle,
-            frame=frame,
-            anchor=anchor,
+            context=curr_context,
             device=device,
             max_horizon=max_horizon,
         )
         if len(prev_preds) < 2 or len(curr_preds) < 1:
             continue
-        usable_horizon = min(max_horizon, len(curr_preds), len(prev_preds) - 1)
+        actual_series = np.asarray(curr_context["actual_series"], dtype=np.float32)
+        usable_horizon = min(max_horizon, len(curr_preds), len(prev_preds) - 1, len(actual_series) - 3)
         for horizon in range(1, usable_horizon + 1):
-            target_idx = anchor + horizon
-            if target_idx >= len(actual):
-                break
             rows.append(
                 {
                     "horizon": horizon,
                     "prev_pred": float(prev_preds[horizon]),
                     "curr_pred": float(curr_preds[horizon - 1]),
-                    "actual": float(actual[target_idx]),
+                    "actual": float(actual_series[horizon + 2]),
                 }
             )
 
@@ -567,6 +659,272 @@ def _default_intraday_continuity_calibration(max_horizon: int = 12) -> dict:
     }
 
 
+def split_intraday_contexts_for_holdout(
+    contexts: list[dict],
+    holdout_eval_split: float,
+    holdout_min_contexts: int,
+    min_training_contexts: int = 40,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Split real intraday issue contexts into an earlier training chunk and later holdout.
+
+    Each context represents one operational issue time with its remaining hourly
+    targets. Keeping the split chronological preserves the fair forecasting
+    setup: challengers only train on earlier contexts and are compared on later
+    issue times that the champion also sees.
+    """
+    n_contexts = int(len(contexts))
+    if n_contexts <= int(min_training_contexts):
+        raise ValueError("Not enough intraday contexts to reserve a later holdout.")
+
+    holdout_n = max(int(round(n_contexts * float(holdout_eval_split))), int(holdout_min_contexts))
+    holdout_n = min(holdout_n, n_contexts - int(min_training_contexts))
+    if holdout_n < 1:
+        raise ValueError("Not enough intraday contexts for challenger evaluation holdout.")
+
+    split_idx = int(n_contexts - holdout_n)
+    return contexts[:split_idx], contexts[split_idx:]
+
+
+def build_intraday_holdout_context_split(
+    db_path: Path,
+    cfg: DatasetConfig,
+    holdout_eval_split: float,
+    holdout_min_contexts: int,
+    max_horizon: int = INTRADAY_CALIBRATION_HORIZON,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Build the canonical chronological intraday train/holdout context split.
+
+    The holdout unit is an issued intraday forecast context: one anchor/issue
+    time with its remaining hourly targets. This mirrors the real current-day
+    forecasting task more faithfully than a random split.
+    """
+    contexts = _build_intraday_anchor_contexts(
+        db_path=db_path,
+        cfg=cfg,
+        max_horizon=max_horizon,
+    )
+    return split_intraday_contexts_for_holdout(
+        contexts=contexts,
+        holdout_eval_split=holdout_eval_split,
+        holdout_min_contexts=holdout_min_contexts,
+    )
+
+
+def _intraday_metric_summary(pred: np.ndarray, actual: np.ndarray) -> dict[str, float | int | None]:
+    pred_arr = np.asarray(pred, dtype=float).reshape(-1)
+    actual_arr = np.asarray(actual, dtype=float).reshape(-1)
+    valid = (~np.isnan(pred_arr)) & (~np.isnan(actual_arr))
+    count = int(np.sum(valid))
+    if count <= 0:
+        return {"count": 0, "mae": None, "rmse": None}
+    errors = pred_arr[valid] - actual_arr[valid]
+    return {
+        "count": count,
+        "mae": float(np.mean(np.abs(errors))),
+        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+    }
+
+
+def build_intraday_holdout_evaluation_frame(
+    bundle: IntradayBundle,
+    contexts: list[dict],
+    device: torch.device,
+    max_horizon: int = INTRADAY_CALIBRATION_HORIZON,
+) -> pd.DataFrame:
+    """
+    Flatten intraday issue contexts into canonical hourly realised evaluation rows.
+
+    One row corresponds to one target timestamp from one issued intraday
+    context. The predictions are built recursively from the bundle exactly as
+    the operational current-day model would issue them, and the realised
+    observations remain the hourly targets after that issue time.
+    """
+    rows: list[dict] = []
+    for context in contexts:
+        anchor_time = pd.Timestamp(context["anchor_time"])
+        if anchor_time.tzinfo is None:
+            anchor_time = anchor_time.tz_localize("UTC")
+        else:
+            anchor_time = anchor_time.tz_convert("UTC")
+
+        forecast_avg = np.asarray(context["forecast_avg_series"], dtype=np.float32)
+        actual_series = np.asarray(context["actual_series"], dtype=np.float32)
+        usable = min(int(max_horizon), len(forecast_avg) - 3, len(actual_series) - 3)
+        if usable <= 0:
+            continue
+
+        pred = _simulate_intraday_recursive_forecast_from_context(
+            bundle=bundle,
+            context=context,
+            device=device,
+            max_horizon=usable,
+        )
+        usable = min(usable, int(len(pred)))
+        if usable <= 0:
+            continue
+
+        forecast_target = forecast_avg[3 : 3 + usable]
+        actual_target = actual_series[3 : 3 + usable]
+        for step in range(usable):
+            target_time = anchor_time + pd.Timedelta(hours=int(step + 1))
+            rows.append(
+                {
+                    "anchor_time_utc": anchor_time,
+                    "target_time_utc": target_time,
+                    "horizon_hr": float(step + 1),
+                    "prediction_value": float(pred[step]),
+                    "harmonie_value": float(forecast_target[step]),
+                    "actual_value": float(actual_target[step]),
+                }
+            )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "anchor_time_utc",
+            "target_time_utc",
+            "horizon_hr",
+            "prediction_value",
+            "harmonie_value",
+            "actual_value",
+        ],
+    )
+
+
+def align_intraday_holdout_frames(
+    challenger_eval_frame: pd.DataFrame,
+    champion_eval_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Align intraday challenger/champion holdout rows on the same issue/target pairs.
+    """
+    base = challenger_eval_frame[
+        [
+            "anchor_time_utc",
+            "target_time_utc",
+            "horizon_hr",
+            "actual_value",
+            "harmonie_value",
+            "prediction_value",
+        ]
+    ].rename(columns={"prediction_value": "challenger_prediction_value"})
+
+    if champion_eval_frame is None:
+        aligned = base.copy()
+        aligned["champion_prediction_value"] = np.nan
+        return aligned
+
+    champion = champion_eval_frame[
+        [
+            "anchor_time_utc",
+            "target_time_utc",
+            "prediction_value",
+        ]
+    ].rename(columns={"prediction_value": "champion_prediction_value"})
+
+    return base.merge(
+        champion,
+        on=["anchor_time_utc", "target_time_utc"],
+        how="inner",
+    )
+
+
+def summarize_intraday_champion_vs_challenger(
+    *,
+    challenger_eval_frame: pd.DataFrame,
+    champion_eval_frame: pd.DataFrame | None,
+    promotion_margin_pct: float,
+    holdout_eval_split: float,
+    holdout_eval_min_contexts: int,
+    challenger_model_id: str,
+    champion_model_id: str | None,
+) -> dict:
+    """
+    Summarize the fair intraday promotion holdout for challenger vs champion.
+
+    The holdout rows are built from later issue contexts only. Champion and
+    challenger are aligned on the same anchor/target timestamps and scored
+    against the same hourly realised observations, with Harmonie reported on
+    that exact same holdout for baseline context.
+    """
+    aligned = align_intraday_holdout_frames(
+        challenger_eval_frame=challenger_eval_frame,
+        champion_eval_frame=champion_eval_frame,
+    )
+    if aligned.empty:
+        raise ValueError("Intraday champion/challenger holdout comparison has no aligned realised rows.")
+
+    actual = aligned["actual_value"].to_numpy(dtype=float)
+    harmonie = aligned["harmonie_value"].to_numpy(dtype=float)
+    challenger = aligned["challenger_prediction_value"].to_numpy(dtype=float)
+    common_contexts = int(aligned["anchor_time_utc"].nunique())
+
+    harmonie_metrics = _intraday_metric_summary(harmonie, actual)
+    challenger_metrics = _intraday_metric_summary(challenger, actual)
+    summary: dict[str, object] = {
+        "comparison_unit": "intraday_issue_context_remaining_hourly_targets",
+        "holdout_eval_split": float(holdout_eval_split),
+        "holdout_eval_min_contexts": int(holdout_eval_min_contexts),
+        "promotion_margin_pct": float(promotion_margin_pct),
+        "intraday_model_id_challenger": challenger_model_id,
+        "intraday_model_id_champion": champion_model_id or "none",
+        "intraday_eval_contexts": common_contexts,
+        "intraday_eval_rows": int(challenger_metrics["count"]),
+        "intraday_mae_harmonie": harmonie_metrics["mae"],
+        "intraday_rmse_harmonie": harmonie_metrics["rmse"],
+        "intraday_mae_challenger": challenger_metrics["mae"],
+        "intraday_rmse_challenger": challenger_metrics["rmse"],
+    }
+
+    if champion_eval_frame is None:
+        summary.update(
+            {
+                "comparison_scope": "aligned_holdout_rows_no_existing_champion",
+                "intraday_mae_champion": None,
+                "intraday_rmse_champion": None,
+                "intraday_mae_improvement_challenger_vs_champion": None,
+                "intraday_rmse_improvement_challenger_vs_champion": None,
+                "intraday_mae_improvement_challenger_vs_harmonie": None
+                if challenger_metrics["mae"] is None or harmonie_metrics["mae"] is None
+                else float(harmonie_metrics["mae"] - challenger_metrics["mae"]),
+                "intraday_rmse_improvement_challenger_vs_harmonie": None
+                if challenger_metrics["rmse"] is None or harmonie_metrics["rmse"] is None
+                else float(harmonie_metrics["rmse"] - challenger_metrics["rmse"]),
+                "promote_intraday": True,
+                "reason": "no_existing_champion",
+            }
+        )
+        return summary
+
+    champion = aligned["champion_prediction_value"].to_numpy(dtype=float)
+    champion_metrics = _intraday_metric_summary(champion, actual)
+    champion_mae = float(champion_metrics["mae"])
+    challenger_mae = float(challenger_metrics["mae"])
+    champion_rmse = float(champion_metrics["rmse"])
+    challenger_rmse = float(challenger_metrics["rmse"])
+    promote_intraday = challenger_mae <= champion_mae * (1.0 - max(0.0, float(promotion_margin_pct)) / 100.0)
+
+    summary.update(
+        {
+            "comparison_scope": "aligned_holdout_rows_common_to_champion_and_challenger",
+            "intraday_mae_champion": champion_mae,
+            "intraday_rmse_champion": champion_rmse,
+            "intraday_mae_improvement_challenger_vs_champion": float(champion_mae - challenger_mae),
+            "intraday_rmse_improvement_challenger_vs_champion": float(champion_rmse - challenger_rmse),
+            "intraday_mae_improvement_challenger_vs_harmonie": None
+            if harmonie_metrics["mae"] is None
+            else float(harmonie_metrics["mae"] - challenger_mae),
+            "intraday_rmse_improvement_challenger_vs_harmonie": None
+            if harmonie_metrics["rmse"] is None
+            else float(harmonie_metrics["rmse"] - challenger_rmse),
+            "promote_intraday": bool(promote_intraday),
+        }
+    )
+    return summary
+
+
 def train_intraday_model(
     db_path: Path,
     cfg: DatasetConfig,
@@ -579,9 +937,18 @@ def train_intraday_model(
     dropout: float = 0.1,
     learning_rate: float = 1e-3,
     recency_power: float = 1.0,
+    contexts: list[dict] | None = None,
 ) -> tuple[IntradayBundle, dict]:
-    training_frame = _build_intraday_training_frame(db_path, cfg)
-    X_all, y_all = build_intraday_training_xy(db_path, cfg)
+    training_contexts = (
+        _build_intraday_anchor_contexts(
+            db_path=db_path,
+            cfg=cfg,
+            max_horizon=INTRADAY_CALIBRATION_HORIZON,
+        )
+        if contexts is None
+        else contexts
+    )
+    X_all, y_all = build_intraday_training_xy(db_path, cfg, contexts=training_contexts)
     n = len(X_all)
     split_idx = int(n * (1.0 - validation_split))
     split_idx = max(20, min(split_idx, n - 20))
@@ -608,15 +975,17 @@ def train_intraday_model(
     )
     bundle.rollout_calibration = _fit_intraday_rollout_calibration(
         bundle=bundle,
-        frame=training_frame,
+        contexts=training_contexts,
         sample_split_idx=split_idx,
         device=device,
+        max_horizon=INTRADAY_CALIBRATION_HORIZON,
     )
     bundle.continuity_calibration = _fit_intraday_continuity_calibration(
         bundle=bundle,
-        frame=training_frame,
+        contexts=training_contexts,
         sample_split_idx=split_idx,
         device=device,
+        max_horizon=INTRADAY_CALIBRATION_HORIZON,
     )
     if bundle.continuity_calibration is None:
         bundle.continuity_calibration = _default_intraday_continuity_calibration()

@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from data_pipeline import DatasetConfig, _apply_standardizer, _build_samples, _build_training_frame
+from data_pipeline import DatasetConfig, _apply_standardizer, build_all_training_arrays
 from train_lstm import NextDayLSTM
+from update_model_and_predict import _build_speed_calibration_context, _predict_speed_batch
 
 
 LSTM_HIGHLIGHT_COLOR = "#d7191c"
@@ -65,7 +66,7 @@ def _plot_daily_mae(df: pd.DataFrame, out_png: Path) -> None:
     fig, ax = plt.subplots(figsize=(11.5, 5.0))
     ax.plot(df["day_local"], df["mae_lstm"], color=LSTM_HIGHLIGHT_COLOR, linewidth=2.2, label="Super local vs measured wind")
     ax.plot(df["day_local"], df["mae_forecast"], color="gray", linewidth=1.8, label="Harmonie vs measured wind")
-    ax.set_title("Backfilled Day-ahead MAE (Current Model on Past Data)")
+    ax.set_title("Backfilled Frozen Day-ahead MAE (Current Model on Past Data)")
     ax.set_xlabel("Date")
     ax.set_ylabel("MAE (kts)")
     ax.set_ylim(0.0, max(4.0, float(np.nanmax([df["mae_lstm"].max(), df["mae_forecast"].max()])) * 1.06))
@@ -94,6 +95,95 @@ def _plot_daily_mae(df: pd.DataFrame, out_png: Path) -> None:
     plt.close(fig)
 
 
+def _inverse_standardizer(X_scaled: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return X_scaled * std.reshape(1, 1, -1) + mean.reshape(1, 1, -1)
+
+
+def _build_frozen_backfill_daily_frame(
+    db_path: Path,
+    cfg: DatasetConfig,
+    model: NextDayLSTM,
+    ckpt: dict,
+    x_mean_saved: np.ndarray,
+    x_std_saved: np.ndarray,
+    y_mean_saved: float,
+    y_std_saved: float,
+    local_tz: str,
+) -> pd.DataFrame:
+    speed_arrays = build_all_training_arrays(db_path, cfg, target_mode="residual")
+    if int(speed_arrays["X_all"].shape[0]) == 0:
+        raise ValueError("No historical canonical samples available for backfill.")
+
+    X_raw = _inverse_standardizer(
+        np.asarray(speed_arrays["X_all"], dtype=np.float32),
+        np.asarray(speed_arrays["x_mean"], dtype=np.float32),
+        np.asarray(speed_arrays["x_std"], dtype=np.float32),
+    ).astype(np.float32)
+    X_scaled = _apply_standardizer(X_raw, x_mean_saved, x_std_saved).astype(np.float32)
+
+    y_actual_raw = np.asarray(speed_arrays["y_actual_all_raw"], dtype=np.float32)
+    y_forecast_raw = np.asarray(speed_arrays["y_forecast_all_raw"], dtype=np.float32)
+    anchor_times_utc = pd.to_datetime(speed_arrays["timestamps"], utc=True, errors="coerce")
+    if anchor_times_utc.isna().any():
+        raise ValueError("Canonical backfill samples contain invalid anchor timestamps.")
+
+    target_start_utc = anchor_times_utc + pd.Timedelta(hours=1)
+    frozen_mask = np.asarray(target_start_utc.hour, dtype=np.int16) == 0
+    if not frozen_mask.any():
+        raise ValueError("No day-start canonical samples available for frozen day-ahead backfill.")
+
+    target_mode = str(ckpt.get("target_mode", "residual")).strip().lower()
+    constraint_eps = ckpt.get("constraint_eps", None)
+    speed_calibration = ckpt.get("speed_regime_calibration")
+    speed_calibration_context = _build_speed_calibration_context(
+        anchor_dir_deg=X_raw[:, -1, 2],
+        target_times_utc=target_start_utc,
+    )
+    pred_speed = _predict_speed_batch(
+        model=model,
+        X_input=X_scaled,
+        forecast_speed=y_forecast_raw,
+        y_mean=float(y_mean_saved),
+        y_std=float(y_std_saved),
+        target_mode=target_mode,
+        constraint_eps=constraint_eps,
+        speed_calibration=speed_calibration,
+        speed_calibration_context=speed_calibration_context,
+        device=torch.device("cpu"),
+    )
+
+    tz = ZoneInfo(local_tz)
+    sample_df = pd.DataFrame(
+        {
+            "anchor_time_utc": anchor_times_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "issue_local_time": anchor_times_utc.tz_convert(tz).strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "target_start_utc": target_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "target_start_local": target_start_utc.tz_convert(tz).strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "day_local": target_start_utc.tz_convert(tz).date.astype(str),
+            "mae_forecast": np.mean(np.abs(y_forecast_raw - y_actual_raw), axis=1).astype(float),
+            "mae_lstm": np.mean(np.abs(pred_speed - y_actual_raw), axis=1).astype(float),
+            "avg_actual_wind_speed": np.mean(y_actual_raw, axis=1).astype(float),
+            "avg_forecast_wind_speed": np.mean(y_forecast_raw, axis=1).astype(float),
+            "avg_lstm_wind_speed": np.mean(pred_speed, axis=1).astype(float),
+            "improvement_vs_forecast": (np.mean(np.abs(y_forecast_raw - y_actual_raw), axis=1) - np.mean(np.abs(pred_speed - y_actual_raw), axis=1)).astype(float),
+            "n_points": np.sum(~np.isnan(y_actual_raw), axis=1).astype(int),
+            "evaluation_type": "day_ahead_frozen_backfill",
+        }
+    )
+    sample_df = sample_df.loc[frozen_mask].copy()
+    if sample_df.empty:
+        raise ValueError("No frozen day-ahead samples remained after canonical filtering.")
+
+    # One canonical frozen issue per target day: the day-start issue context.
+    sample_df["date"] = sample_df["day_local"]
+    sample_df = sample_df.sort_values(["day_local", "anchor_time_utc"]).drop_duplicates(subset=["day_local"], keep="first")
+    daily_df = sample_df.sort_values("day_local").reset_index(drop=True)
+    daily_df["day_local"] = pd.to_datetime(daily_df["day_local"], errors="coerce")
+    daily_df["date"] = daily_df["day_local"].dt.strftime("%Y-%m-%d")
+    daily_df = daily_df.dropna(subset=["day_local"]).reset_index(drop=True)
+    return daily_df
+
+
 def main() -> None:
     args = parse_args()
     metadata_path = Path(args.metadata)
@@ -111,76 +201,28 @@ def main() -> None:
         target_hours=target_hours,
     )
 
-    frame = _build_training_frame(Path(args.db), cfg)
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
-    X_raw, y_actual_raw, y_forecast_raw, timestamps = _build_samples(frame, cfg, feature_cols, "actual_avg")
-    if len(X_raw) == 0:
-        raise ValueError("No historical samples available for backfill.")
+    model, ckpt = _load_model(Path(args.model_path))
+    model_target_hours = int(ckpt.get("target_hours", cfg.target_hours))
+    if model_target_hours != int(cfg.target_hours):
+        raise ValueError(
+            f"Configured target_hours={cfg.target_hours} does not match checkpoint target_hours={model_target_hours}."
+        )
 
     x_mean = np.load(args.x_mean)
     x_std = np.load(args.x_std)
     y_mean = float(np.load(args.y_mean)[0])
     y_std = float(np.load(args.y_std)[0])
-    X_scaled = _apply_standardizer(X_raw, x_mean, x_std).astype(np.float32)
-
-    model, ckpt = _load_model(Path(args.model_path))
-    target_mode = str(ckpt.get("target_mode", "residual")).strip().lower()
-    constraint_eps = ckpt.get("constraint_eps", None)
-    eps = float(0.1 if constraint_eps is None else constraint_eps)
-
-    with torch.no_grad():
-        pred_scaled = model(torch.from_numpy(X_scaled).float()).cpu().numpy()
-    pred_target = pred_scaled * y_std + y_mean
-
-    if target_mode == "residual":
-        pred_speed = y_forecast_raw + pred_target
-    elif target_mode == "constrained_logratio":
-        pred_speed = np.exp(np.log(y_forecast_raw + eps) + pred_target)
-    elif target_mode == "absolute":
-        pred_speed = pred_target
-    else:
-        raise ValueError(f"Unsupported speed target mode: {target_mode}")
-
-    mae_forecast = np.mean(np.abs(y_forecast_raw - y_actual_raw), axis=1)
-    mae_lstm = np.mean(np.abs(pred_speed - y_actual_raw), axis=1)
-    avg_actual_wind_speed = np.mean(y_actual_raw, axis=1)
-    avg_forecast_wind_speed = np.mean(y_forecast_raw, axis=1)
-    avg_lstm_wind_speed = np.mean(pred_speed, axis=1)
-
-    tz = ZoneInfo(args.local_timezone)
-    anchor_times_utc = pd.to_datetime(timestamps, utc=True, errors="coerce")
-    target_start_local = (anchor_times_utc + pd.Timedelta(hours=1)).tz_convert(tz)
-    day_local = target_start_local.date.astype(str)
-
-    sample_df = pd.DataFrame(
-        {
-            "anchor_time_utc": anchor_times_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "target_start_local": target_start_local.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "day_local": day_local,
-            "mae_forecast": mae_forecast.astype(float),
-            "mae_lstm": mae_lstm.astype(float),
-            "avg_actual_wind_speed": avg_actual_wind_speed.astype(float),
-            "avg_forecast_wind_speed": avg_forecast_wind_speed.astype(float),
-            "avg_lstm_wind_speed": avg_lstm_wind_speed.astype(float),
-            "improvement_vs_forecast": (mae_forecast - mae_lstm).astype(float),
-        }
+    daily_df = _build_frozen_backfill_daily_frame(
+        db_path=Path(args.db),
+        cfg=cfg,
+        model=model,
+        ckpt=ckpt,
+        x_mean_saved=x_mean,
+        x_std_saved=x_std,
+        y_mean_saved=y_mean,
+        y_std_saved=y_std,
+        local_tz=args.local_timezone,
     )
-    daily_df = (
-        sample_df.groupby("day_local", as_index=False)[
-            [
-                "mae_forecast",
-                "mae_lstm",
-                "avg_actual_wind_speed",
-                "avg_forecast_wind_speed",
-                "avg_lstm_wind_speed",
-                "improvement_vs_forecast",
-            ]
-        ]
-        .mean(numeric_only=True)
-        .sort_values("day_local")
-    )
-    daily_df["day_local"] = pd.to_datetime(daily_df["day_local"], errors="coerce")
-    daily_df = daily_df.dropna(subset=["day_local"])
 
     out_csv = Path(args.out_csv)
     out_png = Path(args.out_png)

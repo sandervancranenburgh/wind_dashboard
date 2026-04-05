@@ -6,6 +6,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -20,22 +21,41 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from db_store import (
+    init_db,
+    load_next_day_realized_detail_rows,
+    load_prediction_evaluation_summary,
+    log_prediction_batch,
+    materialize_prediction_log_evaluation,
+    summarize_next_day_vs_harmonie,
+    summarize_next_day_vs_harmonie_by_horizon,
+    summarize_next_day_vs_harmonie_by_issued_day,
+)
 from data_pipeline import (
     DatasetConfig,
     _angle_add_deg,
-    _build_forecast_feature_frame,
     _apply_standardizer,
     _fit_standardizer,
     _fit_target_scaler,
+    build_anchor_forecast_context,
+    build_anchor_forecast_timeline,
     build_all_direction_training_arrays,
     build_all_training_arrays,
     build_next_day_inference_input,
 )
 from intraday_model import (
     IntradayBundle,
+    align_intraday_holdout_frames,
+    build_intraday_holdout_context_split,
+    build_intraday_holdout_evaluation_frame,
     load_intraday_model,
     predict_intraday_day_speed,
     save_intraday_model,
+    summarize_intraday_champion_vs_challenger,
     train_intraday_model,
 )
 from train_lstm import NextDayLSTM
@@ -100,6 +120,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Required relative MAE improvement (percent) to promote challenger over champion.",
+    )
+    parser.add_argument(
+        "--intraday-challenge-eval-split",
+        type=float,
+        default=0.15,
+        help="Chronological holdout fraction used for intraday champion-vs-challenger checks.",
+    )
+    parser.add_argument(
+        "--intraday-challenge-min-eval-contexts",
+        type=int,
+        default=48,
+        help="Minimum number of later intraday issue contexts in the promotion holdout.",
+    )
+    parser.add_argument(
+        "--intraday-promotion-margin-pct",
+        type=float,
+        default=1.0,
+        help="Required relative MAE improvement (percent) to promote the intraday challenger.",
     )
     parser.add_argument(
         "--local-timezone",
@@ -793,6 +831,255 @@ def _eval_start_index(n_samples: int, eval_fraction: float, min_eval_samples: in
     return int(n_samples - eval_n)
 
 
+def _metric_summary_from_aligned_predictions(
+    pred: np.ndarray,
+    actual: np.ndarray,
+) -> dict[str, float | int | None]:
+    pred_arr = np.asarray(pred, dtype=float).reshape(-1)
+    actual_arr = np.asarray(actual, dtype=float).reshape(-1)
+    valid = (~np.isnan(pred_arr)) & (~np.isnan(actual_arr))
+    count = int(np.sum(valid))
+    if count <= 0:
+        return {"count": 0, "mae": None, "rmse": None}
+    errors = pred_arr[valid] - actual_arr[valid]
+    return {
+        "count": count,
+        "mae": float(np.mean(np.abs(errors))),
+        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+    }
+
+
+def summarize_champion_vs_challenger(
+    *,
+    actual: np.ndarray,
+    forecast: np.ndarray,
+    challenger_pred: np.ndarray,
+    champion_pred: np.ndarray | None,
+    promotion_margin_pct: float,
+    holdout_eval_split: float,
+    holdout_eval_min_samples: int,
+    challenger_model_id: str,
+    champion_model_id: str | None,
+) -> dict:
+    """
+    Summarize the fair next-day promotion holdout for challenger vs champion.
+
+    The input arrays must already be aligned on the same chronological holdout
+    sample/target positions. This helper preserves that fair comparison by
+    scoring champion, challenger, and Harmonie on exactly the same realised
+    rows instead of recomputing from a dashboard-oriented artifact.
+    """
+    actual_arr = np.asarray(actual, dtype=float)
+    forecast_arr = np.asarray(forecast, dtype=float)
+    challenger_arr = np.asarray(challenger_pred, dtype=float)
+
+    summary: dict[str, object] = {
+        "holdout_eval_split": float(holdout_eval_split),
+        "holdout_eval_min_samples": int(holdout_eval_min_samples),
+        "promotion_margin_pct": float(promotion_margin_pct),
+        "speed_model_id_challenger": challenger_model_id,
+        "speed_model_id_champion": champion_model_id or "none",
+    }
+
+    if champion_pred is None:
+        challenger_metrics = _metric_summary_from_aligned_predictions(challenger_arr, actual_arr)
+        harmonie_metrics = _metric_summary_from_aligned_predictions(forecast_arr, actual_arr)
+        summary.update(
+            {
+                "comparison_scope": "aligned_holdout_rows_no_existing_champion",
+                "speed_eval_rows": int(challenger_metrics["count"]),
+                "speed_mae_forecast": harmonie_metrics["mae"],
+                "speed_rmse_forecast": harmonie_metrics["rmse"],
+                "speed_mae_challenger": challenger_metrics["mae"],
+                "speed_rmse_challenger": challenger_metrics["rmse"],
+                "speed_mae_champion": None,
+                "speed_rmse_champion": None,
+                "speed_mae_improvement_challenger_vs_champion": None,
+                "speed_rmse_improvement_challenger_vs_champion": None,
+                "speed_mae_improvement_challenger_vs_harmonie": None
+                if challenger_metrics["mae"] is None or harmonie_metrics["mae"] is None
+                else float(harmonie_metrics["mae"] - challenger_metrics["mae"]),
+                "speed_rmse_improvement_challenger_vs_harmonie": None
+                if challenger_metrics["rmse"] is None or harmonie_metrics["rmse"] is None
+                else float(harmonie_metrics["rmse"] - challenger_metrics["rmse"]),
+                "promote_speed": True,
+                "reason": "no_existing_champion",
+            }
+        )
+        return summary
+
+    champion_arr = np.asarray(champion_pred, dtype=float)
+    common_mask = (
+        (~np.isnan(actual_arr))
+        & (~np.isnan(forecast_arr))
+        & (~np.isnan(challenger_arr))
+        & (~np.isnan(champion_arr))
+    )
+    if not np.any(common_mask):
+        raise ValueError("Champion/challenger holdout comparison has no common realised rows.")
+
+    actual_common = actual_arr[common_mask]
+    forecast_common = forecast_arr[common_mask]
+    challenger_common = challenger_arr[common_mask]
+    champion_common = champion_arr[common_mask]
+
+    harmonie_metrics = _metric_summary_from_aligned_predictions(forecast_common, actual_common)
+    challenger_metrics = _metric_summary_from_aligned_predictions(challenger_common, actual_common)
+    champion_metrics = _metric_summary_from_aligned_predictions(champion_common, actual_common)
+
+    champion_mae = float(champion_metrics["mae"])
+    challenger_mae = float(challenger_metrics["mae"])
+    champion_rmse = float(champion_metrics["rmse"])
+    challenger_rmse = float(challenger_metrics["rmse"])
+    promote_speed = challenger_mae <= champion_mae * (1.0 - max(0.0, float(promotion_margin_pct)) / 100.0)
+    summary.update(
+        {
+            "comparison_scope": "aligned_holdout_rows_common_to_champion_and_challenger",
+            "speed_eval_rows": int(champion_metrics["count"]),
+            "speed_mae_forecast": harmonie_metrics["mae"],
+            "speed_rmse_forecast": harmonie_metrics["rmse"],
+            "speed_mae_champion": champion_mae,
+            "speed_rmse_champion": champion_rmse,
+            "speed_mae_challenger": challenger_mae,
+            "speed_rmse_challenger": challenger_rmse,
+            "speed_mae_improvement_challenger_vs_champion": float(champion_mae - challenger_mae),
+            "speed_rmse_improvement_challenger_vs_champion": float(champion_rmse - challenger_rmse),
+            "speed_mae_improvement_challenger_vs_harmonie": None
+            if harmonie_metrics["mae"] is None
+            else float(harmonie_metrics["mae"] - challenger_mae),
+            "speed_rmse_improvement_challenger_vs_harmonie": None
+            if harmonie_metrics["rmse"] is None
+            else float(harmonie_metrics["rmse"] - challenger_rmse),
+            "promote_speed": bool(promote_speed),
+        }
+    )
+    return summary
+
+
+def _timestamp_ms_utc(value: pd.Timestamp | datetime | str) -> int:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.value // 1_000_000)
+
+
+def _build_next_day_prediction_log_frame(
+    inference_input: dict,
+    speed_pred: np.ndarray,
+) -> pd.DataFrame:
+    """
+    Build canonical hourly next-day prediction rows for durable logging.
+
+    The emitted frame keeps the exact Harmonie run/fetched metadata that was
+    selected by the vintage-aware inference helpers, so later evaluation can
+    reconstruct the fair operational baseline without re-deriving it from
+    collapsed latest-per-target views.
+    """
+    target_times_utc = pd.to_datetime(inference_input["target_times"], utc=True)
+    return pd.DataFrame(
+        {
+            "target_time_utc": target_times_utc,
+            "horizon_hr": np.asarray(inference_input["target_horizon_hr"], dtype=np.float32),
+            "prediction_value": np.asarray(speed_pred, dtype=np.float32),
+            "harmonie_value": np.asarray(inference_input["forecast_next24"], dtype=np.float32),
+            "harmonie_run_ts": np.asarray(inference_input["target_run_ts"], dtype=np.int64),
+            "harmonie_fetched_ts": np.asarray(inference_input["target_fetched_ts"], dtype=np.int64),
+        }
+    )
+
+
+def _build_prediction_log_rows(
+    prediction_frame: pd.DataFrame,
+    *,
+    site: str,
+    model_type: str,
+    model_name: str,
+    model_version: str | None,
+    model_artifact: str,
+    issued_time_utc: datetime | pd.Timestamp | str,
+    anchor_time_utc: datetime | pd.Timestamp | str,
+    prediction_kind: str = "wind_speed",
+    run_context: str | None = None,
+    metadata: dict | None = None,
+) -> list[dict]:
+    if prediction_frame.empty:
+        return []
+
+    issued_ts = _timestamp_ms_utc(issued_time_utc)
+    anchor_ts = _timestamp_ms_utc(anchor_time_utc)
+    base_metadata = dict(metadata or {})
+    rows: list[dict] = []
+    for rec in prediction_frame.itertuples(index=False):
+        harmonie_run_ts = None if pd.isna(rec.harmonie_run_ts) else int(rec.harmonie_run_ts)
+        harmonie_fetched_ts = None if pd.isna(rec.harmonie_fetched_ts) else int(rec.harmonie_fetched_ts)
+        actual_value = None
+        if hasattr(rec, "actual_value") and not pd.isna(rec.actual_value):
+            actual_value = float(rec.actual_value)
+        rows.append(
+            {
+                "site": site,
+                "model_type": model_type,
+                "prediction_kind": prediction_kind,
+                "model_name": model_name,
+                "model_version": model_version,
+                "model_artifact": model_artifact,
+                "issued_ts": issued_ts,
+                "anchor_ts": anchor_ts,
+                "target_ts": _timestamp_ms_utc(rec.target_time_utc),
+                "horizon_hr": None if pd.isna(rec.horizon_hr) else float(rec.horizon_hr),
+                "prediction_value": None if pd.isna(rec.prediction_value) else float(rec.prediction_value),
+                "harmonie_value": None if pd.isna(rec.harmonie_value) else float(rec.harmonie_value),
+                "harmonie_run_ts": harmonie_run_ts,
+                "harmonie_fetched_ts": harmonie_fetched_ts,
+                "actual_value": actual_value,
+                "run_context": run_context,
+                "metadata_json": base_metadata,
+            }
+        )
+    return rows
+
+
+def _log_prediction_frame(
+    db_path: Path,
+    prediction_frame: pd.DataFrame,
+    *,
+    site: str,
+    model_type: str,
+    model_name: str,
+    model_version: str | None,
+    model_artifact: str,
+    issued_time_utc: datetime | pd.Timestamp | str,
+    anchor_time_utc: datetime | pd.Timestamp | str,
+    prediction_kind: str = "wind_speed",
+    run_context: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    rows = _build_prediction_log_rows(
+        prediction_frame,
+        site=site,
+        model_type=model_type,
+        model_name=model_name,
+        model_version=model_version,
+        model_artifact=model_artifact,
+        issued_time_utc=issued_time_utc,
+        anchor_time_utc=anchor_time_utc,
+        prediction_kind=prediction_kind,
+        run_context=run_context,
+        metadata=metadata,
+    )
+    if not rows:
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_db(conn)
+        return log_prediction_batch(conn, rows)
+    finally:
+        conn.close()
+
+
 def build_prediction_table(
     inference_input: dict,
     speed_pred: np.ndarray,
@@ -1126,7 +1413,15 @@ def build_current_day_table(
     test_now_local_hour: int | None,
     current_day_interval_minutes: int,
     device: torch.device,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return the dense plotting table plus the canonical hourly issued forecast.
+
+    The first frame keeps the existing dense current-day plot output. The second
+    frame is the evaluation-ready hourly issue record: one future target
+    timestamp per row, using the exact Harmonie vintage that was available at
+    the current issue hour.
+    """
     def _predict_residuals_for_targets(
         target_local_index: pd.DatetimeIndex,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1148,8 +1443,17 @@ def build_current_day_table(
         target_utc_index = target_local_index.tz_convert("UTC")
 
         feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
-        history_frame = forecast_frame_utc.reindex(history_utc_for_targets)
-        future_frame = forecast_frame_utc.reindex(target_utc_index)
+        context = build_anchor_forecast_context(
+            db_path=db_path,
+            cfg=cfg,
+            anchor_time=anchor_local_for_targets.tz_convert("UTC"),
+            history_times=history_utc_for_targets,
+            target_times=target_utc_index,
+        )
+        history_frame = context["history_frame"]
+        future_frame = context["target_frame"]
+        if history_frame is None or future_frame is None:
+            raise ValueError("Missing forecast rows for current-day anchor context.")
         if history_frame[feature_cols].isna().any().any():
             raise ValueError("Missing forecast rows in history window for current-day inference.")
         if future_frame[["forecast_avg", "forecast_dir"]].isna().any().any():
@@ -1186,12 +1490,7 @@ def build_current_day_table(
         return lstm_speed.astype(np.float32), lstm_dir.astype(np.float32)
 
     tz = ZoneInfo(local_tz)
-    now_local = datetime.now(tz=tz)
-    if test_now_local_hour is not None:
-        hour = int(test_now_local_hour)
-        if hour < 0 or hour > 23:
-            raise ValueError("--test-now-local-hour must be between 0 and 23.")
-        now_local = now_local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    now_local = _resolve_now_local(local_tz, test_now_local_hour)
     now_hour_local = now_local.replace(minute=0, second=0, microsecond=0)
     day_start_local = now_hour_local.replace(hour=0)
     day_end_local = day_start_local + timedelta(hours=23)
@@ -1199,8 +1498,17 @@ def build_current_day_table(
     if interval_min <= 0 or 60 % interval_min != 0:
         raise ValueError("--current-day-interval-minutes must be a positive divisor of 60.")
 
-    # Build forecast frame (UTC indexed) and raw observations, then convert to local timezone.
-    forecast_frame_utc = _build_forecast_feature_frame(db_path, cfg)
+    # Build the forecast frame that was actually available at the current issue hour.
+    full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
+    issue_anchor_utc = pd.Timestamp(now_hour_local).tz_convert("UTC")
+    forecast_frame_utc = build_anchor_forecast_timeline(
+        db_path=db_path,
+        cfg=cfg,
+        anchor_time=issue_anchor_utc,
+        timeline=full_hours.tz_convert("UTC"),
+    )
+    if forecast_frame_utc is None:
+        raise ValueError("Missing current-issue forecast timeline for current-day prediction.")
     conn = sqlite3.connect(str(db_path))
     try:
         obs_raw_utc = _load_observations_raw(conn, cfg.site)
@@ -1239,7 +1547,6 @@ def build_current_day_table(
     remaining_n = len(remaining_local)
 
     # Full-day context direction prediction (00..23) based on day-start anchor.
-    full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
     _, lstm_dir_full = _predict_residuals_for_targets(full_hours)
     # Remaining-day best prediction (next hour..23) based on current anchor.
     if remaining_n > 0:
@@ -1260,6 +1567,33 @@ def build_current_day_table(
     )
 
     fc_today = forecast_frame_local.reindex(full_hours)
+    issued_hourly_predictions = pd.DataFrame(
+        columns=[
+            "target_time_utc",
+            "horizon_hr",
+            "prediction_value",
+            "harmonie_value",
+            "harmonie_run_ts",
+            "harmonie_fetched_ts",
+        ]
+    )
+    if remaining_n > 0:
+        fc_remaining = forecast_frame_utc.reindex(remaining_local.tz_convert("UTC"))
+        rem_prediction_speed = (
+            pd.Series(intraday_speed_rem, index=full_hours, dtype=float)
+            .reindex(remaining_local)
+            .to_numpy(dtype=np.float32)
+        )
+        issued_hourly_predictions = pd.DataFrame(
+            {
+                "target_time_utc": remaining_local.tz_convert("UTC"),
+                "horizon_hr": ((remaining_local.tz_convert("UTC") - issue_anchor_utc) / pd.Timedelta(hours=1)).astype(float),
+                "prediction_value": rem_prediction_speed,
+                "harmonie_value": fc_remaining["forecast_avg"].to_numpy(dtype=np.float32),
+                "harmonie_run_ts": fc_remaining["run_ts"].to_numpy(dtype=np.int64),
+                "harmonie_fetched_ts": fc_remaining["fetched_ts"].to_numpy(dtype=np.int64),
+            }
+        )
     fc_min = fc_today["forecast_min"].to_numpy(dtype=np.float32)
     fc_avg = fc_today["forecast_avg"].to_numpy(dtype=np.float32)
     fc_max = fc_today["forecast_max"].to_numpy(dtype=np.float32)
@@ -1356,7 +1690,7 @@ def build_current_day_table(
     table["is_future"] = table["time_local"] >= future_start
     table["hour_local"] = table["time_local"].dt.strftime("%H")
     table["minute_local"] = table["time_local"].dt.minute
-    return table
+    return table, issued_hourly_predictions
 
 
 def save_current_day_plot(
@@ -1528,8 +1862,8 @@ def save_current_day_plot(
         active_lw = 2.2 if mobile else 2.0
         overlay_alphas = np.linspace(overlay_alpha_start, overlay_alpha_end, len(historical_branches), dtype=float)
         branch_start_markers: dict[int, tuple[float, float]] = {}
-        prev_active_end_x: float | None = None
-        prev_active_end_y: float | None = None
+        historical_branch_markers: list[tuple[float, float, float]] = []
+        historical_branches_plotted = False
         for idx, ((issue_anchor, overlay), overlay_alpha) in enumerate(zip(historical_branches, overlay_alphas)):
             next_issue_anchor = (
                 historical_branches[idx + 1][0]
@@ -1546,12 +1880,6 @@ def save_current_day_plot(
             order = np.argsort(overlay_x)
             overlay_x = overlay_x[order]
             overlay_y = overlay_y[order]
-            if prev_active_end_x is not None and prev_active_end_y is not None:
-                if np.isclose(overlay_x[0], prev_active_end_x):
-                    overlay_y[0] = prev_active_end_y
-                elif overlay_x[0] > prev_active_end_x:
-                    overlay_x = np.insert(overlay_x, 0, prev_active_end_x)
-                    overlay_y = np.insert(overlay_y, 0, prev_active_end_y)
             branch_lookback = branch_lookback_by_anchor.get(issue_anchor)
             if branch_lookback in mae_branch_styles:
                 branch_style = mae_branch_styles[branch_lookback]
@@ -1570,30 +1898,26 @@ def save_current_day_plot(
             active_x = np.array([x_lookup.get(ts, np.nan) for ts in active_overlay["time_local"]], dtype=float)
             active_y = active_overlay["lstm_pred_wind_speed"].to_numpy(dtype=float)
             active_valid = (~np.isnan(active_x)) & (~np.isnan(active_y))
-            if active_valid.sum() >= 2:
+            if active_valid.sum() >= 1:
                 active_x = active_x[active_valid]
                 active_y = active_y[active_valid]
                 active_order = np.argsort(active_x)
                 active_x = active_x[active_order]
                 active_y = active_y[active_order]
-                if prev_active_end_x is not None and prev_active_end_y is not None:
-                    if np.isclose(active_x[0], prev_active_end_x):
-                        active_y[0] = prev_active_end_y
-                    elif active_x[0] > prev_active_end_x:
-                        active_x = np.insert(active_x, 0, prev_active_end_x)
-                        active_y = np.insert(active_y, 0, prev_active_end_y)
-                ax.plot(
-                    active_x,
-                    active_y,
-                    color=LSTM_HIGHLIGHT_COLOR,
-                    linestyle="--",
-                    linewidth=active_lw,
-                    alpha=0.88,
-                    zorder=2.65,
-                    label="_nolegend_",
-                )
-                prev_active_end_x = float(active_x[-1])
-                prev_active_end_y = float(active_y[-1])
+                active_alpha = min(max(float(overlay_alpha) + 0.22, 0.34), 0.82)
+                if len(active_x) >= 2:
+                    ax.plot(
+                        active_x,
+                        active_y,
+                        color=LSTM_HIGHLIGHT_COLOR,
+                        linestyle="--",
+                        linewidth=active_lw,
+                        alpha=active_alpha,
+                        zorder=2.65,
+                        label="_nolegend_",
+                    )
+                historical_branch_markers.append((float(active_x[0]), float(active_y[0]), active_alpha))
+                historical_branches_plotted = True
         for lookback_hours, (marker_x, marker_y) in branch_start_markers.items():
             branch_style = mae_branch_styles[lookback_hours]
             ax.scatter(
@@ -1604,6 +1928,18 @@ def save_current_day_plot(
                 edgecolors="white",
                 linewidths=0.8,
                 zorder=3.4,
+                label="_nolegend_",
+            )
+        for marker_x, marker_y, marker_alpha in historical_branch_markers:
+            ax.scatter(
+                [marker_x],
+                [marker_y],
+                s=18 if mobile else 14,
+                color=LSTM_HIGHLIGHT_COLOR,
+                edgecolors="white",
+                linewidths=0.6,
+                alpha=marker_alpha,
+                zorder=3.2,
                 label="_nolegend_",
             )
 
@@ -1647,12 +1983,27 @@ def save_current_day_plot(
     desired_order = [
         "Wind speed - measured",
         "Super local - avg speed - hourly remaining day forecast",
+        "Super local - avg speed - frozen prior issued forecasts",
         "Super local - avg speed - 3 hr ago forecast",
         "Super local - avg speed - 6 hr ago forecast",
         "Harmonie model - avg speed",
         "Harmonie model - max speed",
     ]
     order_map = {label: handle for handle, label in zip(handles, labels)}
+    if historical_branches and "historical_branches_plotted" in locals() and historical_branches_plotted:
+        order_map["Super local - avg speed - frozen prior issued forecasts"] = Line2D(
+            [0],
+            [0],
+            color=LSTM_HIGHLIGHT_COLOR,
+            linestyle="--",
+            linewidth=1.6 if mobile else 1.4,
+            marker="o",
+            markersize=4.2 if mobile else 3.6,
+            markerfacecolor=LSTM_HIGHLIGHT_COLOR,
+            markeredgecolor="white",
+            markeredgewidth=0.6,
+            alpha=0.62,
+        )
     for lookback_hours, branch_style in mae_branch_styles.items():
         if lookback_hours not in branch_lookback_by_anchor.values():
             continue
@@ -2059,37 +2410,11 @@ def save_daily_mae_plot(
     hist["avg_forecast_wind_speed"] = pd.to_numeric(hist["avg_forecast_wind_speed"], errors="coerce")
     hist["avg_lstm_wind_speed"] = pd.to_numeric(hist["avg_lstm_wind_speed"], errors="coerce")
     hist = hist.dropna(subset=["mae_forecast", "mae_lstm"])
-
     hist["day"] = hist["date"].dt.floor("D")
     hist_daily = hist.groupby("day", as_index=False)[
         ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
     ].mean(numeric_only=True)
-
-    backfill_csv = history_csv.parent / "dayahead_backfill_history.csv"
-    backfill_daily = pd.DataFrame(
-        columns=["day", "mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
-    )
-    if backfill_csv.exists():
-        backfill = pd.read_csv(backfill_csv)
-        if "day_local" in backfill.columns:
-            backfill["day"] = pd.to_datetime(backfill["day_local"], errors="coerce")
-        elif "date" in backfill.columns:
-            backfill["day"] = pd.to_datetime(backfill["date"], errors="coerce")
-        else:
-            backfill["day"] = pd.NaT
-        for c in ["avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]:
-            if c not in backfill.columns:
-                backfill[c] = np.nan
-        for c in ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]:
-            if c in backfill.columns:
-                backfill[c] = pd.to_numeric(backfill[c], errors="coerce")
-        backfill = backfill.dropna(subset=["day"])
-        if not backfill.empty:
-            backfill_daily = backfill.groupby("day", as_index=False)[
-                ["mae_forecast", "mae_lstm", "avg_actual_wind_speed", "avg_forecast_wind_speed", "avg_lstm_wind_speed"]
-            ].mean(numeric_only=True)
-
-    if hist_daily.empty and backfill_daily.empty:
+    if hist_daily.empty:
         fig, ax = plt.subplots(figsize=(10, 4.8))
         ax.set_title("Mean Absolute Prediction Error (Day-ahead)")
         ax.set_xlabel("Date")
@@ -2111,13 +2436,7 @@ def save_daily_mae_plot(
         plt.close(fig)
         return
 
-    if hist_daily.empty:
-        merged = backfill_daily.set_index("day")
-    elif backfill_daily.empty:
-        merged = hist_daily.set_index("day")
-    else:
-        merged = hist_daily.set_index("day").combine_first(backfill_daily.set_index("day"))
-    merged = merged.sort_index()
+    merged = hist_daily.set_index("day").sort_index()
 
     fig, (ax_top, ax_bottom) = plt.subplots(
         2,
@@ -2193,15 +2512,16 @@ def save_daily_mae_plot(
     ax_top.set_ylabel("Wind speed (kts)")
     ax_top.grid(axis="y", alpha=0.3)
     ax_top.legend(loc="upper left")
-    speed_top = float(
-        np.nanmax(
-            [
-                merged["avg_lstm_wind_speed"].max(),
-                merged["avg_forecast_wind_speed"].max(),
-                merged["avg_actual_wind_speed"].max(),
-            ]
-        )
+    speed_candidates = np.asarray(
+        [
+            merged["avg_lstm_wind_speed"].max(),
+            merged["avg_forecast_wind_speed"].max(),
+            merged["avg_actual_wind_speed"].max(),
+        ],
+        dtype=float,
     )
+    finite_speed_candidates = speed_candidates[np.isfinite(speed_candidates)]
+    speed_top = float(np.max(finite_speed_candidates)) if finite_speed_candidates.size else 0.0
     ax_top.set_ylim(0.0, max(4.0, speed_top * 1.04))
     ax_top.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter("{x:.0f}"))
 
@@ -2224,7 +2544,9 @@ def save_daily_mae_plot(
     ax_bottom.set_ylabel("MAE (kts)")
     ax_bottom.grid(axis="y", alpha=0.3)
     ax_bottom.legend(loc="upper left")
-    y_top_data = float(np.nanmax([merged["mae_forecast"].max(), merged["mae_lstm"].max()]))
+    mae_candidates = np.asarray([merged["mae_forecast"].max(), merged["mae_lstm"].max()], dtype=float)
+    finite_mae_candidates = mae_candidates[np.isfinite(mae_candidates)]
+    y_top_data = float(np.max(finite_mae_candidates)) if finite_mae_candidates.size else 0.0
     ax_bottom.set_ylim(0.0, max(4.0, y_top_data * 1.08))
 
     # Mark model-gate events where challenger was promoted.
@@ -2533,7 +2855,15 @@ def compute_fixed_origin_current_day_mae(
     if actual_measurements is not None and not actual_measurements.empty:
         eval_actual = actual_measurements.copy()
         eval_actual = eval_actual.dropna(subset=["time_local", "actual_wind_speed"]).copy()
-        eval_actual = eval_actual.sort_values("time_local").drop_duplicates(subset=["time_local"])
+        eval_actual["time_local"] = pd.to_datetime(eval_actual["time_local"], utc=True, errors="coerce")
+        eval_actual = eval_actual.dropna(subset=["time_local"]).sort_values("time_local")
+        eval_actual = (
+            eval_actual.set_index("time_local")[["actual_wind_speed"]]
+            .resample("1h")
+            .mean(numeric_only=True)
+            .dropna()
+            .reset_index()
+        )
     else:
         eval_actual = current_table.copy()
         eval_actual = eval_actual[
@@ -2581,7 +2911,11 @@ def compute_fixed_origin_current_day_mae(
 
         issue_anchor, issued_at, snap = eligible[-1]
         snap_eval = snap.copy()
-        snap_eval = snap_eval[(snap_eval["time_local"] >= issue_anchor) & (snap_eval["time_local"] <= eval_end)].copy()
+        snap_eval = snap_eval[
+            snap_eval["time_local"].dt.minute.eq(0)
+            & (snap_eval["time_local"] > issue_anchor)
+            & (snap_eval["time_local"] <= eval_end)
+        ].copy()
         snap_eval = snap_eval.dropna(subset=["time_local", "forecast_wind_speed", "lstm_pred_wind_speed"])
         actual_eval = eval_actual[(eval_actual["time_local"] > issue_anchor) & (eval_actual["time_local"] <= eval_end)].copy()
         if snap_eval.empty or actual_eval.empty:
@@ -2599,34 +2933,13 @@ def compute_fixed_origin_current_day_mae(
             continue
 
         snap_eval = snap_eval.sort_values("time_local").drop_duplicates(subset=["time_local"]).copy()
-        actual_times = actual_eval["time_local"]
-        forecast_series = (
-            pd.Series(pd.to_numeric(snap_eval["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float), index=snap_eval["time_local"])
-            .sort_index()
-            .groupby(level=0)
-            .last()
+        snap_eval["forecast_wind_speed"] = pd.to_numeric(snap_eval["forecast_wind_speed"], errors="coerce")
+        snap_eval["lstm_pred_wind_speed"] = pd.to_numeric(snap_eval["lstm_pred_wind_speed"], errors="coerce")
+        merged = actual_eval.merge(
+            snap_eval[["time_local", "forecast_wind_speed", "lstm_pred_wind_speed"]],
+            on="time_local",
+            how="inner",
         )
-        superlocal_series = (
-            pd.Series(pd.to_numeric(snap_eval["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float), index=snap_eval["time_local"])
-            .sort_index()
-            .groupby(level=0)
-            .last()
-        )
-        forecast_interp = (
-            forecast_series.reindex(forecast_series.index.union(actual_times))
-            .sort_index()
-            .interpolate(method="time", limit_area="inside")
-            .reindex(actual_times)
-        )
-        superlocal_interp = (
-            superlocal_series.reindex(superlocal_series.index.union(actual_times))
-            .sort_index()
-            .interpolate(method="time", limit_area="inside")
-            .reindex(actual_times)
-        )
-        merged = actual_eval.copy()
-        merged["forecast_wind_speed"] = forecast_interp.to_numpy(dtype=float)
-        merged["lstm_pred_wind_speed"] = superlocal_interp.to_numpy(dtype=float)
         merged = merged.dropna(subset=["forecast_wind_speed", "lstm_pred_wind_speed", "actual_wind_speed"])
         if merged.empty:
             metrics.append(
@@ -2678,127 +2991,116 @@ def maybe_save_daily_mae_dayahead(
     local_tz: str,
     test_now_local_hour: int | None,
 ) -> tuple[str | None, str | None]:
+    """
+    Export canonical frozen next-day daily history from prediction_log.
+
+    The CSV/PNG remain dashboard artefacts, but their metrics are derived from
+    realised next-day prediction_log rows rather than snapshot CSV recomputation.
+    """
     now_local = _resolve_now_local(local_tz, test_now_local_hour)
-    if now_local.hour < 22:
-        return None, None
-
-    target_day_local = now_local.date()
-    snapshot_path = _find_dayahead_snapshot(out_dir, target_day_local)
-    if snapshot_path is None or (not snapshot_path.exists()):
-        return None, None
-
-    snap = pd.read_csv(snapshot_path)
-    if snap.empty or "target_time_utc" not in snap.columns:
-        return None, None
-    snap["target_time_utc"] = pd.to_datetime(snap["target_time_utc"], utc=True, errors="coerce")
-    snap = snap.dropna(subset=["target_time_utc"]).copy()
-    if snap.empty:
-        return None, None
-
+    zone = ZoneInfo(local_tz)
+    max_complete_target_day = now_local.date() if now_local.hour >= 22 else (now_local.date() - timedelta(days=1))
     conn = sqlite3.connect(str(db_path))
     try:
-        obs_raw_utc = _load_observations_raw(conn, cfg.site)
+        detail_rows = load_next_day_realized_detail_rows(conn, site=cfg.site, prediction_kind="wind_speed")
     finally:
         conn.close()
-    if obs_raw_utc.empty:
-        return None, None
-    obs_hourly_utc = obs_raw_utc.resample("1h").mean(numeric_only=True)
-    actual = obs_hourly_utc.reindex(snap["target_time_utc"])["actual_avg"].to_numpy(dtype=float)
-    forecast = pd.to_numeric(snap["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float)
-    lstm = pd.to_numeric(snap["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float)
-    valid = (~np.isnan(actual)) & (~np.isnan(forecast)) & (~np.isnan(lstm))
-    if not valid.any():
-        return None, None
-
-    mae_forecast = float(np.mean(np.abs(actual[valid] - forecast[valid])))
-    mae_lstm = float(np.mean(np.abs(actual[valid] - lstm[valid])))
-    avg_actual_speed = float(np.mean(actual[valid]))
-    avg_forecast_speed = float(np.mean(forecast[valid]))
-    avg_lstm_speed = float(np.mean(lstm[valid]))
-    n_points = int(np.sum(valid))
 
     history_csv = out_dir / "daily_mae_history.csv"
-    legacy_history_csv = out_dir / "daily_mse_history.csv"
     details_dir = out_dir / "daily_error_details"
     details_dir.mkdir(parents=True, exist_ok=True)
-    day_stamp = target_day_local.strftime("%Y%m%d")
-    details_csv = details_dir / f"{day_stamp}_dayahead_actual_forecast_lstm.csv"
+    history_rows: list[dict[str, object]] = []
+    if detail_rows:
+        detail_df = pd.DataFrame(detail_rows)
+        detail_df["issued_dt_utc"] = pd.to_datetime(detail_df["issued_ts"], unit="ms", utc=True, errors="coerce")
+        detail_df["target_dt_utc"] = pd.to_datetime(detail_df["target_ts"], unit="ms", utc=True, errors="coerce")
+        detail_df = detail_df.dropna(subset=["issued_dt_utc", "target_dt_utc"]).copy()
+        if not detail_df.empty:
+            detail_df["target_dt_local"] = detail_df["target_dt_utc"].dt.tz_convert(zone)
+            detail_df["issued_dt_local"] = detail_df["issued_dt_utc"].dt.tz_convert(zone)
+            detail_df["target_day_local"] = detail_df["target_dt_local"].dt.strftime("%Y-%m-%d")
+            detail_df["target_day_local_date"] = detail_df["target_dt_local"].dt.date
+            detail_df = detail_df[detail_df["target_day_local_date"] <= max_complete_target_day].copy()
 
-    details = snap.copy()
-    details["actual_wind_speed"] = actual
-    details["abs_err_forecast"] = np.abs(details["actual_wind_speed"] - pd.to_numeric(details["forecast_wind_speed"], errors="coerce"))
-    details["abs_err_lstm"] = np.abs(details["actual_wind_speed"] - pd.to_numeric(details["lstm_pred_wind_speed"], errors="coerce"))
-    details["target_time_utc"] = pd.to_datetime(details["target_time_utc"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    details.to_csv(details_csv, index=False)
+            for target_day_local, day_df in detail_df.groupby("target_day_local", sort=True):
+                day_df = day_df.sort_values("target_dt_utc").reset_index(drop=True)
+                day_stamp = str(target_day_local).replace("-", "")
+                details_csv = details_dir / f"{day_stamp}_dayahead_actual_forecast_lstm.csv"
+                snapshot_path = _find_dayahead_snapshot(out_dir, datetime.strptime(target_day_local, "%Y-%m-%d").date())
 
-    row = pd.DataFrame(
-        [
-            {
-                "date": target_day_local.strftime("%Y-%m-%d"),
-                "run_local_time": now_local.isoformat(),
-                "issue_local_time": str(snap["issue_local_time"].iloc[0]) if "issue_local_time" in snap.columns else "",
-                "mae_forecast": mae_forecast,
-                "mae_lstm": mae_lstm,
-                "avg_actual_wind_speed": avg_actual_speed,
-                "avg_forecast_wind_speed": avg_forecast_speed,
-                "avg_lstm_wind_speed": avg_lstm_speed,
-                "n_points": int(n_points),
-                "details_csv": str(details_csv),
-                "snapshot_csv": str(snapshot_path),
-                "evaluation_type": "day_ahead_frozen",
-            }
-        ]
+                details = pd.DataFrame(
+                    {
+                        "target_time_utc": day_df["target_dt_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "hour_utc": day_df["target_dt_utc"].dt.strftime("%H"),
+                        "forecast_wind_speed": day_df["harmonie_value"],
+                        "lstm_pred_wind_speed": day_df["prediction_value"],
+                        "actual_wind_speed": day_df["actual_value"],
+                        "abs_err_forecast": day_df["harmonie_abs_error"],
+                        "abs_err_lstm": day_df["model_abs_error"],
+                        "issue_local_time": day_df["issued_dt_local"].iloc[0].isoformat(),
+                        "issue_date_local": day_df["issued_dt_local"].iloc[0].strftime("%Y-%m-%d"),
+                        "target_date_local": target_day_local,
+                    }
+                )
+                details.to_csv(details_csv, index=False)
+
+                model_sq = pd.to_numeric(day_df["model_sq_error"], errors="coerce")
+                harmonie_sq = pd.to_numeric(day_df["harmonie_sq_error"], errors="coerce")
+                mae_forecast = float(pd.to_numeric(day_df["harmonie_abs_error"], errors="coerce").mean())
+                mae_lstm = float(pd.to_numeric(day_df["model_abs_error"], errors="coerce").mean())
+                rmse_forecast = float(np.sqrt(harmonie_sq.mean()))
+                rmse_lstm = float(np.sqrt(model_sq.mean()))
+
+                history_rows.append(
+                    {
+                        "date": target_day_local,
+                        "run_local_time": now_local.isoformat(),
+                        "issue_local_time": day_df["issued_dt_local"].iloc[0].isoformat(),
+                        "issued_day_utc": day_df["issued_dt_utc"].iloc[0].strftime("%Y-%m-%d"),
+                        "mae_forecast": mae_forecast,
+                        "mae_lstm": mae_lstm,
+                        "rmse_forecast": rmse_forecast,
+                        "rmse_lstm": rmse_lstm,
+                        "mae_improvement_lstm_vs_forecast": mae_forecast - mae_lstm,
+                        "rmse_improvement_lstm_vs_forecast": rmse_forecast - rmse_lstm,
+                        "avg_actual_wind_speed": float(pd.to_numeric(day_df["actual_value"], errors="coerce").mean()),
+                        "avg_forecast_wind_speed": float(pd.to_numeric(day_df["harmonie_value"], errors="coerce").mean()),
+                        "avg_lstm_wind_speed": float(pd.to_numeric(day_df["prediction_value"], errors="coerce").mean()),
+                        "n_points": int(len(day_df)),
+                        "details_csv": str(details_csv),
+                        "snapshot_csv": "" if snapshot_path is None else str(snapshot_path),
+                        "evaluation_type": "day_ahead_frozen",
+                        "data_source": "prediction_log",
+                    }
+                )
+
+    hist = pd.DataFrame(
+        history_rows,
+        columns=[
+            "date",
+            "run_local_time",
+            "issue_local_time",
+            "issued_day_utc",
+            "mae_forecast",
+            "mae_lstm",
+            "rmse_forecast",
+            "rmse_lstm",
+            "mae_improvement_lstm_vs_forecast",
+            "rmse_improvement_lstm_vs_forecast",
+            "avg_actual_wind_speed",
+            "avg_forecast_wind_speed",
+            "avg_lstm_wind_speed",
+            "n_points",
+            "details_csv",
+            "snapshot_csv",
+            "evaluation_type",
+            "data_source",
+        ],
     )
-    if history_csv.exists():
-        hist = pd.read_csv(history_csv)
-        if "evaluation_type" not in hist.columns:
-            hist["evaluation_type"] = "legacy_current_day"
-    elif legacy_history_csv.exists():
-        hist = pd.read_csv(legacy_history_csv)
-        if "mae_forecast" not in hist.columns and "mse_forecast" in hist.columns:
-            hist["mae_forecast"] = hist["mse_forecast"]
-        if "mae_lstm" not in hist.columns and "mse_lstm" in hist.columns:
-            hist["mae_lstm"] = hist["mse_lstm"]
-        keep_cols = [
-            c
-            for c in [
-                "date",
-                "run_local_time",
-                "mae_forecast",
-                "mae_lstm",
-                "avg_actual_wind_speed",
-                "avg_forecast_wind_speed",
-                "avg_lstm_wind_speed",
-                "n_points",
-            ]
-            if c in hist.columns
-        ]
-        hist = hist[keep_cols]
-        hist["evaluation_type"] = "legacy_current_day"
-    else:
-        hist = pd.DataFrame(
-            columns=[
-                "date",
-                "run_local_time",
-                "issue_local_time",
-                "mae_forecast",
-                "mae_lstm",
-                "avg_actual_wind_speed",
-                "avg_forecast_wind_speed",
-                "avg_lstm_wind_speed",
-                "n_points",
-                "details_csv",
-                "snapshot_csv",
-                "evaluation_type",
-            ]
-        )
-
-    hist = hist[~((hist["date"] == row.iloc[0]["date"]) & (hist["evaluation_type"] == "day_ahead_frozen"))]
-    hist = pd.concat([hist, row], ignore_index=True)
-
-    hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
-    hist = hist.dropna(subset=["date"]).sort_values("date")
-    hist["date"] = hist["date"].dt.strftime("%Y-%m-%d")
+    if not hist.empty:
+        hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+        hist = hist.dropna(subset=["date"]).sort_values("date")
+        hist["date"] = hist["date"].dt.strftime("%Y-%m-%d")
     hist.to_csv(history_csv, index=False)
 
     history_png = out_dir / "daily_mae_history.png"
@@ -2811,6 +3113,7 @@ def append_model_gate_eval_history(
     model_selection_gate: dict,
     local_tz: str,
 ) -> str | None:
+    """Append reporting history derived from the canonical promotion summary."""
     if not model_selection_gate.get("enabled", False):
         return None
     if "speed_mae_challenger" not in model_selection_gate:
@@ -2823,14 +3126,30 @@ def append_model_gate_eval_history(
             {
                 "run_utc": now_utc.isoformat(),
                 "speed_mae_forecast": model_selection_gate.get("speed_mae_forecast"),
+                "speed_rmse_forecast": model_selection_gate.get("speed_rmse_forecast"),
                 "run_local_time": now_local.isoformat(),
                 "speed_mae_champion": model_selection_gate.get("speed_mae_champion"),
+                "speed_rmse_champion": model_selection_gate.get("speed_rmse_champion"),
                 "speed_mae_challenger": model_selection_gate.get("speed_mae_challenger"),
+                "speed_rmse_challenger": model_selection_gate.get("speed_rmse_challenger"),
+                "speed_mae_improvement_challenger_vs_champion": model_selection_gate.get(
+                    "speed_mae_improvement_challenger_vs_champion"
+                ),
+                "speed_rmse_improvement_challenger_vs_champion": model_selection_gate.get(
+                    "speed_rmse_improvement_challenger_vs_champion"
+                ),
+                "speed_mae_improvement_challenger_vs_harmonie": model_selection_gate.get(
+                    "speed_mae_improvement_challenger_vs_harmonie"
+                ),
+                "speed_rmse_improvement_challenger_vs_harmonie": model_selection_gate.get(
+                    "speed_rmse_improvement_challenger_vs_harmonie"
+                ),
                 "direction_mae_champion_deg": model_selection_gate.get("direction_mae_champion"),
                 "direction_mae_challenger_deg": model_selection_gate.get("direction_mae_challenger"),
                 "speed_selected": model_selection_gate.get("speed_selected"),
                 "direction_selected": model_selection_gate.get("direction_selected"),
                 "speed_eval_samples": model_selection_gate.get("speed_eval_samples"),
+                "speed_eval_rows": model_selection_gate.get("speed_eval_rows"),
                 "direction_eval_samples": model_selection_gate.get("direction_eval_samples"),
                 "promotion_margin_pct": model_selection_gate.get("promotion_margin_pct"),
                 "holdout_eval_split": model_selection_gate.get("holdout_eval_split"),
@@ -3611,6 +3930,7 @@ def main() -> None:
     speed_model_path = out_dir / "next_day_lstm_speed_residual.pt"
     direction_model_path = out_dir / "next_day_lstm_direction_residual.pt"
     intraday_model_path = out_dir / "intraday_speed_residual.pt"
+    intraday_challenger_model_path = out_dir / "intraday_speed_residual_challenger.pt"
     speed_scalers_path = {
         "x_mean": out_dir / "x_mean_speed.npy",
         "x_std": out_dir / "x_std_speed.npy",
@@ -3624,8 +3944,11 @@ def main() -> None:
         "y_std": out_dir / "y_std_direction.npy",
     }
     intraday_hparams = {}
+    intraday_model_last_trained_at_utc: str | None = None
     model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
+    intraday_model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
     gate_eval_details_csv_src: Path | None = None
+    intraday_gate_eval_details_csv_src: Path | None = None
     speed_calibration: dict | None = None
 
     if args.skip_training:
@@ -3648,6 +3971,7 @@ def main() -> None:
         speed_constraint_eps = speed_ckpt.get("constraint_eps", None)
         speed_calibration = speed_ckpt.get("speed_regime_calibration")
         model_last_trained_at_utc = _resolve_model_trained_utc(speed_ckpt, speed_model_path)
+        intraday_model_last_trained_at_utc = _resolve_model_trained_utc(intraday_ckpt, intraday_model_path)
         speed_train_stats = None
         direction_train_stats = None
         n_samples_all_speed = None
@@ -3662,9 +3986,12 @@ def main() -> None:
             "recency_power": intraday_ckpt.get("recency_power"),
         }
         model_selection_report = {"enabled": False, "reason": "skip_training"}
+        intraday_model_selection_report = {"enabled": False, "reason": "skip_training"}
     else:
         if not (0.0 < float(args.challenge_eval_split) < 0.5):
             raise ValueError("--challenge-eval-split must be > 0 and < 0.5.")
+        if not (0.0 < float(args.intraday_challenge_eval_split) < 0.5):
+            raise ValueError("--intraday-challenge-eval-split must be > 0 and < 0.5.")
 
         speed_target_mode = "constrained_logratio"
         direction_target_mode = "residual"
@@ -3802,7 +4129,13 @@ def main() -> None:
             device=device,
         )
 
-        intraday_bundle, intraday_train_stats = train_intraday_model(
+        intraday_train_contexts, intraday_eval_contexts = build_intraday_holdout_context_split(
+            db_path=db_path,
+            cfg=cfg,
+            holdout_eval_split=float(args.intraday_challenge_eval_split),
+            holdout_min_contexts=int(args.intraday_challenge_min_eval_contexts),
+        )
+        intraday_bundle_challenger, intraday_train_stats = train_intraday_model(
             db_path=db_path,
             cfg=cfg,
             device=device,
@@ -3814,7 +4147,9 @@ def main() -> None:
             dropout=float(args.intraday_dropout),
             learning_rate=float(args.intraday_learning_rate),
             recency_power=float(args.intraday_recency_power),
+            contexts=intraday_train_contexts,
         )
+        intraday_train_stats["holdout_contexts"] = int(len(intraday_eval_contexts))
 
         champion_available = all(
             p.exists()
@@ -3827,7 +4162,6 @@ def main() -> None:
         )
         promote_speed = True
         promote_direction = True
-        champion_speed_mae = None
         challenger_speed_eval_pred = _predict_speed_batch(
             speed_model_challenger,
             speed_X_eval,
@@ -3859,6 +4193,7 @@ def main() -> None:
         champion_direction_ckpt = {}
         champion_speed_calibration = None
         champion_speed_eval_pred = np.full_like(challenger_speed_eval_pred, np.nan, dtype=np.float32)
+        speed_promotion_summary: dict | None = None
         if champion_available:
             champion_speed_model, champion_speed_ckpt = _load_model(speed_model_path, device)
             champion_direction_model, champion_direction_ckpt = _load_model(direction_model_path, device)
@@ -3891,8 +4226,6 @@ def main() -> None:
                 speed_calibration_context=speed_eval_calibration_context,
                 device=device,
             )
-            champion_speed_mae = float(np.mean(np.abs(champion_speed_eval_pred - speed_actual_eval)))
-            forecast_speed_mae = float(np.mean(np.abs(speed_forecast_eval - speed_actual_eval)))
             champion_direction_mae = _angular_mae_deg(
                 _predict_direction_batch(
                     champion_direction_model,
@@ -3905,7 +4238,21 @@ def main() -> None:
                 direction_actual_eval,
             )
 
-            promote_speed = challenger_speed_mae <= champion_speed_mae * (1.0 - promotion_margin)
+            speed_promotion_summary = summarize_champion_vs_challenger(
+                actual=speed_actual_eval,
+                forecast=speed_forecast_eval,
+                challenger_pred=challenger_speed_eval_pred,
+                champion_pred=champion_speed_eval_pred,
+                promotion_margin_pct=float(args.promotion_margin_pct),
+                holdout_eval_split=float(args.challenge_eval_split),
+                holdout_eval_min_samples=int(args.challenge_min_eval_samples),
+                challenger_model_id=challenger_speed_model_id,
+                champion_model_id=champion_speed_model_id,
+            )
+            challenger_speed_mae = float(speed_promotion_summary["speed_mae_challenger"])
+            champion_speed_mae = float(speed_promotion_summary["speed_mae_champion"])
+            forecast_speed_mae = float(speed_promotion_summary["speed_mae_forecast"])
+            promote_speed = bool(speed_promotion_summary["promote_speed"])
             promote_direction = challenger_direction_mae <= champion_direction_mae * (1.0 - promotion_margin)
             model_selection_report = {
                 "enabled": True,
@@ -3914,9 +4261,25 @@ def main() -> None:
                 "promotion_margin_pct": float(args.promotion_margin_pct),
                 "speed_eval_samples": int(len(speed_X_eval)),
                 "direction_eval_samples": int(len(direction_X_eval)),
-                "speed_mae_forecast": float(forecast_speed_mae),
-                "speed_mae_champion": float(champion_speed_mae),
-                "speed_mae_challenger": float(challenger_speed_mae),
+                "speed_eval_rows": int(speed_promotion_summary["speed_eval_rows"]),
+                "speed_mae_forecast": float(speed_promotion_summary["speed_mae_forecast"]),
+                "speed_rmse_forecast": float(speed_promotion_summary["speed_rmse_forecast"]),
+                "speed_mae_champion": float(speed_promotion_summary["speed_mae_champion"]),
+                "speed_rmse_champion": float(speed_promotion_summary["speed_rmse_champion"]),
+                "speed_mae_challenger": float(speed_promotion_summary["speed_mae_challenger"]),
+                "speed_rmse_challenger": float(speed_promotion_summary["speed_rmse_challenger"]),
+                "speed_mae_improvement_challenger_vs_champion": float(
+                    speed_promotion_summary["speed_mae_improvement_challenger_vs_champion"]
+                ),
+                "speed_rmse_improvement_challenger_vs_champion": float(
+                    speed_promotion_summary["speed_rmse_improvement_challenger_vs_champion"]
+                ),
+                "speed_mae_improvement_challenger_vs_harmonie": float(
+                    speed_promotion_summary["speed_mae_improvement_challenger_vs_harmonie"]
+                ),
+                "speed_rmse_improvement_challenger_vs_harmonie": float(
+                    speed_promotion_summary["speed_rmse_improvement_challenger_vs_harmonie"]
+                ),
                 "speed_regime_calibration_challenger": challenger_speed_calibration,
                 "speed_regime_calibration_champion": champion_speed_calibration,
                 "direction_mae_champion": float(champion_direction_mae),
@@ -3925,9 +4288,15 @@ def main() -> None:
                 "promote_direction": bool(promote_direction),
                 "speed_model_id_champion": champion_speed_model_id,
                 "speed_model_id_challenger": challenger_speed_model_id,
+                "speed_promotion_summary": speed_promotion_summary,
             }
             print(
-                f"Model gate | speed MAE forecast={forecast_speed_mae:.4f}, champion={champion_speed_mae:.4f}, challenger={challenger_speed_mae:.4f}, "
+                "Model gate | "
+                f"speed MAE forecast={speed_promotion_summary['speed_mae_forecast']:.4f}, "
+                f"champion={speed_promotion_summary['speed_mae_champion']:.4f}, "
+                f"challenger={speed_promotion_summary['speed_mae_challenger']:.4f}, "
+                f"RMSE champion={speed_promotion_summary['speed_rmse_champion']:.4f}, "
+                f"challenger={speed_promotion_summary['speed_rmse_challenger']:.4f}, "
                 f"promoted={promote_speed}"
             )
             print(
@@ -3935,19 +4304,43 @@ def main() -> None:
                 f"challenger={challenger_direction_mae:.4f}, promoted={promote_direction}"
             )
         else:
+            speed_promotion_summary = summarize_champion_vs_challenger(
+                actual=speed_actual_eval,
+                forecast=speed_forecast_eval,
+                challenger_pred=challenger_speed_eval_pred,
+                champion_pred=None,
+                promotion_margin_pct=float(args.promotion_margin_pct),
+                holdout_eval_split=float(args.challenge_eval_split),
+                holdout_eval_min_samples=int(args.challenge_min_eval_samples),
+                challenger_model_id=challenger_speed_model_id,
+                champion_model_id=champion_speed_model_id,
+            )
             model_selection_report = {
                 "enabled": True,
                 "reason": "no_existing_champion",
+                "holdout_eval_split": float(args.challenge_eval_split),
+                "holdout_eval_min_samples": int(args.challenge_min_eval_samples),
+                "promotion_margin_pct": float(args.promotion_margin_pct),
                 "speed_eval_samples": int(len(speed_X_eval)),
                 "direction_eval_samples": int(len(direction_X_eval)),
-                "speed_mae_forecast": float(np.mean(np.abs(speed_forecast_eval - speed_actual_eval))),
-                "speed_mae_challenger": float(challenger_speed_mae),
+                "speed_eval_rows": int(speed_promotion_summary["speed_eval_rows"]),
+                "speed_mae_forecast": float(speed_promotion_summary["speed_mae_forecast"]),
+                "speed_rmse_forecast": float(speed_promotion_summary["speed_rmse_forecast"]),
+                "speed_mae_challenger": float(speed_promotion_summary["speed_mae_challenger"]),
+                "speed_rmse_challenger": float(speed_promotion_summary["speed_rmse_challenger"]),
+                "speed_mae_improvement_challenger_vs_harmonie": float(
+                    speed_promotion_summary["speed_mae_improvement_challenger_vs_harmonie"]
+                ),
+                "speed_rmse_improvement_challenger_vs_harmonie": float(
+                    speed_promotion_summary["speed_rmse_improvement_challenger_vs_harmonie"]
+                ),
                 "speed_regime_calibration_challenger": challenger_speed_calibration,
                 "direction_mae_challenger": float(challenger_direction_mae),
                 "promote_speed": True,
                 "promote_direction": True,
                 "speed_model_id_champion": champion_speed_model_id,
                 "speed_model_id_challenger": challenger_speed_model_id,
+                "speed_promotion_summary": speed_promotion_summary,
             }
             print("Model gate | no existing champion found, promoting challenger models.")
 
@@ -4050,25 +4443,164 @@ def main() -> None:
             gate_eval_details_csv_src = gate_eval_details_csv
             model_selection_report["speed_eval_details_csv"] = str(gate_eval_details_csv)
 
-        save_intraday_model(
-            intraday_model_path,
-            intraday_bundle,
-            extra={
-                "trained_at_utc": now_train_utc,
-                "hidden1": int(args.intraday_hidden1),
-                "hidden2": int(args.intraday_hidden2),
-                "dropout": float(args.intraday_dropout),
-                "learning_rate": float(args.intraday_learning_rate),
-                "recency_power": float(args.intraday_recency_power),
-            },
-        )
-        intraday_hparams = {
+        intraday_challenger_extra = {
+            "trained_at_utc": now_train_utc,
             "hidden1": int(args.intraday_hidden1),
             "hidden2": int(args.intraday_hidden2),
             "dropout": float(args.intraday_dropout),
             "learning_rate": float(args.intraday_learning_rate),
             "recency_power": float(args.intraday_recency_power),
+            "model_role": "challenger",
+            "holdout_eval_split": float(args.intraday_challenge_eval_split),
+            "holdout_eval_min_contexts": int(args.intraday_challenge_min_eval_contexts),
+            "promotion_margin_pct": float(args.intraday_promotion_margin_pct),
         }
+        save_intraday_model(
+            intraday_challenger_model_path,
+            intraday_bundle_challenger,
+            extra=intraday_challenger_extra,
+        )
+
+        intraday_challenger_model_id = _format_model_id(now_train_utc, args.local_timezone)
+        intraday_champion_bundle: IntradayBundle | None = None
+        intraday_champion_ckpt: dict = {}
+        intraday_champion_model_id = "none"
+        intraday_champion_available = intraday_model_path.exists()
+        intraday_challenger_eval_frame = build_intraday_holdout_evaluation_frame(
+            bundle=intraday_bundle_challenger,
+            contexts=intraday_eval_contexts,
+            device=device,
+        )
+        intraday_champion_eval_frame: pd.DataFrame | None = None
+        if intraday_champion_available:
+            intraday_champion_bundle, intraday_champion_ckpt = load_intraday_model(intraday_model_path, device)
+            intraday_champion_model_id = _format_model_id(
+                _resolve_model_trained_utc(intraday_champion_ckpt, intraday_model_path),
+                args.local_timezone,
+            )
+            intraday_champion_eval_frame = build_intraday_holdout_evaluation_frame(
+                bundle=intraday_champion_bundle,
+                contexts=intraday_eval_contexts,
+                device=device,
+            )
+
+        intraday_promotion_summary = summarize_intraday_champion_vs_challenger(
+            challenger_eval_frame=intraday_challenger_eval_frame,
+            champion_eval_frame=intraday_champion_eval_frame,
+            promotion_margin_pct=float(args.intraday_promotion_margin_pct),
+            holdout_eval_split=float(args.intraday_challenge_eval_split),
+            holdout_eval_min_contexts=int(args.intraday_challenge_min_eval_contexts),
+            challenger_model_id=intraday_challenger_model_id,
+            champion_model_id=intraday_champion_model_id,
+        )
+        promote_intraday = bool(intraday_promotion_summary["promote_intraday"])
+        intraday_model_selection_report = {
+            "enabled": True,
+            "holdout_eval_split": float(args.intraday_challenge_eval_split),
+            "holdout_eval_min_contexts": int(args.intraday_challenge_min_eval_contexts),
+            "promotion_margin_pct": float(args.intraday_promotion_margin_pct),
+            "eval_training_contexts": int(len(intraday_train_contexts)),
+            "eval_holdout_contexts": int(intraday_promotion_summary["intraday_eval_contexts"]),
+            "eval_holdout_rows": int(intraday_promotion_summary["intraday_eval_rows"]),
+            "intraday_model_id_champion": intraday_champion_model_id,
+            "intraday_model_id_challenger": intraday_challenger_model_id,
+            "mae_harmonie": intraday_promotion_summary.get("intraday_mae_harmonie"),
+            "rmse_harmonie": intraday_promotion_summary.get("intraday_rmse_harmonie"),
+            "mae_champion": intraday_promotion_summary.get("intraday_mae_champion"),
+            "rmse_champion": intraday_promotion_summary.get("intraday_rmse_champion"),
+            "mae_challenger": intraday_promotion_summary.get("intraday_mae_challenger"),
+            "rmse_challenger": intraday_promotion_summary.get("intraday_rmse_challenger"),
+            "mae_improvement_challenger_vs_champion": intraday_promotion_summary.get(
+                "intraday_mae_improvement_challenger_vs_champion"
+            ),
+            "rmse_improvement_challenger_vs_champion": intraday_promotion_summary.get(
+                "intraday_rmse_improvement_challenger_vs_champion"
+            ),
+            "mae_improvement_challenger_vs_harmonie": intraday_promotion_summary.get(
+                "intraday_mae_improvement_challenger_vs_harmonie"
+            ),
+            "rmse_improvement_challenger_vs_harmonie": intraday_promotion_summary.get(
+                "intraday_rmse_improvement_challenger_vs_harmonie"
+            ),
+            "promote_intraday": promote_intraday,
+            "reason": intraday_promotion_summary.get("reason", "evaluated"),
+            "promotion_summary": intraday_promotion_summary,
+        }
+        intraday_aligned_eval = align_intraday_holdout_frames(
+            challenger_eval_frame=intraday_challenger_eval_frame,
+            champion_eval_frame=intraday_champion_eval_frame,
+        )
+        if not intraday_aligned_eval.empty:
+            intraday_details_dir = out_dir / "intraday_model_gate_eval_details"
+            intraday_details_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            intraday_gate_eval_details_csv = intraday_details_dir / f"{stamp}_intraday_model_gate_eval_speed.csv"
+            intraday_aligned_eval = intraday_aligned_eval.copy()
+            intraday_aligned_eval["abs_err_harmonie"] = np.abs(
+                intraday_aligned_eval["harmonie_value"] - intraday_aligned_eval["actual_value"]
+            )
+            intraday_aligned_eval["abs_err_challenger"] = np.abs(
+                intraday_aligned_eval["challenger_prediction_value"] - intraday_aligned_eval["actual_value"]
+            )
+            intraday_aligned_eval["abs_err_champion"] = np.abs(
+                intraday_aligned_eval["champion_prediction_value"] - intraday_aligned_eval["actual_value"]
+            )
+            intraday_aligned_eval["anchor_time_utc"] = pd.to_datetime(
+                intraday_aligned_eval["anchor_time_utc"], utc=True
+            ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            intraday_aligned_eval["target_time_utc"] = pd.to_datetime(
+                intraday_aligned_eval["target_time_utc"], utc=True
+            ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            intraday_aligned_eval.to_csv(intraday_gate_eval_details_csv, index=False)
+            intraday_gate_eval_details_csv_src = intraday_gate_eval_details_csv
+            intraday_model_selection_report["intraday_eval_details_csv"] = str(intraday_gate_eval_details_csv)
+
+        if promote_intraday:
+            intraday_bundle = intraday_bundle_challenger
+            save_intraday_model(
+                intraday_model_path,
+                intraday_bundle,
+                extra={
+                    **intraday_challenger_extra,
+                    "model_role": "champion",
+                    "promoted_from": str(intraday_challenger_model_path.name),
+                },
+            )
+            intraday_model_last_trained_at_utc = now_train_utc
+            intraday_hparams = {
+                "hidden1": int(args.intraday_hidden1),
+                "hidden2": int(args.intraday_hidden2),
+                "dropout": float(args.intraday_dropout),
+                "learning_rate": float(args.intraday_learning_rate),
+                "recency_power": float(args.intraday_recency_power),
+            }
+            intraday_model_selection_report["selected"] = "challenger"
+        else:
+            if intraday_champion_bundle is None:
+                raise ValueError("Intraday promotion decided to keep champion, but no champion artifact was loaded.")
+            intraday_bundle = intraday_champion_bundle
+            intraday_model_last_trained_at_utc = _resolve_model_trained_utc(intraday_champion_ckpt, intraday_model_path)
+            intraday_hparams = {
+                "hidden1": intraday_champion_ckpt.get("hidden1"),
+                "hidden2": intraday_champion_ckpt.get("hidden2"),
+                "dropout": intraday_champion_ckpt.get("dropout"),
+                "learning_rate": intraday_champion_ckpt.get("learning_rate"),
+                "recency_power": intraday_champion_ckpt.get("recency_power"),
+            }
+            intraday_model_selection_report["selected"] = "champion"
+
+        intraday_champion_mae_text = (
+            "none"
+            if intraday_promotion_summary.get("intraday_mae_champion") is None
+            else f"{float(intraday_promotion_summary['intraday_mae_champion']):.4f}"
+        )
+        print(
+            "Intraday gate | "
+            f"Harmonie MAE={float(intraday_promotion_summary['intraday_mae_harmonie']):.4f}, "
+            f"champion={intraday_champion_mae_text}, "
+            f"challenger={float(intraday_promotion_summary['intraday_mae_challenger']):.4f}, "
+            f"promoted={promote_intraday}"
+        )
 
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
@@ -4109,6 +4641,23 @@ def main() -> None:
     )
 
     table = build_prediction_table(inference_input_speed, speed_pred, direction_pred)
+    next_day_prediction_log_frame = _build_next_day_prediction_log_frame(inference_input_speed, speed_pred)
+    is_test_mode = args.test_now_local_hour is not None
+    prediction_generated_at_dt = datetime.now(timezone.utc)
+    prediction_generated_at_utc = prediction_generated_at_dt.isoformat()
+    prediction_update_local = prediction_generated_at_dt.astimezone(ZoneInfo(args.local_timezone)).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
+    next_day_prediction_log_rows = 0
+    current_day_prediction_log_rows = 0
+    prediction_evaluation_rows_materialized = 0
+    prediction_evaluation_summary: list[dict] = []
+    next_day_vs_harmonie_summary: dict = {}
+    next_day_vs_harmonie_by_issued_day: list[dict] = []
+    next_day_vs_harmonie_by_horizon: list[dict] = []
 
     table_path = out_dir / "next_day_predictions.csv"
     table_for_csv = table[
@@ -4131,14 +4680,30 @@ def main() -> None:
             out_dir=out_dir,
             table=table,
             local_tz=args.local_timezone,
-            prediction_generated_at_utc=datetime.now(timezone.utc).isoformat(),
+            prediction_generated_at_utc=prediction_generated_at_utc,
+        )
+    if not is_test_mode:
+        next_day_prediction_log_rows = _log_prediction_frame(
+            db_path=db_path,
+            prediction_frame=next_day_prediction_log_frame,
+            site=cfg.site,
+            model_type="next_day",
+            model_name=type(speed_model).__name__,
+            model_version=model_last_trained_at_utc,
+            model_artifact=speed_model_path.name,
+            issued_time_utc=prediction_generated_at_dt,
+            anchor_time_utc=inference_input_speed["anchor_time"],
+            prediction_kind="wind_speed",
+            run_context=str(inference_input_speed["prediction_day_start"]),
+            metadata={
+                "forecast_model": args.model,
+                "reference_observation_time": str(inference_input_speed["reference_observation_time"]),
+                "source": "update_model_and_predict",
+            },
         )
 
     plot_path = out_dir / "next_day_predictions.png"
     plot_path_mobile = out_dir / "next_day_predictions_mobile.png"
-    prediction_generated_at_utc = datetime.now(timezone.utc).isoformat()
-    prediction_update_local = datetime.now(ZoneInfo(args.local_timezone)).replace(minute=0, second=0, microsecond=0)
-    prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
     save_prediction_plot(
         table,
         plot_path,
@@ -4157,7 +4722,6 @@ def main() -> None:
         mobile=True,
     )
 
-    is_test_mode = args.test_now_local_hour is not None
     test_suffix = f"_test_hour_{int(args.test_now_local_hour):02d}" if is_test_mode else ""
     current_day_prior_prediction_tables: list[pd.DataFrame] = []
     current_day_fixed_origin_mae: list[dict] = []
@@ -4176,8 +4740,15 @@ def main() -> None:
             local_tz=args.local_timezone,
         )
 
+    current_day_issue_anchor_local = _resolve_now_local(args.local_timezone, args.test_now_local_hour).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    current_day_issue_anchor_utc = pd.Timestamp(current_day_issue_anchor_local).tz_convert("UTC")
+
     # --- Current day plot/table: actuals up to present + prediction for remaining day ---
-    current_day_table = build_current_day_table(
+    current_day_table, current_day_prediction_log_frame = build_current_day_table(
         db_path=db_path,
         cfg=cfg,
         intraday_bundle=intraday_bundle,
@@ -4203,6 +4774,55 @@ def main() -> None:
     current_day_table_csv = current_day_table.copy()
     current_day_table_csv["time_local"] = current_day_table_csv["time_local"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     current_day_table_csv.to_csv(current_day_table_path, index=False)
+    if not is_test_mode:
+        current_day_prediction_log_rows = _log_prediction_frame(
+            db_path=db_path,
+            prediction_frame=current_day_prediction_log_frame,
+            site=cfg.site,
+            model_type="intraday",
+            model_name=type(intraday_bundle.model).__name__,
+            model_version=intraday_model_last_trained_at_utc,
+            model_artifact=intraday_model_path.name,
+            issued_time_utc=prediction_generated_at_dt,
+            anchor_time_utc=current_day_issue_anchor_utc,
+            prediction_kind="wind_speed",
+            run_context=str(current_day_issue_anchor_local.date().isoformat()),
+            metadata={
+                "forecast_model": args.model,
+                "local_timezone": args.local_timezone,
+                "source": "update_model_and_predict",
+            },
+        )
+        conn = sqlite3.connect(str(db_path))
+        try:
+            init_db(conn)
+            prediction_evaluation_rows_materialized = materialize_prediction_log_evaluation(
+                conn,
+                site=cfg.site,
+                prediction_kind="wind_speed",
+            )
+            prediction_evaluation_summary = load_prediction_evaluation_summary(
+                conn,
+                site=cfg.site,
+                prediction_kind="wind_speed",
+            )
+            next_day_vs_harmonie_summary = summarize_next_day_vs_harmonie(
+                conn,
+                site=cfg.site,
+                prediction_kind="wind_speed",
+            )
+            next_day_vs_harmonie_by_issued_day = summarize_next_day_vs_harmonie_by_issued_day(
+                conn,
+                site=cfg.site,
+                prediction_kind="wind_speed",
+            )
+            next_day_vs_harmonie_by_horizon = summarize_next_day_vs_harmonie_by_horizon(
+                conn,
+                site=cfg.site,
+                prediction_kind="wind_speed",
+            )
+        finally:
+            conn.close()
     current_day_snapshot_csv = None
     if not is_test_mode and not current_day_table.empty:
         current_day_target_local = pd.to_datetime(current_day_table["time_local"]).dt.tz_convert(ZoneInfo(args.local_timezone)).iloc[0].date()
@@ -4414,6 +5034,16 @@ def main() -> None:
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
         "model_last_trained_at_utc": model_last_trained_at_utc,
+        "intraday_model_last_trained_at_utc": intraday_model_last_trained_at_utc,
+        "next_day_prediction_log_rows": int(next_day_prediction_log_rows),
+        "current_day_prediction_log_rows": int(current_day_prediction_log_rows),
+        "prediction_evaluation_rows_materialized": int(prediction_evaluation_rows_materialized),
+        "prediction_evaluation_summary": prediction_evaluation_summary,
+        "next_day_vs_harmonie_summary": next_day_vs_harmonie_summary,
+        "next_day_vs_harmonie_by_issued_day": next_day_vs_harmonie_by_issued_day,
+        "next_day_vs_harmonie_by_horizon": next_day_vs_harmonie_by_horizon,
+        "model_promotion_speed_summary": model_selection_report.get("speed_promotion_summary"),
+        "intraday_model_promotion_summary": intraday_model_selection_report.get("promotion_summary"),
         "y_scaler_mean_speed": float(speed_arrays["y_mean"][0]),
         "y_scaler_std_speed": float(speed_arrays["y_std"][0]),
         "y_scaler_mean_direction": float(direction_arrays["y_mean"][0]),
@@ -4443,11 +5073,15 @@ def main() -> None:
         "speed_model_path": str(speed_model_path),
         "direction_model_path": str(direction_model_path),
         "intraday_model_path": str(intraday_model_path),
+        "intraday_challenger_model_path": str(intraday_challenger_model_path),
         "intraday_model_class": "IntradayResidualMLP",
         "intraday_feature_count": int(len(getattr(intraday_bundle, "x_mean", []))),
         "intraday_n_train": None if intraday_train_stats is None else int(intraday_train_stats["n_train"]),
         "intraday_n_val": None if intraday_train_stats is None else int(intraday_train_stats["n_val"]),
         "intraday_best_val_loss": None if intraday_train_stats is None else float(intraday_train_stats["best_val_loss"]),
+        "intraday_holdout_contexts": None
+        if intraday_train_stats is None
+        else int(intraday_train_stats.get("holdout_contexts", 0)),
         "intraday_hidden1": intraday_hparams.get("hidden1"),
         "intraday_hidden2": intraday_hparams.get("hidden2"),
         "intraday_dropout": intraday_hparams.get("dropout"),
@@ -4455,11 +5089,18 @@ def main() -> None:
         "intraday_recency_power": intraday_hparams.get("recency_power"),
         "intraday_rollout_calibration": getattr(intraday_bundle, "rollout_calibration", None),
         "intraday_continuity_calibration": getattr(intraday_bundle, "continuity_calibration", None),
+        "intraday_model_gate_eval_details_csv": None
+        if intraday_gate_eval_details_csv_src is None
+        else str(intraday_gate_eval_details_csv_src),
+        "intraday_model_selection_gate": intraday_model_selection_report,
         "data_refresh": refresh_info,
         "model_selection_gate": model_selection_report,
         "challenge_eval_split": args.challenge_eval_split,
         "challenge_min_eval_samples": args.challenge_min_eval_samples,
         "promotion_margin_pct": args.promotion_margin_pct,
+        "intraday_challenge_eval_split": args.intraday_challenge_eval_split,
+        "intraday_challenge_min_eval_contexts": args.intraday_challenge_min_eval_contexts,
+        "intraday_promotion_margin_pct": args.intraday_promotion_margin_pct,
         "max_forecast_age_hours": args.max_forecast_age_hours,
         "expected_update_hour_utc": args.expected_update_hour_utc,
         "validation_split": args.validation_split,
@@ -4475,10 +5116,14 @@ def main() -> None:
     print(f"Speed model saved to: {speed_model_path}")
     print(f"Direction model saved to: {direction_model_path}")
     print(f"Intraday model saved to: {intraday_model_path}")
+    if intraday_challenger_model_path.exists():
+        print(f"Intraday challenger saved to: {intraday_challenger_model_path}")
     print(f"Prediction table saved to: {table_path}")
     print(f"Prediction plot saved to: {plot_path}")
     print(f"Current-day table saved to: {current_day_table_path}")
     print(f"Current-day plot saved to: {current_day_plot_path}")
+    if not is_test_mode:
+        print(f"Prediction evaluation rows materialized in SQLite: {prediction_evaluation_rows_materialized}")
     if is_test_mode:
         print("Test mode active: skipped daily archive/history updates and preserved production current-day outputs.")
     if archived_next_day_plots is not None:
@@ -4491,6 +5136,12 @@ def main() -> None:
     if daily_mae_csv is not None and daily_mae_png is not None:
         print(f"Daily MAE history saved to: {daily_mae_csv}")
         print(f"Daily MAE history plot saved to: {daily_mae_png}")
+    if intraday_model_selection_report.get("enabled"):
+        print(
+            "Intraday selection | "
+            f"selected={intraday_model_selection_report.get('selected')} | "
+            f"promoted={intraday_model_selection_report.get('promote_intraday')}"
+        )
     if web_publish is not None:
         print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
     if args.git_auto_push_pages:

@@ -352,9 +352,9 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
     finally:
         conn.close()
 
-    forecast_vintages = forecast_vintages.sort_values(["fetched_ts", "run_ts", "target_ts"]).reset_index(drop=True)
+    forecast_vintages = forecast_vintages.sort_values(["run_ts", "fetched_ts", "target_ts"]).reset_index(drop=True)
     target_lookup: Dict[int, Dict[str, np.ndarray]] = {}
-    by_target = forecast_vintages.sort_values(["target_ts", "fetched_ts", "run_ts"])
+    by_target = forecast_vintages.sort_values(["target_ts", "run_ts", "fetched_ts"])
     for target_ts, group in by_target.groupby("target_ts", sort=False):
         target_lookup[int(target_ts)] = {
             "fetched_ts": group["fetched_ts"].astype(np.int64).to_numpy(),
@@ -373,7 +373,8 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
         run_entries.append(
             {
                 "run_ts": int(run_ts),
-                "fetched_ts": int(group["fetched_ts"].iloc[-1]),
+                "available_ts": int(group["fetched_ts"].max()),
+                "row_fetched_ts": group["fetched_ts"].astype(np.int64).to_numpy(),
                 "target_index": {int(ts): idx for idx, ts in enumerate(target_values.tolist())},
                 "forecast_avg": pd.to_numeric(group["forecast_avg"], errors="coerce").to_numpy(dtype=np.float32),
                 "forecast_min": pd.to_numeric(group["forecast_min"], errors="coerce").to_numpy(dtype=np.float32),
@@ -382,12 +383,12 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
                 "horizon_hr": pd.to_numeric(group["horizon_hr"], errors="coerce").to_numpy(dtype=np.float32),
             }
         )
-    run_entries.sort(key=lambda entry: (int(entry["fetched_ts"]), int(entry["run_ts"])))
-    run_fetched_ts = np.asarray([int(entry["fetched_ts"]) for entry in run_entries], dtype=np.int64)
+    run_entries.sort(key=lambda entry: (int(entry["run_ts"]), int(entry["available_ts"])))
+    run_available_ts = np.asarray([int(entry["available_ts"]) for entry in run_entries], dtype=np.int64)
     return {
         "target_lookup": target_lookup,
         "run_entries": run_entries,
-        "run_fetched_ts": run_fetched_ts,
+        "run_available_ts": run_available_ts,
     }
 
 
@@ -400,12 +401,31 @@ def _lookup_latest_target_as_of(
     target_ts_ms: int,
     anchor_ts_ms: int,
 ) -> Dict[str, float | int] | None:
+    """
+    Return the latest forecast row for a single target that was available at anchor_ts_ms.
+
+    anchor_ts_ms is the historical issue time we pretend to stand in.
+    run_ts is the forecast vintage timestamp.
+    fetched_ts is when our collector first saw that specific forecast row.
+
+    Fairness rule: only rows with fetched_ts <= anchor_ts_ms are eligible, and
+    among eligible rows we choose the latest forecast vintage (highest run_ts,
+    then highest fetched_ts as a tie-break).
+    """
     series = target_lookup.get(int(target_ts_ms))
     if series is None:
         return None
-    pos = int(np.searchsorted(series["fetched_ts"], anchor_ts_ms, side="right")) - 1
-    if pos < 0:
+    eligible = series["fetched_ts"] <= int(anchor_ts_ms)
+    if not np.any(eligible):
         return None
+    eligible_idx = np.flatnonzero(eligible)
+    order = np.lexsort(
+        (
+            series["fetched_ts"][eligible_idx],
+            series["run_ts"][eligible_idx],
+        )
+    )
+    pos = int(eligible_idx[order[-1]])
     return {
         "run_ts": int(series["run_ts"][pos]),
         "fetched_ts": int(series["fetched_ts"][pos]),
@@ -422,6 +442,8 @@ def _build_history_forecast_frame(
     history_times: pd.DatetimeIndex,
     anchor_ts_ms: int,
 ) -> pd.DataFrame | None:
+    if len(history_times) == 0:
+        return pd.DataFrame(index=history_times)
     records: List[Dict[str, float | int | pd.Timestamp]] = []
     for target_time in history_times:
         row = _lookup_latest_target_as_of(target_lookup, _target_ms(target_time), anchor_ts_ms)
@@ -440,15 +462,22 @@ def _build_history_forecast_frame(
 
 def _select_latest_complete_run_frame(
     run_entries: List[Dict[str, object]],
-    run_fetched_ts: np.ndarray,
     target_times: pd.DatetimeIndex,
     anchor_ts_ms: int,
 ) -> pd.DataFrame | None:
+    """
+    Select the latest complete Harmonie run that was actually available at anchor_ts_ms.
+
+    A run is eligible only when every requested target timestamp exists in that
+    run and each corresponding row satisfies fetched_ts <= anchor_ts_ms. This is
+    the key leakage-prevention rule for fair historical training and evaluation.
+    """
     target_mss = [_target_ms(ts) for ts in target_times]
-    pos = int(np.searchsorted(run_fetched_ts, anchor_ts_ms, side="right")) - 1
-    while pos >= 0:
-        entry = run_entries[pos]
+    for entry in reversed(run_entries):
+        if int(entry["available_ts"]) > int(anchor_ts_ms):
+            continue
         index_map = entry["target_index"]
+        row_fetched_ts = np.asarray(entry["row_fetched_ts"], dtype=np.int64)
         indices: List[int] = []
         complete = True
         for target_ts_ms in target_mss:
@@ -456,12 +485,15 @@ def _select_latest_complete_run_frame(
             if idx is None:
                 complete = False
                 break
+            if int(row_fetched_ts[int(idx)]) > int(anchor_ts_ms):
+                complete = False
+                break
             indices.append(int(idx))
         if complete:
             target_frame = pd.DataFrame(
                 {
                     "run_ts": np.full(len(target_times), int(entry["run_ts"]), dtype=np.int64),
-                    "fetched_ts": np.full(len(target_times), int(entry["fetched_ts"]), dtype=np.int64),
+                    "fetched_ts": row_fetched_ts[indices],
                     "horizon_hr": np.asarray(entry["horizon_hr"], dtype=np.float32)[indices],
                     "forecast_avg": np.asarray(entry["forecast_avg"], dtype=np.float32)[indices],
                     "forecast_min": np.asarray(entry["forecast_min"], dtype=np.float32)[indices],
@@ -472,11 +504,106 @@ def _select_latest_complete_run_frame(
             )
             target_frame.index.name = "target_dt"
             if target_frame[["forecast_avg", "forecast_max", "forecast_dir"]].isna().any().any():
-                pos -= 1
                 continue
             return target_frame
-        pos -= 1
     return None
+
+
+def build_anchor_forecast_context(
+    db_path: Path,
+    cfg: DatasetConfig,
+    anchor_time: pd.Timestamp,
+    history_times: pd.DatetimeIndex,
+    target_times: pd.DatetimeIndex,
+) -> Dict[str, object]:
+    """
+    Build the forecast context that would have been knowable at anchor_time.
+
+    anchor_time:
+        Historical issue time for the sample or evaluation point.
+    run_ts:
+        Timestamp of the forecast vintage / model run.
+    fetched_ts:
+        First-seen availability time recorded by our collector.
+
+    Fairness rule:
+        Only forecast rows with fetched_ts <= anchor_time are usable.
+        Historical feature timestamps use the latest available row per target as
+        of anchor_time, while future target timestamps use the latest complete
+        run available at anchor_time.
+    """
+    anchor_time_utc = pd.Timestamp(anchor_time)
+    if anchor_time_utc.tzinfo is None:
+        anchor_time_utc = anchor_time_utc.tz_localize("UTC")
+    else:
+        anchor_time_utc = anchor_time_utc.tz_convert("UTC")
+
+    history_times_utc = pd.to_datetime(history_times, utc=True)
+    target_times_utc = pd.to_datetime(target_times, utc=True)
+    bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
+    anchor_ts_ms = _target_ms(anchor_time_utc)
+
+    history_frame = (
+        pd.DataFrame(index=history_times_utc)
+        if len(history_times_utc) == 0
+        else _build_history_forecast_frame(bundle["target_lookup"], history_times_utc, anchor_ts_ms)
+    )
+    target_frame = (
+        pd.DataFrame(index=target_times_utc)
+        if len(target_times_utc) == 0
+        else _select_latest_complete_run_frame(bundle["run_entries"], target_times_utc, anchor_ts_ms)
+    )
+    return {
+        "anchor_time": anchor_time_utc,
+        "history_frame": history_frame,
+        "target_frame": target_frame,
+    }
+
+
+def build_anchor_forecast_timeline(
+    db_path: Path,
+    cfg: DatasetConfig,
+    anchor_time: pd.Timestamp,
+    timeline: pd.DatetimeIndex,
+) -> pd.DataFrame | None:
+    timeline_utc = pd.to_datetime(timeline, utc=True)
+    if len(timeline_utc) == 0:
+        return pd.DataFrame()
+
+    anchor_time_utc = pd.Timestamp(anchor_time)
+    if anchor_time_utc.tzinfo is None:
+        anchor_time_utc = anchor_time_utc.tz_localize("UTC")
+    else:
+        anchor_time_utc = anchor_time_utc.tz_convert("UTC")
+
+    history_times = timeline_utc[timeline_utc <= anchor_time_utc]
+    future_times = timeline_utc[timeline_utc > anchor_time_utc]
+    context = build_anchor_forecast_context(
+        db_path=db_path,
+        cfg=cfg,
+        anchor_time=anchor_time_utc,
+        history_times=history_times,
+        target_times=future_times,
+    )
+
+    frames: List[pd.DataFrame] = []
+    if len(history_times) > 0:
+        history_frame = context["history_frame"]
+        if history_frame is None:
+            return None
+        frames.append(history_frame.reindex(history_times))
+    if len(future_times) > 0:
+        target_frame = context["target_frame"]
+        if target_frame is None:
+            return None
+        frames.append(target_frame.reindex(future_times))
+    if not frames:
+        return pd.DataFrame(index=timeline_utc)
+
+    frame = pd.concat(frames).sort_index().reindex(timeline_utc)
+    frame = _interpolate_missing_features(frame)
+    frame = _add_calendar_features(frame)
+    return frame
 
 
 def _build_vintage_aware_samples(
@@ -503,8 +630,6 @@ def _build_vintage_aware_samples(
     total = len(obs)
     target_lookup = bundle["target_lookup"]
     run_entries = bundle["run_entries"]
-    run_fetched_ts = bundle["run_fetched_ts"]
-
     # Forecasts are selected as they were actually available at each anchor time.
     # Historical features use the latest forecast known by that anchor, while the
     # future Harmonie baseline comes from the latest complete run available then.
@@ -517,7 +642,7 @@ def _build_vintage_aware_samples(
         history_frame = _build_history_forecast_frame(target_lookup, history_times, anchor_ts_ms)
         if history_frame is None:
             continue
-        target_frame = _select_latest_complete_run_frame(run_entries, run_fetched_ts, target_times, anchor_ts_ms)
+        target_frame = _select_latest_complete_run_frame(run_entries, target_times, anchor_ts_ms)
         if target_frame is None:
             continue
 
@@ -679,7 +804,6 @@ def build_next_day_inference_input(
     x_std: np.ndarray,
 ) -> Dict[str, np.ndarray | str]:
     feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
-    bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
     conn = sqlite3.connect(str(db_path))
     try:
         latest_obs = _latest_observation_time(conn, cfg.site)
@@ -704,8 +828,15 @@ def build_next_day_inference_input(
     )
     anchor_ts_ms = _target_ms(anchor_time)
 
-    history_frame = _build_history_forecast_frame(bundle["target_lookup"], history_times, anchor_ts_ms)
-    target_frame = _select_latest_complete_run_frame(bundle["run_entries"], bundle["run_fetched_ts"], target_times, anchor_ts_ms)
+    context = build_anchor_forecast_context(
+        db_path=db_path,
+        cfg=cfg,
+        anchor_time=anchor_time,
+        history_times=history_times,
+        target_times=target_times,
+    )
+    history_frame = context["history_frame"]
+    target_frame = context["target_frame"]
     if history_frame is None or history_frame[feature_cols].isna().any().any():
         raise ValueError("Missing anchor-time forecast history for next-day inference.")
     if target_frame is None or target_frame[["forecast_avg", "forecast_max", "forecast_dir"]].isna().any().any():
@@ -724,6 +855,9 @@ def build_next_day_inference_input(
         "forecast_min_next24": forecast_min_next,
         "forecast_max_next24": forecast_max_next,
         "forecast_dir_next24": forecast_dir_next,
+        "target_run_ts": target_frame["run_ts"].to_numpy(dtype=np.int64),
+        "target_fetched_ts": target_frame["fetched_ts"].to_numpy(dtype=np.int64),
+        "target_horizon_hr": target_frame["horizon_hr"].to_numpy(dtype=np.float32),
         "anchor_forecast_dir": np.float32(history_frame["forecast_dir"].iloc[-1]),
         "target_times": np.array([t.isoformat() for t in target_times]),
         "anchor_time": anchor_time.isoformat(),

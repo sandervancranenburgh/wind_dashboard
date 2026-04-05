@@ -1190,6 +1190,36 @@ def _interp_hourly_to_dense(hourly_values: np.ndarray, hourly_index: pd.Datetime
     return dense.to_numpy(dtype=np.float32)
 
 
+def _interp_series_at_times(series: pd.Series, query_index: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Linearly interpolate a frozen forecast curve at arbitrary timestamps.
+
+    Query timestamps outside the curve support stay NaN so this helper does not
+    extrapolate beyond the issued forecast branch.
+    """
+    if len(query_index) == 0:
+        return np.array([], dtype=float)
+    curve = pd.Series(series, copy=True, dtype=float).dropna()
+    if curve.empty:
+        return np.full(len(query_index), np.nan, dtype=float)
+    curve = curve[~curve.index.duplicated(keep="last")].sort_index()
+    if len(curve) == 1:
+        out = np.full(len(query_index), np.nan, dtype=float)
+        same_time = query_index == curve.index[0]
+        if np.any(same_time):
+            out[same_time] = float(curve.iloc[0])
+        return out
+
+    x = curve.index.asi8.astype(np.float64)
+    y = curve.to_numpy(dtype=float)
+    q = query_index.asi8.astype(np.float64)
+    out = np.full(len(query_index), np.nan, dtype=float)
+    valid = (q >= x[0]) & (q <= x[-1])
+    if np.any(valid):
+        out[valid] = np.interp(q[valid], x, y)
+    return out
+
+
 def _smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
     """Gentle centered rolling mean for plotting; preserves NaN gaps."""
     arr = np.asarray(values, dtype=float)
@@ -1244,6 +1274,14 @@ def _format_plot_meta_text(
         else "unknown"
     )
     return f"Last plot update: {pred_txt}\nLast prediction update: {pred_upd_txt}\nLast model training: {train_txt}"
+
+
+def _format_last_plot_update_text(plot_updated_at_utc: datetime | pd.Timestamp | str | None, local_tz: str) -> str:
+    plot_dt = _parse_iso_utc(None if plot_updated_at_utc is None else str(plot_updated_at_utc))
+    if plot_dt is None:
+        return "Last plot update: unknown"
+    plot_txt = plot_dt.astimezone(ZoneInfo(local_tz)).strftime("%H:%M")
+    return f"Last plot update: {plot_txt}"
 
 
 def _format_model_id(model_trained_at_utc: str | None, local_tz: str) -> str:
@@ -1701,9 +1739,88 @@ def save_current_day_plot(
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
     prior_prediction_tables: list[pd.DataFrame] | None = None,
-    fixed_origin_mae_metrics: list[dict] | None = None,
+    live_monitoring_metric: dict | None = None,
     mobile: bool = False,
 ) -> None:
+    def _prepare_branch_frame(
+        raw_frame: pd.DataFrame,
+        *,
+        fallback_issue_anchor: pd.Timestamp | None = None,
+    ) -> tuple[pd.Timestamp, pd.DataFrame] | None:
+        if raw_frame is None or raw_frame.empty or "time_local" not in raw_frame.columns:
+            return None
+        frame = raw_frame.copy()
+        frame["time_local"] = pd.to_datetime(frame["time_local"], utc=True, errors="coerce").dt.tz_convert(
+            ZoneInfo(local_tz)
+        )
+        frame = frame.dropna(subset=["time_local"]).copy()
+        if frame.empty:
+            return None
+
+        issued_at_local = None
+        if "issued_at_local" in frame.columns:
+            issued_series = pd.to_datetime(frame["issued_at_local"], utc=True, errors="coerce").dropna()
+            if not issued_series.empty:
+                issued_at_local = issued_series.iloc[0].tz_convert(ZoneInfo(local_tz))
+        elif "issued_at_utc" in frame.columns:
+            issued_series = pd.to_datetime(frame["issued_at_utc"], utc=True, errors="coerce").dropna()
+            if not issued_series.empty:
+                issued_at_local = issued_series.iloc[0].tz_convert(ZoneInfo(local_tz))
+        if issued_at_local is None:
+            issued_at_local = fallback_issue_anchor
+        if issued_at_local is None:
+            return None
+
+        issue_anchor = pd.Timestamp(issued_at_local).floor("h")
+        frame = frame[
+            (frame["time_local"].dt.hour >= 8)
+            & ((frame["time_local"].dt.hour < 22) | ((frame["time_local"].dt.hour == 22) & (frame["time_local"].dt.minute == 0)))
+        ].copy()
+        if frame.empty:
+            return None
+        if "is_future" in frame.columns:
+            is_future_mask = (
+                frame["is_future"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin(["true", "1", "yes"])
+            )
+            frame = frame[is_future_mask | frame["time_local"].eq(issue_anchor)].copy()
+        frame = frame[frame["time_local"] >= issue_anchor].copy()
+        if frame.empty:
+            return None
+        frame = frame.sort_values("time_local").drop_duplicates(subset=["time_local"], keep="last").reset_index(drop=True)
+        return issue_anchor, frame
+
+    def _forecast_branch_changed(
+        prev_frame: pd.DataFrame,
+        curr_frame: pd.DataFrame,
+        *,
+        compare_cols: list[str],
+        tolerance: float = 0.0,
+    ) -> bool:
+        prev_cols = ["time_local"] + [col for col in compare_cols if col in prev_frame.columns]
+        curr_cols = ["time_local"] + [col for col in compare_cols if col in curr_frame.columns]
+        common_cols = [col for col in compare_cols if col in prev_cols and col in curr_cols]
+        if not common_cols:
+            return False
+        prev_view = prev_frame[
+            prev_frame["time_local"].dt.minute.eq(0)
+        ][["time_local"] + common_cols].set_index("time_local").sort_index()
+        curr_view = curr_frame[
+            curr_frame["time_local"].dt.minute.eq(0)
+        ][["time_local"] + common_cols].set_index("time_local").sort_index()
+        common_times = prev_view.index.intersection(curr_view.index)
+        if len(common_times) == 0:
+            return False
+        prev_vals = prev_view.loc[common_times, common_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        curr_vals = curr_view.loc[common_times, common_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        diffs = np.abs(prev_vals - curr_vals)
+        if np.isnan(diffs).all():
+            return False
+        return bool(np.nanmax(diffs) > float(tolerance))
+
     table = table.copy()
     table = table[
         (table["time_local"].dt.hour >= 8)
@@ -1747,25 +1864,6 @@ def save_current_day_plot(
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
     fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
     actual_avg = table["actual_wind_speed"].to_numpy(dtype=float)
-    ax.fill_between(
-        x,
-        fc_low,
-        fc_high,
-        color="gray",
-        alpha=0.25,
-        linewidth=0.8,
-        edgecolor="gray",
-        label="_nolegend_",
-        zorder=1,
-    )
-    ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Harmonie model - max speed")
-    ax.plot(
-        x,
-        fc_avg,
-        color="gray",
-        linewidth=1.5,
-        label="Harmonie model - avg speed",
-    )
     ax.plot(
         x,
         actual_avg,
@@ -1773,245 +1871,305 @@ def save_current_day_plot(
         markersize=2.2,
         color="magenta",
         linewidth=2.2,
-        label="Wind speed - measured",
+        label="_nolegend_",
         zorder=5,
     )
 
-    branch_lookback_by_anchor: dict[pd.Timestamp, int] = {}
-    for metric in fixed_origin_mae_metrics or []:
-        lookback_hours = int(metric.get("lookback_hours", 0))
-        if lookback_hours not in {3, 6}:
-            continue
-        if not bool(metric.get("available", False)):
-            continue
-        snapshot_issued_at_local = metric.get("snapshot_issued_at_local")
-        if not snapshot_issued_at_local:
-            continue
-        metric_issue_anchor = pd.to_datetime(snapshot_issued_at_local, errors="coerce")
-        if pd.isna(metric_issue_anchor):
-            continue
-        if metric_issue_anchor.tzinfo is None:
-            metric_issue_anchor = metric_issue_anchor.tz_localize(ZoneInfo(local_tz))
-        else:
-            metric_issue_anchor = metric_issue_anchor.tz_convert(ZoneInfo(local_tz))
-        branch_lookback_by_anchor[metric_issue_anchor.floor("h")] = lookback_hours
+    current_issue_dt = _parse_iso_utc(prediction_generated_at_utc)
+    if current_issue_dt is None:
+        current_issue_anchor = table["time_local"].max().floor("h")
+    else:
+        current_issue_anchor = pd.Timestamp(current_issue_dt).tz_convert(ZoneInfo(local_tz)).floor("h")
 
     overlay_tables = prior_prediction_tables or []
-    historical_branches: list[tuple[pd.Timestamp, pd.DataFrame]] = []
-    if overlay_tables:
-        for overlay_table in overlay_tables:
-            overlay = overlay_table.copy()
-            if "time_local" not in overlay.columns or "lstm_pred_wind_speed" not in overlay.columns:
-                continue
-            if "issued_at_local" not in overlay.columns:
-                continue
-            issued_series = overlay["issued_at_local"].dropna()
-            if issued_series.empty:
-                continue
-            issued_at = pd.to_datetime(issued_series.iloc[0], utc=True, errors="coerce")
-            if pd.isna(issued_at):
-                continue
-            issued_at = issued_at.tz_convert(ZoneInfo(local_tz))
-            issue_anchor = issued_at.floor("h")
-            overlay["time_local"] = pd.to_datetime(overlay["time_local"], utc=True, errors="coerce").dt.tz_convert(
-                ZoneInfo(local_tz)
-            )
-            overlay = overlay.dropna(subset=["time_local"]).copy()
-            if overlay.empty:
-                continue
-            overlay = overlay[
-                (overlay["time_local"].dt.hour >= 8)
-                & (
-                    (overlay["time_local"].dt.hour < 22)
-                    | ((overlay["time_local"].dt.hour == 22) & (overlay["time_local"].dt.minute == 0))
-                )
-            ].copy()
-            if overlay.empty:
-                continue
-            if "is_future" in overlay.columns:
-                is_future_mask = (
-                    overlay["is_future"]
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    .isin(["true", "1", "yes"])
-                )
-                overlay = overlay[
-                    is_future_mask | overlay["time_local"].eq(issue_anchor)
-                ].copy()
-            overlay = overlay[overlay["time_local"] >= issue_anchor].copy()
-            if overlay.empty:
-                continue
-            historical_branches.append((issue_anchor, overlay.sort_values("time_local").reset_index(drop=True)))
+    branch_frames_by_anchor: dict[pd.Timestamp, pd.DataFrame] = {}
+    for overlay_table in overlay_tables:
+        prepared = _prepare_branch_frame(overlay_table)
+        if prepared is None:
+            continue
+        issue_anchor, overlay = prepared
+        if issue_anchor not in branch_frames_by_anchor:
+            branch_frames_by_anchor[issue_anchor] = overlay
+    current_branch = _prepare_branch_frame(table, fallback_issue_anchor=current_issue_anchor)
+    if current_branch is not None:
+        branch_frames_by_anchor[current_branch[0]] = current_branch[1]
+    historical_branches = sorted(branch_frames_by_anchor.items(), key=lambda item: item[0])
 
-    mae_branch_styles = {
-        3: {"color": "#0057b8", "label": "Super local - avg speed - 3 hr ago forecast"},
-        6: {"color": "#008b5e", "label": "Super local - avg speed - 6 hr ago forecast"},
-    }
-
+    harmonie_update_anchors: list[pd.Timestamp] = []
     if historical_branches:
-        current_issue_dt = _parse_iso_utc(prediction_generated_at_utc)
-        if current_issue_dt is None:
-            current_issue_anchor = table["time_local"].max().floor("h")
-        else:
-            current_issue_anchor = pd.Timestamp(current_issue_dt).tz_convert(ZoneInfo(local_tz)).floor("h")
-        historical_branches.sort(key=lambda item: item[0])
-        overlay_alpha_start = 0.16 if mobile else 0.14
-        overlay_alpha_end = 0.42 if mobile else 0.36
-        overlay_lw = 1.1 if mobile else 1.0
-        active_lw = 2.2 if mobile else 2.0
+        harmonie_update_anchors = [historical_branches[0][0]]
+        prev_harmonie_frame = historical_branches[0][1]
+        for issue_anchor, overlay in historical_branches[1:]:
+            if _forecast_branch_changed(
+                prev_harmonie_frame,
+                overlay,
+                compare_cols=["forecast_wind_speed", "forecast_wind_min", "forecast_wind_max"],
+                tolerance=0.25,
+            ):
+                harmonie_update_anchors.append(issue_anchor)
+            prev_harmonie_frame = overlay
+    harmonie_next_update_anchor: dict[pd.Timestamp, pd.Timestamp] = {}
+    if harmonie_update_anchors:
+        for idx, issue_anchor in enumerate(harmonie_update_anchors[:-1]):
+            harmonie_next_update_anchor[issue_anchor] = harmonie_update_anchors[idx + 1]
+        harmonie_next_update_anchor[harmonie_update_anchors[-1]] = current_issue_anchor
+
+    current_harmonie_anchor = (
+        harmonie_update_anchors[-1]
+        if harmonie_update_anchors
+        else current_issue_anchor
+    )
+    current_comparison_frame = branch_frames_by_anchor.get(current_harmonie_anchor)
+    if current_comparison_frame is None or current_comparison_frame.empty:
+        current_comparison_frame = _prepare_branch_frame(table, fallback_issue_anchor=current_issue_anchor)[1]
+        current_harmonie_anchor = current_issue_anchor
+
+    historical_superlocal_plotted = False
+    historical_harmonie_plotted = False
+    if historical_branches:
+        overlay_alpha_start = 0.56 if mobile else 0.5
+        overlay_alpha_end = 0.9 if mobile else 0.84
+        superlocal_prior_lw = 2.45 if mobile else 2.2
+        harmonie_prior_lw = 2.3 if mobile else 2.05
+        superlocal_prior_dash = (0, (4.8, 1.8))
+        harmonie_prior_dash = (0, (3.4, 1.6))
         overlay_alphas = np.linspace(overlay_alpha_start, overlay_alpha_end, len(historical_branches), dtype=float)
-        branch_start_markers: dict[int, tuple[float, float]] = {}
-        historical_branch_markers: list[tuple[float, float, float]] = []
-        historical_branches_plotted = False
         for idx, ((issue_anchor, overlay), overlay_alpha) in enumerate(zip(historical_branches, overlay_alphas)):
+            if issue_anchor == current_harmonie_anchor:
+                continue
             next_issue_anchor = (
                 historical_branches[idx + 1][0]
                 if idx + 1 < len(historical_branches)
                 else current_issue_anchor
             )
-            overlay_x = np.array([x_lookup.get(ts, np.nan) for ts in overlay["time_local"]], dtype=float)
-            overlay_y = overlay["lstm_pred_wind_speed"].to_numpy(dtype=float)
-            valid = (~np.isnan(overlay_x)) & (~np.isnan(overlay_y))
-            if valid.sum() < 2:
-                continue
-            overlay_x = overlay_x[valid]
-            overlay_y = overlay_y[valid]
-            order = np.argsort(overlay_x)
-            overlay_x = overlay_x[order]
-            overlay_y = overlay_y[order]
-            branch_lookback = branch_lookback_by_anchor.get(issue_anchor)
-            if branch_lookback in mae_branch_styles:
-                branch_style = mae_branch_styles[branch_lookback]
-                ax.plot(
-                    overlay_x,
-                    overlay_y,
-                    color=branch_style["color"],
-                    linewidth=overlay_lw + 0.3,
-                    alpha=max(float(overlay_alpha), 0.6),
-                    zorder=2,
-                    label="_nolegend_",
-                )
-                if branch_lookback not in branch_start_markers:
-                    branch_start_markers[branch_lookback] = (float(overlay_x[0]), float(overlay_y[0]))
             active_overlay = overlay[(overlay["time_local"] >= issue_anchor) & (overlay["time_local"] <= next_issue_anchor)].copy()
+            if active_overlay.empty:
+                continue
+
             active_x = np.array([x_lookup.get(ts, np.nan) for ts in active_overlay["time_local"]], dtype=float)
-            active_y = active_overlay["lstm_pred_wind_speed"].to_numpy(dtype=float)
-            active_valid = (~np.isnan(active_x)) & (~np.isnan(active_y))
-            if active_valid.sum() >= 1:
-                active_x = active_x[active_valid]
-                active_y = active_y[active_valid]
-                active_order = np.argsort(active_x)
-                active_x = active_x[active_order]
-                active_y = active_y[active_order]
-                active_alpha = min(max(float(overlay_alpha) + 0.22, 0.34), 0.82)
-                if len(active_x) >= 2:
+
+            superlocal_y = pd.to_numeric(active_overlay["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float)
+            superlocal_valid = (~np.isnan(active_x)) & (~np.isnan(superlocal_y))
+            if np.any(superlocal_valid):
+                sl_x = active_x[superlocal_valid]
+                sl_y = superlocal_y[superlocal_valid]
+                order = np.argsort(sl_x)
+                sl_x = sl_x[order]
+                sl_y = sl_y[order]
+                if len(sl_x) >= 2:
                     ax.plot(
-                        active_x,
-                        active_y,
+                        sl_x,
+                        sl_y,
                         color=LSTM_HIGHLIGHT_COLOR,
-                        linestyle="--",
-                        linewidth=active_lw,
-                        alpha=active_alpha,
-                        zorder=2.65,
+                        linestyle=superlocal_prior_dash,
+                        linewidth=superlocal_prior_lw,
+                        alpha=float(overlay_alpha),
+                        zorder=2.35,
                         label="_nolegend_",
                     )
-                historical_branch_markers.append((float(active_x[0]), float(active_y[0]), active_alpha))
-                historical_branches_plotted = True
-        for lookback_hours, (marker_x, marker_y) in branch_start_markers.items():
-            branch_style = mae_branch_styles[lookback_hours]
-            ax.scatter(
-                [marker_x],
-                [marker_y],
-                s=34 if mobile else 30,
-                color=branch_style["color"],
-                edgecolors="white",
-                linewidths=0.8,
-                zorder=3.4,
-                label="_nolegend_",
-            )
-        for marker_x, marker_y, marker_alpha in historical_branch_markers:
-            ax.scatter(
-                [marker_x],
-                [marker_y],
-                s=18 if mobile else 14,
-                color=LSTM_HIGHLIGHT_COLOR,
-                edgecolors="white",
-                linewidths=0.6,
-                alpha=marker_alpha,
-                zorder=3.2,
-                label="_nolegend_",
-            )
+                historical_superlocal_plotted = True
 
-    # Vertical line at present hour boundary (first predicted hour).
-    future_idx = np.where(table["is_future"].to_numpy(dtype=bool))[0]
+            if issue_anchor not in harmonie_update_anchors or "forecast_wind_speed" not in overlay.columns:
+                continue
+            harmonie_end_anchor = harmonie_next_update_anchor.get(issue_anchor, current_issue_anchor)
+            harmonie_overlay = overlay[
+                (overlay["time_local"] >= issue_anchor) & (overlay["time_local"] <= harmonie_end_anchor)
+            ].copy()
+            if harmonie_overlay.empty:
+                continue
+            harmonie_x = np.array([x_lookup.get(ts, np.nan) for ts in harmonie_overlay["time_local"]], dtype=float)
+            harmonie_y = pd.to_numeric(harmonie_overlay["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float)
+            harmonie_valid = (~np.isnan(harmonie_x)) & (~np.isnan(harmonie_y))
+            if np.any(harmonie_valid):
+                h_x = harmonie_x[harmonie_valid]
+                h_y = harmonie_y[harmonie_valid]
+                order = np.argsort(h_x)
+                h_x = h_x[order]
+                h_y = h_y[order]
+                if len(h_x) >= 2:
+                    ax.plot(
+                        h_x,
+                        h_y,
+                        color="#8a8a8a",
+                        linestyle=harmonie_prior_dash,
+                        linewidth=harmonie_prior_lw,
+                        alpha=max(float(overlay_alpha), 0.56),
+                        zorder=2.2,
+                        label="_nolegend_",
+                    )
+                historical_harmonie_plotted = True
 
-    if not historical_branches:
-        # Before any prior hourly updates exist, fall back to the current run's past context.
-        lstm_past = table["lstm_pred_wind_speed_full"].to_numpy(dtype=float).copy()
-        if len(future_idx) > 0:
-            lstm_past[future_idx[0]:] = np.nan
-        ax.plot(
-            x,
-            lstm_past,
+    # The solid current comparison is anchored to the latest active Harmonie
+    # update. We plot the Super local branch issued at that same anchor so the
+    # solid lines represent one fair frozen head-to-head pair.
+    current_branch_x = np.array([x_lookup.get(ts, np.nan) for ts in current_comparison_frame["time_local"]], dtype=float)
+    harmonie_current = np.full(len(table), np.nan, dtype=float)
+    harmonie_current_high = np.full(len(table), np.nan, dtype=float)
+    harmonie_current_low = np.full(len(table), np.nan, dtype=float)
+    superlocal_current = np.full(len(table), np.nan, dtype=float)
+    current_branch_boundary_idx: int | None = x_lookup.get(current_harmonie_anchor)
+    current_valid = ~np.isnan(current_branch_x)
+    if np.any(current_valid):
+        branch_positions = current_branch_x[current_valid].astype(int)
+        harmonie_vals = pd.to_numeric(
+            current_comparison_frame.loc[current_valid, "forecast_wind_speed"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        harmonie_high_vals = pd.to_numeric(
+            current_comparison_frame.loc[current_valid, "forecast_wind_max"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        harmonie_low_vals = pd.to_numeric(
+            current_comparison_frame.loc[current_valid, "forecast_wind_min"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        superlocal_vals = pd.to_numeric(
+            current_comparison_frame.loc[current_valid, "lstm_pred_wind_speed"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        harmonie_current[branch_positions] = harmonie_vals
+        harmonie_current_high[branch_positions] = np.where(np.isnan(harmonie_high_vals), harmonie_vals, harmonie_high_vals)
+        harmonie_current_low[branch_positions] = np.where(np.isnan(harmonie_low_vals), harmonie_vals, harmonie_low_vals)
+        superlocal_current[branch_positions] = superlocal_vals
+        if current_branch_boundary_idx is None and len(branch_positions) > 0:
+            current_branch_boundary_idx = int(branch_positions[0])
+
+    ax.fill_between(
+        x,
+        harmonie_current_low,
+        harmonie_current_high,
+        color="#7a7a7a",
+        alpha=0.16,
+        linewidth=0.6,
+        edgecolor="none",
+        label="_nolegend_",
+        zorder=1.1,
+    )
+    ax.plot(
+        x,
+        harmonie_current_high,
+        color="#666666",
+        linewidth=1.2,
+        linestyle="--",
+        label="_nolegend_",
+        zorder=2.4,
+    )
+    ax.plot(
+        x,
+        harmonie_current,
+        color="#555555",
+        linewidth=2.2,
+        label="_nolegend_",
+        zorder=2.6,
+    )
+
+    ax.plot(
+        x,
+        superlocal_current,
+        color=LSTM_HIGHLIGHT_COLOR,
+        linewidth=2.6,
+        label="_nolegend_",
+        zorder=3,
+    )
+
+    def _first_valid_index(values: np.ndarray) -> int | None:
+        valid_idx = np.where(~np.isnan(values))[0]
+        return int(valid_idx[0]) if len(valid_idx) else None
+
+    harmonie_start_idx = _first_valid_index(harmonie_current)
+    if harmonie_start_idx is not None:
+        ax.scatter(
+            [float(harmonie_start_idx)],
+            [float(harmonie_current[harmonie_start_idx])],
+            s=54 if mobile else 46,
+            marker="s",
+            color="#555555",
+            edgecolors="white",
+            linewidths=0.9,
+            zorder=3.6,
+            label="_nolegend_",
+        )
+    superlocal_start_idx = _first_valid_index(superlocal_current)
+    if superlocal_start_idx is not None:
+        ax.scatter(
+            [float(superlocal_start_idx)],
+            [float(superlocal_current[superlocal_start_idx])],
+            s=58 if mobile else 50,
+            marker="o",
             color=LSTM_HIGHLIGHT_COLOR,
-            linestyle="--",
-            linewidth=2.0,
-            alpha=0.9,
+            edgecolors="white",
+            linewidths=0.9,
+            zorder=3.8,
             label="_nolegend_",
         )
 
-    # LSTM future segment (solid): remaining-day best prediction from current anchor.
-    lstm_future = table["lstm_pred_wind_speed"].to_numpy(dtype=float).copy()
-    if len(future_idx) > 0 and future_idx[0] - 1 >= 0:
-        boundary_idx = future_idx[0] - 1
-        if np.isnan(lstm_future[boundary_idx]):
-            lstm_future[boundary_idx] = table["lstm_pred_wind_speed_full"].to_numpy(dtype=float)[boundary_idx]
-    ax.plot(
-        x,
-        lstm_future,
-        color=LSTM_HIGHLIGHT_COLOR,
-        linewidth=2.6,
-        label="Super local - avg speed - hourly remaining day forecast",
-        zorder=3,
-    )
     ax.set_title(f"Current-day wind prediction: {day_label}", fontsize=title_fs)
     ax.set_xlabel("Time", fontsize=label_fs)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
-    handles, labels = ax.get_legend_handles_labels()
-    desired_order = [
-        "Wind speed - measured",
-        "Super local - avg speed - hourly remaining day forecast",
-        "Super local - avg speed - frozen prior issued forecasts",
-        "Super local - avg speed - 3 hr ago forecast",
-        "Super local - avg speed - 6 hr ago forecast",
-        "Harmonie model - avg speed",
-        "Harmonie model - max speed",
-    ]
-    order_map = {label: handle for handle, label in zip(handles, labels)}
-    if historical_branches and "historical_branches_plotted" in locals() and historical_branches_plotted:
-        order_map["Super local - avg speed - frozen prior issued forecasts"] = Line2D(
+    order_map = {
+        "Measured wind": Line2D(
+            [0],
+            [0],
+            color="magenta",
+            linewidth=2.2,
+            marker="o",
+            markersize=4.2 if mobile else 3.6,
+        ),
+        "Super local - current forecast": Line2D(
             [0],
             [0],
             color=LSTM_HIGHLIGHT_COLOR,
-            linestyle="--",
-            linewidth=1.6 if mobile else 1.4,
+            linewidth=2.6,
             marker="o",
-            markersize=4.2 if mobile else 3.6,
+            markersize=5.0 if mobile else 4.4,
             markerfacecolor=LSTM_HIGHLIGHT_COLOR,
             markeredgecolor="white",
-            markeredgewidth=0.6,
-            alpha=0.62,
+            markeredgewidth=0.7,
+        ),
+        "Harmonie - current forecast": Line2D(
+            [0],
+            [0],
+            color="#555555",
+            linewidth=2.2,
+            marker="s",
+            markersize=4.8 if mobile else 4.2,
+            markerfacecolor="#555555",
+            markeredgecolor="white",
+            markeredgewidth=0.7,
+        ),
+        "Harmonie - max speed": Line2D(
+            [0],
+            [0],
+            color="#666666",
+            linewidth=1.2,
+            linestyle="--",
+        ),
+    }
+    desired_order = [
+        "Measured wind",
+        "Super local - current forecast",
+        "Super local - prior issued forecasts",
+        "Harmonie - current forecast",
+        "Harmonie - prior issued forecasts",
+        "Harmonie - max speed",
+    ]
+    if historical_superlocal_plotted:
+        order_map["Super local - prior issued forecasts"] = Line2D(
+            [0],
+            [0],
+            color=LSTM_HIGHLIGHT_COLOR,
+            linestyle=(0, (4.8, 1.8)),
+            linewidth=2.15 if mobile else 1.9,
+            alpha=0.84,
         )
-    for lookback_hours, branch_style in mae_branch_styles.items():
-        if lookback_hours not in branch_lookback_by_anchor.values():
-            continue
-        order_map[branch_style["label"]] = Line2D(
+    if historical_harmonie_plotted:
+        order_map["Harmonie - prior issued forecasts"] = Line2D(
             [0],
             [0],
-            color=branch_style["color"],
-            linewidth=1.5 if mobile else 1.3,
+            color="#8a8a8a",
+            linestyle=(0, (3.4, 1.6)),
+            linewidth=2.0 if mobile else 1.8,
             alpha=0.8,
         )
     ordered_handles = [order_map[label] for label in desired_order if label in order_map]
@@ -2031,11 +2189,6 @@ def save_current_day_plot(
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(-0.05, len(table) - 1.0 + 0.02)
     ax.set_ylim(y_lower, y_upper)
-
-    metric_map = {
-        int(metric.get("lookback_hours", 0)): metric
-        for metric in (fixed_origin_mae_metrics or [])
-    }
 
     superlocal_color = "#d62728"
     measured_color = "#cc33cc"
@@ -2063,6 +2216,18 @@ def save_current_day_plot(
             zorder=8,
             clip_on=True,
         )
+        if current_branch_boundary_idx is not None:
+            ax.annotate(
+                f"active anchor {current_harmonie_anchor.strftime('%H:%M')}",
+                xy=(float(current_branch_boundary_idx), y_upper),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=max(mae_fs - 2, 8),
+                color="black",
+                clip_on=False,
+            )
 
     def _metric_value_colors(metric: dict | None) -> tuple[str, str]:
         if not metric or not metric.get("available", False):
@@ -2075,44 +2240,19 @@ def save_current_day_plot(
             return better_color, worse_color
         return worse_color, better_color
 
-    def _metric_left_label(model_label: str, model_color: str, interval_color: str) -> HPacker:
-        padded_model_label = model_label.ljust(len("Super local"))
-        return HPacker(
-            children=[
-                TextArea(
-                    "━━━ ",
-                    textprops={
-                        "fontsize": mae_fs + 1,
-                        "color": interval_color,
-                        "fontweight": "bold",
-                        "fontfamily": metric_fontfamily,
-                    },
-                ),
-                TextArea(
-                    padded_model_label,
-                    textprops={"fontsize": mae_fs, "color": model_color, "fontfamily": metric_fontfamily},
-                ),
-            ],
-            align="center",
-            pad=0,
-            sep=0,
-        )
-
-    def _metric_line(
-        model_label: str,
-        model_color: str,
-        hours: int,
-        interval_color: str,
+    def _summary_line(
+        label_text: str,
         value_text: str,
-        value_color: str,
+        *,
+        label_color: str = "black",
+        value_color: str = "black",
     ) -> HPacker:
+        label_block = f"{label_text + ':':<16}"
         return HPacker(
             children=[
-                _metric_left_label(model_label, model_color, interval_color),
-                TextArea("  ", textprops={"fontsize": mae_fs, "color": "black", "fontfamily": metric_fontfamily}),
                 TextArea(
-                    f"{hours} hr interval: ",
-                    textprops={"fontsize": mae_fs, "color": "black", "fontfamily": metric_fontfamily},
+                    label_block,
+                    textprops={"fontsize": mae_fs, "color": label_color, "fontfamily": metric_fontfamily},
                 ),
                 TextArea(
                     value_text,
@@ -2129,53 +2269,37 @@ def save_current_day_plot(
             sep=0,
         )
 
+    summary_available = bool(live_monitoring_metric and live_monitoring_metric.get("available", False))
+    superlocal_value_color, harmonie_value_color = _metric_value_colors(live_monitoring_metric)
+    if summary_available:
+        mae_superlocal_txt = f"{float(live_monitoring_metric['mae_superlocal']):.2f} kts"
+        mae_harmonie_txt = f"{float(live_monitoring_metric['mae_harmonie']):.2f} kts"
+        point_count_txt = f"{int(live_monitoring_metric.get('measurement_point_count', live_monitoring_metric.get('point_count', 0))):,}"
+    else:
+        mae_superlocal_txt = "n/a"
+        mae_harmonie_txt = "n/a"
+        point_count_txt = "0"
+
     metric_lines: list[TextArea | HPacker] = [
         TextArea(
-            "Running mean absolute errors:",
+            "Current-day cumulative MAE",
             textprops={
                 "fontsize": mae_fs,
                 "fontweight": "bold",
                 "color": "black",
                 "fontfamily": metric_fontfamily,
             },
-        )
+        ),
+        _summary_line("Super local", mae_superlocal_txt, label_color=superlocal_color, value_color=superlocal_value_color),
+        _summary_line("Harmonie", mae_harmonie_txt, label_color=harmonie_color, value_color=harmonie_value_color),
+        _summary_line("Measured points", point_count_txt),
     ]
-    for hours in (3, 6):
-        metric = metric_map.get(hours)
-        interval_color = mae_branch_styles[hours]["color"]
-        superlocal_value_color, harmonie_value_color = _metric_value_colors(metric)
-        if metric and metric.get("available", False):
-            mae_superlocal_txt = f"{float(metric['mae_superlocal']):.2f} kts"
-            mae_harmonie_txt = f"{float(metric['mae_harmonie']):.2f} kts"
-        else:
-            mae_superlocal_txt = "n/a"
-            mae_harmonie_txt = "n/a"
-        metric_lines.append(
-            _metric_line(
-                "Super local",
-                superlocal_color,
-                hours,
-                interval_color,
-                mae_superlocal_txt,
-                superlocal_value_color,
-            )
-        )
-        metric_lines.append(
-            _metric_line(
-                "Harmonie",
-                harmonie_color,
-                hours,
-                harmonie_color,
-                mae_harmonie_txt,
-                harmonie_value_color,
-            )
-        )
 
     mse_box = VPacker(
         children=metric_lines,
         align="left",
         pad=0,
-        sep=1,
+        sep=2,
     )
     mse_anchored = AnchoredOffsetbox(
         loc="upper right",
@@ -2305,6 +2429,67 @@ def _resolve_model_trained_utc(ckpt: dict, model_path: Path) -> str | None:
     if model_path.exists():
         return datetime.fromtimestamp(model_path.stat().st_mtime, tz=timezone.utc).isoformat()
     return None
+
+
+def _safe_model_trained_utc(
+    model_path: Path,
+    device: torch.device,
+    *,
+    intraday: bool = False,
+) -> str | None:
+    if not model_path.exists():
+        return None
+    try:
+        if intraday:
+            _, ckpt = load_intraday_model(model_path, device)
+        else:
+            _, ckpt = _load_model(model_path, device)
+        return _resolve_model_trained_utc(ckpt, model_path)
+    except Exception:
+        return datetime.fromtimestamp(model_path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _champion_artifact_state(
+    model_path: Path,
+    device: torch.device,
+    local_tz: str,
+    *,
+    intraday: bool = False,
+) -> dict:
+    trained_at_utc = _safe_model_trained_utc(model_path, device, intraday=intraday)
+    return {
+        "path": str(model_path),
+        "exists": bool(model_path.exists()),
+        "trained_at_utc": trained_at_utc,
+        "model_id": _format_model_id(trained_at_utc, local_tz) if trained_at_utc else None,
+    }
+
+
+def _load_active_champion_states(
+    *,
+    speed_model_path: Path,
+    direction_model_path: Path,
+    intraday_model_path: Path,
+    device: torch.device,
+    local_tz: str,
+) -> dict:
+    return {
+        "next_day_speed": _champion_artifact_state(speed_model_path, device, local_tz, intraday=False),
+        "next_day_direction": _champion_artifact_state(direction_model_path, device, local_tz, intraday=False),
+        "intraday_speed": _champion_artifact_state(intraday_model_path, device, local_tz, intraday=True),
+    }
+
+
+def _champion_state_refreshed(before_state: dict | None, after_state: dict | None) -> bool | None:
+    if before_state is None or after_state is None:
+        return None
+    before_exists = bool(before_state.get("exists"))
+    after_exists = bool(after_state.get("exists"))
+    if not after_exists:
+        return False
+    if not before_exists and after_exists:
+        return True
+    return before_state.get("trained_at_utc") != after_state.get("trained_at_utc")
 
 
 def _resolve_now_local(local_tz: str, test_now_local_hour: int | None) -> datetime:
@@ -2840,136 +3025,262 @@ def load_latest_current_day_snapshot(
     return snap.sort_values("time_local").reset_index(drop=True)
 
 
-def compute_fixed_origin_current_day_mae(
-    current_table: pd.DataFrame,
-    prior_prediction_tables: list[pd.DataFrame] | None,
-    actual_measurements: pd.DataFrame | None = None,
-    lookback_hours: tuple[int, ...] = (1, 3, 6),
-) -> list[dict]:
-    if current_table.empty:
-        return []
-    history = prior_prediction_tables or []
-    if not history:
-        return []
+def compute_current_day_completed_interval_mae(
+    db_path: Path,
+    site: str,
+    target_day_local: date,
+    local_tz: str,
+    prior_prediction_tables: list[pd.DataFrame] | None = None,
+) -> dict:
+    """
+    Build the live current-day monitoring metric from completed Harmonie-update intervals.
 
-    if actual_measurements is not None and not actual_measurements.empty:
-        eval_actual = actual_measurements.copy()
-        eval_actual = eval_actual.dropna(subset=["time_local", "actual_wind_speed"]).copy()
-        eval_actual["time_local"] = pd.to_datetime(eval_actual["time_local"], utc=True, errors="coerce")
-        eval_actual = eval_actual.dropna(subset=["time_local"]).sort_values("time_local")
-        eval_actual = (
-            eval_actual.set_index("time_local")[["actual_wind_speed"]]
-            .resample("1h")
-            .mean(numeric_only=True)
-            .dropna()
-            .reset_index()
-        )
-    else:
-        eval_actual = current_table.copy()
-        eval_actual = eval_actual[
-            eval_actual["time_local"].dt.minute.eq(0) & eval_actual["actual_wind_speed"].notna()
-        ][["time_local", "actual_wind_speed"]].drop_duplicates(subset=["time_local"])
-    if eval_actual.empty:
-        return []
-    eval_end = eval_actual["time_local"].max()
+    Each segment starts at the first intraday issue hour where a new Harmonie
+    vintage becomes active, uses the frozen model/Harmonie forecast branch from
+    that issue hour, and is scored on all realised measured wind-speed points up
+    to the next Harmonie update boundary. Forecast values at measurement
+    timestamps are obtained via the same linear interpolation rule for both
+    Super local and Harmonie. The latest open interval is excluded.
+    """
+    tz = ZoneInfo(local_tz)
+    day_start_local = pd.Timestamp(datetime.combine(target_day_local, datetime.min.time()), tz=tz)
+    day_end_local = day_start_local + pd.Timedelta(days=1)
+    day_start_ms = int(day_start_local.tz_convert("UTC").timestamp() * 1000)
+    day_end_ms = int(day_end_local.tz_convert("UTC").timestamp() * 1000)
 
-    snapshots: list[tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]] = []
-    for snap in history:
-        if snap.empty or "issued_at_local" not in snap.columns:
-            continue
-        issued_series = snap["issued_at_local"].dropna()
-        if issued_series.empty:
-            continue
-        issued_at = pd.to_datetime(issued_series.iloc[0])
-        issue_anchor = issued_at.floor("h")
-        snap_hourly = snap.copy()
-        snap_hourly = snap_hourly[snap_hourly["time_local"].dt.minute.eq(0)].copy()
-        if snap_hourly.empty:
-            continue
-        snapshots.append((issue_anchor, issued_at, snap_hourly))
-    if not snapshots:
-        return []
-    snapshots.sort(key=lambda item: item[0])
-
-    metrics: list[dict] = []
-    for lookback in lookback_hours:
-        cutoff = eval_end - pd.Timedelta(hours=int(lookback))
-        eligible = [item for item in snapshots if item[0] <= cutoff]
-        if not eligible:
-            metrics.append(
-                {
-                    "lookback_hours": int(lookback),
-                    "available": False,
-                    "snapshot_issued_at_local": None,
-                    "actual_issue_age_hours": None,
-                    "point_count": 0,
-                    "mae_superlocal": None,
-                    "mae_harmonie": None,
-                }
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = pd.read_sql_query(
+            """
+            WITH first_issue AS (
+                SELECT
+                    anchor_ts,
+                    target_ts,
+                    MIN(issued_ts) AS issued_ts
+                FROM prediction_log
+                WHERE site = ?
+                  AND model_type = 'intraday'
+                  AND prediction_kind = 'wind_speed'
+                  AND anchor_ts >= ?
+                  AND anchor_ts < ?
+                  AND target_ts >= ?
+                  AND target_ts < ?
+                GROUP BY anchor_ts, target_ts
             )
-            continue
+            SELECT
+                pl.anchor_ts,
+                pl.issued_ts,
+                pl.target_ts,
+                pl.prediction_value,
+                pl.harmonie_value,
+                pl.harmonie_run_ts,
+                pl.harmonie_fetched_ts,
+                pl.actual_value,
+                pl.model_abs_error,
+                pl.harmonie_abs_error,
+                pl.model_sq_error,
+                pl.harmonie_sq_error
+            FROM prediction_log AS pl
+            INNER JOIN first_issue AS fi
+                ON pl.anchor_ts = fi.anchor_ts
+               AND pl.target_ts = fi.target_ts
+               AND pl.issued_ts = fi.issued_ts
+            WHERE pl.site = ?
+              AND pl.model_type = 'intraday'
+              AND pl.prediction_kind = 'wind_speed'
+            ORDER BY pl.anchor_ts ASC, pl.target_ts ASC
+            """,
+            conn,
+            params=[site, day_start_ms, day_end_ms, day_start_ms, day_end_ms, site],
+        )
+        obs_raw_utc = _load_observations_raw(conn, site)
+    finally:
+        conn.close()
 
-        issue_anchor, issued_at, snap = eligible[-1]
-        snap_eval = snap.copy()
-        snap_eval = snap_eval[
-            snap_eval["time_local"].dt.minute.eq(0)
-            & (snap_eval["time_local"] > issue_anchor)
-            & (snap_eval["time_local"] <= eval_end)
+    empty_summary = {
+        "available": False,
+        "point_count": 0,
+        "measurement_point_count": 0,
+        "completed_interval_count": 0,
+        "partial_current_interval_included": False,
+        "mae_superlocal": None,
+        "mae_harmonie": None,
+        "rmse_superlocal": None,
+        "rmse_harmonie": None,
+        "model_win_rate": None,
+        "segments": [],
+    }
+    if rows.empty:
+        return empty_summary
+
+    snapshot_by_anchor: dict[pd.Timestamp, pd.DataFrame] = {}
+    for snap in prior_prediction_tables or []:
+        if snap.empty or "issued_at_local" not in snap.columns or "time_local" not in snap.columns:
+            continue
+        snap_frame = snap.copy()
+        snap_frame["time_local"] = pd.to_datetime(snap_frame["time_local"], utc=True, errors="coerce")
+        if "issued_at_local" in snap_frame.columns:
+            snap_frame["issued_at_local"] = pd.to_datetime(snap_frame["issued_at_local"], utc=True, errors="coerce")
+        elif "issued_at_utc" in snap_frame.columns:
+            snap_frame["issued_at_local"] = pd.to_datetime(snap_frame["issued_at_utc"], utc=True, errors="coerce")
+        snap_frame = snap_frame.dropna(subset=["time_local", "issued_at_local"]).copy()
+        if snap_frame.empty:
+            continue
+        snap_frame["time_local"] = snap_frame["time_local"].dt.tz_convert(tz)
+        snap_frame["issued_at_local"] = snap_frame["issued_at_local"].dt.tz_convert(tz)
+        issue_anchor_local = pd.to_datetime(snap_frame["issued_at_local"].iloc[0]).floor("h")
+        if issue_anchor_local not in snapshot_by_anchor:
+            snapshot_by_anchor[issue_anchor_local] = snap_frame.sort_values("time_local").reset_index(drop=True)
+
+    actual_points_local = obs_raw_utc.tz_convert(tz)
+    actual_points_local = actual_points_local[
+        (actual_points_local.index >= day_start_local)
+        & (actual_points_local.index < day_end_local)
+    ].copy()
+    actual_points_local = actual_points_local[actual_points_local["actual_avg"].notna()].copy()
+    if actual_points_local.empty:
+        return empty_summary
+
+    numeric_cols = [
+        "anchor_ts",
+        "issued_ts",
+        "target_ts",
+        "prediction_value",
+        "harmonie_value",
+        "harmonie_run_ts",
+        "harmonie_fetched_ts",
+        "actual_value",
+        "model_abs_error",
+        "harmonie_abs_error",
+        "model_sq_error",
+        "harmonie_sq_error",
+    ]
+    for col in numeric_cols:
+        rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    rows = rows.dropna(subset=["anchor_ts", "target_ts"]).copy()
+    if rows.empty:
+        return empty_summary
+
+    def _has_harmonie_update(prev_frame: pd.DataFrame, curr_frame: pd.DataFrame) -> bool:
+        compare_cols = ["target_ts", "harmonie_run_ts", "harmonie_fetched_ts", "harmonie_value"]
+        prev_view = prev_frame[compare_cols].drop_duplicates(subset=["target_ts"]).set_index("target_ts").sort_index()
+        curr_view = curr_frame[compare_cols].drop_duplicates(subset=["target_ts"]).set_index("target_ts").sort_index()
+        common_targets = prev_view.index.intersection(curr_view.index)
+        if len(common_targets) == 0:
+            return False
+        return not prev_view.loc[common_targets].equals(curr_view.loc[common_targets])
+
+    anchor_groups = [
+        (int(anchor_ts), frame.sort_values("target_ts").reset_index(drop=True))
+        for anchor_ts, frame in rows.groupby("anchor_ts", sort=True)
+    ]
+    if not anchor_groups:
+        return empty_summary
+
+    update_boundaries: list[tuple[int, pd.DataFrame]] = [anchor_groups[0]]
+    previous_issue_frame = anchor_groups[0][1]
+    for anchor_ts, frame in anchor_groups[1:]:
+        if _has_harmonie_update(previous_issue_frame, frame):
+            update_boundaries.append((anchor_ts, frame))
+        previous_issue_frame = frame
+
+    segment_frames: list[pd.DataFrame] = []
+    segment_summaries: list[dict] = []
+    for (segment_anchor_ts, segment_frame), (next_anchor_ts, _next_frame) in zip(update_boundaries, update_boundaries[1:]):
+        segment_anchor_local = pd.to_datetime(segment_anchor_ts, unit="ms", utc=True).tz_convert(tz)
+        next_anchor_local = pd.to_datetime(next_anchor_ts, unit="ms", utc=True).tz_convert(tz)
+        snapshot = snapshot_by_anchor.get(segment_anchor_local)
+        if snapshot is None or snapshot.empty:
+            continue
+        measurement_rows = actual_points_local[
+            (actual_points_local.index >= segment_anchor_local)
+            & (actual_points_local.index < next_anchor_local)
         ].copy()
-        snap_eval = snap_eval.dropna(subset=["time_local", "forecast_wind_speed", "lstm_pred_wind_speed"])
-        actual_eval = eval_actual[(eval_actual["time_local"] > issue_anchor) & (eval_actual["time_local"] <= eval_end)].copy()
-        if snap_eval.empty or actual_eval.empty:
-            metrics.append(
-                {
-                    "lookback_hours": int(lookback),
-                    "available": False,
-                    "snapshot_issued_at_local": issue_anchor.isoformat(),
-                    "actual_issue_age_hours": float((eval_end - issue_anchor).total_seconds() / 3600.0),
-                    "point_count": 0,
-                    "mae_superlocal": None,
-                    "mae_harmonie": None,
-                }
-            )
+        if measurement_rows.empty:
             continue
 
-        snap_eval = snap_eval.sort_values("time_local").drop_duplicates(subset=["time_local"]).copy()
-        snap_eval["forecast_wind_speed"] = pd.to_numeric(snap_eval["forecast_wind_speed"], errors="coerce")
-        snap_eval["lstm_pred_wind_speed"] = pd.to_numeric(snap_eval["lstm_pred_wind_speed"], errors="coerce")
-        merged = actual_eval.merge(
-            snap_eval[["time_local", "forecast_wind_speed", "lstm_pred_wind_speed"]],
-            on="time_local",
-            how="inner",
+        curve = snapshot[
+            (snapshot["time_local"] >= segment_anchor_local)
+            & (snapshot["time_local"] <= next_anchor_local)
+        ].copy()
+        if curve.empty:
+            continue
+        forecast_curve = pd.Series(
+            pd.to_numeric(curve["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float),
+            index=curve["time_local"],
         )
-        merged = merged.dropna(subset=["forecast_wind_speed", "lstm_pred_wind_speed", "actual_wind_speed"])
-        if merged.empty:
-            metrics.append(
-                {
-                    "lookback_hours": int(lookback),
-                    "available": False,
-                    "snapshot_issued_at_local": issue_anchor.isoformat(),
-                    "actual_issue_age_hours": float((eval_end - issue_anchor).total_seconds() / 3600.0),
-                    "point_count": 0,
-                    "mae_superlocal": None,
-                    "mae_harmonie": None,
-                }
-            )
+        superlocal_curve = pd.Series(
+            pd.to_numeric(curve["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float),
+            index=curve["time_local"],
+        )
+        interp_harmonie = _interp_series_at_times(forecast_curve, measurement_rows.index)
+        interp_superlocal = _interp_series_at_times(superlocal_curve, measurement_rows.index)
+        actual_values = pd.to_numeric(measurement_rows["actual_avg"], errors="coerce").to_numpy(dtype=float)
+        valid = (~np.isnan(actual_values)) & (~np.isnan(interp_harmonie)) & (~np.isnan(interp_superlocal))
+        if not np.any(valid):
             continue
 
-        mae_sl = float(np.mean(np.abs(merged["lstm_pred_wind_speed"] - merged["actual_wind_speed"])))
-        mae_fc = float(np.mean(np.abs(merged["forecast_wind_speed"] - merged["actual_wind_speed"])))
-        metrics.append(
+        segment_rows = pd.DataFrame(
             {
-                "lookback_hours": int(lookback),
-                "available": True,
-                "snapshot_issued_at_local": issue_anchor.isoformat(),
-                "actual_issue_age_hours": float((eval_end - issue_anchor).total_seconds() / 3600.0),
-                "point_count": int(len(merged)),
-                "mae_superlocal": mae_sl,
-                "mae_harmonie": mae_fc,
+                "actual_value": actual_values[valid],
+                "superlocal_value": interp_superlocal[valid],
+                "harmonie_value": interp_harmonie[valid],
+            }
+        )
+        segment_rows["model_abs_error"] = np.abs(segment_rows["superlocal_value"] - segment_rows["actual_value"])
+        segment_rows["harmonie_abs_error"] = np.abs(segment_rows["harmonie_value"] - segment_rows["actual_value"])
+        segment_rows["model_sq_error"] = np.square(segment_rows["superlocal_value"] - segment_rows["actual_value"])
+        segment_rows["harmonie_sq_error"] = np.square(segment_rows["harmonie_value"] - segment_rows["actual_value"])
+        segment_frames.append(segment_rows)
+        segment_summaries.append(
+            {
+                "segment_anchor_local": segment_anchor_local.isoformat(),
+                "segment_end_local": next_anchor_local.isoformat(),
+                "measurement_point_count": int(len(segment_rows)),
+                "point_count": int(len(segment_rows)),
             }
         )
 
-    return metrics
+    if not segment_frames:
+        out = empty_summary.copy()
+        out["segments"] = segment_summaries
+        return out
+
+    evaluated = pd.concat(segment_frames, ignore_index=True)
+    model_abs = evaluated["model_abs_error"].to_numpy(dtype=float)
+    harmonie_abs = evaluated["harmonie_abs_error"].to_numpy(dtype=float)
+    model_sq = evaluated["model_sq_error"].to_numpy(dtype=float)
+    harmonie_sq = evaluated["harmonie_sq_error"].to_numpy(dtype=float)
+    valid_mask = (
+        ~np.isnan(model_abs)
+        & ~np.isnan(harmonie_abs)
+        & ~np.isnan(model_sq)
+        & ~np.isnan(harmonie_sq)
+    )
+    if not np.any(valid_mask):
+        out = empty_summary.copy()
+        out["segments"] = segment_summaries
+        return out
+
+    model_abs = model_abs[valid_mask]
+    harmonie_abs = harmonie_abs[valid_mask]
+    model_sq = model_sq[valid_mask]
+    harmonie_sq = harmonie_sq[valid_mask]
+
+    return {
+        "available": True,
+        "point_count": int(len(model_abs)),
+        "measurement_point_count": int(len(model_abs)),
+        "completed_interval_count": int(len(segment_frames)),
+        "partial_current_interval_included": False,
+        "mae_superlocal": float(np.mean(model_abs)),
+        "mae_harmonie": float(np.mean(harmonie_abs)),
+        "rmse_superlocal": float(np.sqrt(np.mean(model_sq))),
+        "rmse_harmonie": float(np.sqrt(np.mean(harmonie_sq))),
+        "model_win_rate": float(np.mean(model_abs < harmonie_abs)),
+        "interpolation_method": "linear",
+        "segments": segment_summaries,
+    }
 
 
 def _find_dayahead_snapshot(out_dir: Path, target_day_local: date) -> Path | None:
@@ -3191,6 +3502,7 @@ def save_model_gate_eval_history_plot(
     challenger_color = "#1f77b4"
     champion_color = "#ff7f0e"
     harmonie_color = "gray"
+    plot_meta_text = _format_last_plot_update_text(datetime.now(timezone.utc).isoformat(), local_tz)
     champion_model_id = None
     challenger_model_id = None
     harmonie_label = "Harmonie prediction"
@@ -3293,6 +3605,17 @@ def save_model_gate_eval_history_plot(
                 ax_top.grid(axis="y", alpha=0.3)
                 ax_top.margins(x=0, y=0)
                 ax_top.set_xlim(x_start_local, x_end_local)
+                ax_top.text(
+                    0.015,
+                    1.10,
+                    plot_meta_text,
+                    transform=ax_top.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=9,
+                    color="black",
+                    clip_on=False,
+                )
                 ymax = np.nanmax(
                     [
                         det_view["actual_wind_speed"].max(skipna=True),
@@ -3519,7 +3842,7 @@ def save_model_gate_eval_history_plot(
                 bottom_legend.patch.set_edgecolor("none")
                 ax_bottom.add_artist(bottom_legend)
 
-                fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
+                fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.10)
                 fig.savefig(plot_png, dpi=150)
                 plt.close(fig)
                 return
@@ -3584,6 +3907,17 @@ def save_model_gate_eval_history_plot(
     ax_top.grid(axis="y", alpha=0.3)
     ax_top.legend(loc="upper left", fontsize=9)
     ax_top.margins(x=0, y=0)
+    ax_top.text(
+        0.015,
+        1.10,
+        plot_meta_text,
+        transform=ax_top.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="black",
+        clip_on=False,
+    )
     samples_top = np.nanmax([hist["speed_eval_samples"].max(skipna=True), 1.0])
     ax_top.set_ylim(0.0, max(10.0, float(samples_top) * 1.08))
 
@@ -3633,7 +3967,7 @@ def save_model_gate_eval_history_plot(
     ax_bottom.xaxis.set_major_locator(date_locator)
     ax_bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
     ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.10)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.10)
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
 
@@ -3950,6 +4284,13 @@ def main() -> None:
     gate_eval_details_csv_src: Path | None = None
     intraday_gate_eval_details_csv_src: Path | None = None
     speed_calibration: dict | None = None
+    pre_run_champion_states = _load_active_champion_states(
+        speed_model_path=speed_model_path,
+        direction_model_path=direction_model_path,
+        intraday_model_path=intraday_model_path,
+        device=device,
+        local_tz=args.local_timezone,
+    )
 
     if args.skip_training:
         for p in [
@@ -4724,7 +5065,18 @@ def main() -> None:
 
     test_suffix = f"_test_hour_{int(args.test_now_local_hour):02d}" if is_test_mode else ""
     current_day_prior_prediction_tables: list[pd.DataFrame] = []
-    current_day_fixed_origin_mae: list[dict] = []
+    current_day_live_monitoring_metric: dict = {
+        "available": False,
+        "point_count": 0,
+        "completed_interval_count": 0,
+        "partial_current_interval_included": False,
+        "mae_superlocal": None,
+        "mae_harmonie": None,
+        "rmse_superlocal": None,
+        "rmse_harmonie": None,
+        "model_win_rate": None,
+        "segments": [],
+    }
     current_day_target_local = datetime.now(ZoneInfo(args.local_timezone)).date()
     latest_prior_prediction_table = None
     if not is_test_mode:
@@ -4826,22 +5178,12 @@ def main() -> None:
     current_day_snapshot_csv = None
     if not is_test_mode and not current_day_table.empty:
         current_day_target_local = pd.to_datetime(current_day_table["time_local"]).dt.tz_convert(ZoneInfo(args.local_timezone)).iloc[0].date()
-        conn = sqlite3.connect(str(db_path))
-        try:
-            actual_raw_utc = _load_observations_raw(conn, cfg.site)
-        finally:
-            conn.close()
-        actual_measurements = actual_raw_utc.tz_convert(ZoneInfo(args.local_timezone)).reset_index().rename(
-            columns={"obs_dt": "time_local", "actual_avg": "actual_wind_speed"}
-        )
-        actual_measurements = actual_measurements[
-            actual_measurements["time_local"].dt.date.eq(current_day_target_local)
-        ][["time_local", "actual_wind_speed"]].copy()
-        current_day_fixed_origin_mae = compute_fixed_origin_current_day_mae(
-            current_table=current_day_table,
+        current_day_live_monitoring_metric = compute_current_day_completed_interval_mae(
+            db_path=db_path,
+            site=cfg.site,
+            target_day_local=current_day_target_local,
+            local_tz=args.local_timezone,
             prior_prediction_tables=current_day_prior_prediction_tables,
-            actual_measurements=actual_measurements,
-            lookback_hours=(1, 3, 6),
         )
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
@@ -4854,7 +5196,7 @@ def main() -> None:
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
-        fixed_origin_mae_metrics=current_day_fixed_origin_mae,
+        live_monitoring_metric=current_day_live_monitoring_metric,
     )
     save_current_day_plot(
         current_day_table,
@@ -4864,7 +5206,7 @@ def main() -> None:
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
-        fixed_origin_mae_metrics=current_day_fixed_origin_mae,
+        live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
     )
     if not is_test_mode:
@@ -4996,6 +5338,43 @@ def main() -> None:
                 branch=args.git_branch,
             )
 
+    post_run_champion_states = _load_active_champion_states(
+        speed_model_path=speed_model_path,
+        direction_model_path=direction_model_path,
+        intraday_model_path=intraday_model_path,
+        device=device,
+        local_tz=args.local_timezone,
+    )
+    champion_refresh_summary = {
+        "requested": not bool(args.skip_training),
+        "completed": not bool(args.skip_training),
+        "reused_entrypoint": "update_model_and_predict.py (training enabled)",
+        "gate_logic_enforced": {
+            "next_day": not bool(args.skip_training),
+            "intraday": not bool(args.skip_training),
+        },
+        "pre_run": pre_run_champion_states,
+        "post_run": post_run_champion_states,
+        "active_next_day_speed_model_id": post_run_champion_states["next_day_speed"].get("model_id"),
+        "active_next_day_direction_model_id": post_run_champion_states["next_day_direction"].get("model_id"),
+        "active_intraday_model_id": post_run_champion_states["intraday_speed"].get("model_id"),
+        "next_day_speed_selected": model_selection_report.get("speed_selected"),
+        "next_day_direction_selected": model_selection_report.get("direction_selected"),
+        "intraday_selected": intraday_model_selection_report.get("selected"),
+        "next_day_speed_refreshed_this_run": _champion_state_refreshed(
+            pre_run_champion_states.get("next_day_speed"),
+            post_run_champion_states.get("next_day_speed"),
+        ),
+        "next_day_direction_refreshed_this_run": _champion_state_refreshed(
+            pre_run_champion_states.get("next_day_direction"),
+            post_run_champion_states.get("next_day_direction"),
+        ),
+        "intraday_refreshed_this_run": _champion_state_refreshed(
+            pre_run_champion_states.get("intraday_speed"),
+            post_run_champion_states.get("intraday_speed"),
+        ),
+    }
+
     metadata = {
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
         "db_path": str(db_path),
@@ -5059,7 +5438,7 @@ def main() -> None:
         else archived_next_day_plots.get("mobile"),
         "current_day_table_csv": str(current_day_table_path),
         "current_day_snapshot_csv": current_day_snapshot_csv,
-        "current_day_fixed_origin_mae": current_day_fixed_origin_mae,
+        "current_day_live_monitoring_metric": current_day_live_monitoring_metric,
         "current_day_plot_png": str(current_day_plot_path),
         "current_day_plot_archived_png": archived_current_day_plot,
         "daily_mae_history_csv": daily_mae_csv,
@@ -5093,6 +5472,7 @@ def main() -> None:
         if intraday_gate_eval_details_csv_src is None
         else str(intraday_gate_eval_details_csv_src),
         "intraday_model_selection_gate": intraday_model_selection_report,
+        "champion_refresh_summary": champion_refresh_summary,
         "data_refresh": refresh_info,
         "model_selection_gate": model_selection_report,
         "challenge_eval_split": args.challenge_eval_split,
@@ -5142,6 +5522,15 @@ def main() -> None:
             f"selected={intraday_model_selection_report.get('selected')} | "
             f"promoted={intraday_model_selection_report.get('promote_intraday')}"
         )
+    print(
+        "Champion refresh | "
+        f"next-day speed refreshed={champion_refresh_summary.get('next_day_speed_refreshed_this_run')} "
+        f"selected={champion_refresh_summary.get('next_day_speed_selected')} | "
+        f"next-day direction refreshed={champion_refresh_summary.get('next_day_direction_refreshed_this_run')} "
+        f"selected={champion_refresh_summary.get('next_day_direction_selected')} | "
+        f"intraday refreshed={champion_refresh_summary.get('intraday_refreshed_this_run')} "
+        f"selected={champion_refresh_summary.get('intraday_selected')}"
+    )
     if web_publish is not None:
         print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
     if args.git_auto_push_pages:

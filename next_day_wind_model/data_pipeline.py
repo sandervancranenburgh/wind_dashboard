@@ -611,7 +611,7 @@ def _build_vintage_aware_samples(
     cfg: DatasetConfig,
     actual_col: str,
     forecast_target_col: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
     conn = sqlite3.connect(str(db_path))
     try:
@@ -624,6 +624,10 @@ def _build_vintage_aware_samples(
     y_actual_list: List[np.ndarray] = []
     y_forecast_list: List[np.ndarray] = []
     timestamps: List[str] = []
+    target_times_list: List[np.ndarray] = []
+    target_run_ts_list: List[np.ndarray] = []
+    target_fetched_ts_list: List[np.ndarray] = []
+    target_horizon_hr_list: List[np.ndarray] = []
 
     window = cfg.window_hours
     horizon = cfg.target_hours
@@ -657,6 +661,10 @@ def _build_vintage_aware_samples(
         y_actual_list.append(actual_next)
         y_forecast_list.append(forecast_next)
         timestamps.append(anchor_time.isoformat())
+        target_times_list.append(np.array([ts.isoformat() for ts in target_times], dtype=object))
+        target_run_ts_list.append(target_frame["run_ts"].to_numpy(dtype=np.int64))
+        target_fetched_ts_list.append(target_frame["fetched_ts"].to_numpy(dtype=np.int64))
+        target_horizon_hr_list.append(target_frame["horizon_hr"].to_numpy(dtype=np.float32))
 
     if not X_list:
         raise ValueError("No vintage-aware training samples could be built with the current window/horizon settings.")
@@ -664,7 +672,20 @@ def _build_vintage_aware_samples(
     X_raw = np.stack(X_list).astype(np.float32)
     y_actual_raw = np.stack(y_actual_list).astype(np.float32)
     y_forecast_raw = np.stack(y_forecast_list).astype(np.float32)
-    return X_raw, y_actual_raw, y_forecast_raw, np.array(timestamps)
+    target_times_all = np.stack(target_times_list)
+    target_run_ts_all = np.stack(target_run_ts_list).astype(np.int64)
+    target_fetched_ts_all = np.stack(target_fetched_ts_list).astype(np.int64)
+    target_horizon_hr_all = np.stack(target_horizon_hr_list).astype(np.float32)
+    return (
+        X_raw,
+        y_actual_raw,
+        y_forecast_raw,
+        np.array(timestamps),
+        target_times_all,
+        target_run_ts_all,
+        target_fetched_ts_all,
+        target_horizon_hr_all,
+    )
 
 
 def build_all_training_arrays(
@@ -675,7 +696,16 @@ def build_all_training_arrays(
     target_mode = _resolve_target_mode(target_mode)
     feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
     target_col = "actual_avg"
-    X_raw, y_actual_raw, y_forecast_raw, timestamps = _build_vintage_aware_samples(
+    (
+        X_raw,
+        y_actual_raw,
+        y_forecast_raw,
+        timestamps,
+        target_times_all,
+        target_run_ts_all,
+        target_fetched_ts_all,
+        target_horizon_hr_all,
+    ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col=target_col,
@@ -696,6 +726,10 @@ def build_all_training_arrays(
         "y_all": y_scaled,
         "y_actual_all_raw": y_actual_raw,
         "y_forecast_all_raw": y_forecast_raw,
+        "target_times_all": target_times_all,
+        "target_run_ts_all": target_run_ts_all,
+        "target_fetched_ts_all": target_fetched_ts_all,
+        "target_horizon_hr_all": target_horizon_hr_all,
         "x_mean": x_mean,
         "x_std": x_std,
         "y_mean": np.array([y_mean], dtype=np.float32),
@@ -715,7 +749,16 @@ def build_training_arrays(
     target_mode = _resolve_target_mode(target_mode)
     feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
     target_col = "actual_avg"
-    X_raw, y_actual_raw, y_forecast_raw, timestamps = _build_vintage_aware_samples(
+    (
+        X_raw,
+        y_actual_raw,
+        y_forecast_raw,
+        timestamps,
+        target_times_all,
+        target_run_ts_all,
+        target_fetched_ts_all,
+        target_horizon_hr_all,
+    ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col=target_col,
@@ -752,6 +795,10 @@ def build_training_arrays(
         "y_actual_val_raw": y_val_actual_raw,
         "y_forecast_train_raw": y_train_forecast_raw,
         "y_forecast_val_raw": y_val_forecast_raw,
+        "target_times_all": target_times_all,
+        "target_run_ts_all": target_run_ts_all,
+        "target_fetched_ts_all": target_fetched_ts_all,
+        "target_horizon_hr_all": target_horizon_hr_all,
         "x_mean": x_mean,
         "x_std": x_std,
         "y_mean": np.array([y_mean], dtype=np.float32),
@@ -768,7 +815,16 @@ def build_all_direction_training_arrays(
     cfg: DatasetConfig,
 ) -> Dict[str, np.ndarray | List[str]]:
     feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
-    X_raw, y_actual_raw, y_forecast_raw, timestamps = _build_vintage_aware_samples(
+    (
+        X_raw,
+        y_actual_raw,
+        y_forecast_raw,
+        timestamps,
+        target_times_all,
+        target_run_ts_all,
+        target_fetched_ts_all,
+        target_horizon_hr_all,
+    ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col="actual_dir",
@@ -786,6 +842,10 @@ def build_all_direction_training_arrays(
         "y_all": y_scaled,
         "y_actual_all_raw": y_actual_raw,
         "y_forecast_all_raw": y_forecast_raw,
+        "target_times_all": target_times_all,
+        "target_run_ts_all": target_run_ts_all,
+        "target_fetched_ts_all": target_fetched_ts_all,
+        "target_horizon_hr_all": target_horizon_hr_all,
         "x_mean": x_mean,
         "x_std": x_std,
         "y_mean": np.array([y_mean], dtype=np.float32),

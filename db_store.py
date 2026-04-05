@@ -802,6 +802,158 @@ def load_prediction_evaluation_summary(
     ]
 
 
+def _load_prediction_log_realized_rows(
+    conn: sqlite3.Connection,
+    *,
+    site: Optional[str] = None,
+    model_type: Optional[str] = None,
+    prediction_kind: Optional[str] = None,
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
+    issued_ts_from_ms: Optional[int] = None,
+    issued_ts_to_ms: Optional[int] = None,
+    target_ts_from_ms: Optional[int] = None,
+    target_ts_to_ms: Optional[int] = None,
+    min_horizon_hr: Optional[float] = None,
+    max_horizon_hr: Optional[float] = None,
+    frozen_next_day: bool = False,
+) -> list[tuple[int, int, Optional[float], float, float, float, float, float, float]]:
+    filters = [
+        "pl.actual_value IS NOT NULL",
+        "pl.model_error IS NOT NULL",
+        "pl.harmonie_error IS NOT NULL",
+        "pl.model_abs_error IS NOT NULL",
+        "pl.harmonie_abs_error IS NOT NULL",
+        "pl.model_sq_error IS NOT NULL",
+        "pl.harmonie_sq_error IS NOT NULL",
+    ]
+    params: list[Any] = []
+    if site is not None:
+        filters.append("pl.site = ?")
+        params.append(site)
+    if model_type is not None:
+        filters.append("pl.model_type = ?")
+        params.append(model_type)
+    if prediction_kind is not None:
+        filters.append("pl.prediction_kind = ?")
+        params.append(prediction_kind)
+    if model_artifact is not None:
+        filters.append("pl.model_artifact = ?")
+        params.append(model_artifact)
+    if model_version is not None:
+        filters.append("pl.model_version = ?")
+        params.append(model_version)
+    if issued_ts_from_ms is not None:
+        filters.append("pl.issued_ts >= ?")
+        params.append(int(issued_ts_from_ms))
+    if issued_ts_to_ms is not None:
+        filters.append("pl.issued_ts <= ?")
+        params.append(int(issued_ts_to_ms))
+    if target_ts_from_ms is not None:
+        filters.append("pl.target_ts >= ?")
+        params.append(int(target_ts_from_ms))
+    if target_ts_to_ms is not None:
+        filters.append("pl.target_ts <= ?")
+        params.append(int(target_ts_to_ms))
+    if min_horizon_hr is not None:
+        filters.append("pl.horizon_hr >= ?")
+        params.append(float(min_horizon_hr))
+    if max_horizon_hr is not None:
+        filters.append("pl.horizon_hr <= ?")
+        params.append(float(max_horizon_hr))
+
+    if frozen_next_day:
+        first_issue_filters = ["1 = 1"]
+        first_issue_params: list[Any] = []
+        if site is not None:
+            first_issue_filters.append("site = ?")
+            first_issue_params.append(site)
+        if model_type is not None:
+            first_issue_filters.append("model_type = ?")
+            first_issue_params.append(model_type)
+        if prediction_kind is not None:
+            first_issue_filters.append("prediction_kind = ?")
+            first_issue_params.append(prediction_kind)
+        if model_artifact is not None:
+            first_issue_filters.append("model_artifact = ?")
+            first_issue_params.append(model_artifact)
+        if model_version is not None:
+            first_issue_filters.append("model_version = ?")
+            first_issue_params.append(model_version)
+
+        rows = conn.execute(
+            f"""
+            WITH first_issue AS (
+                SELECT
+                    site,
+                    model_type,
+                    prediction_kind,
+                    anchor_ts,
+                    target_ts,
+                    MIN(issued_ts) AS issued_ts
+                FROM {PREDICTION_LOG_TABLE}
+                WHERE {" AND ".join(first_issue_filters)}
+                GROUP BY site, model_type, prediction_kind, anchor_ts, target_ts
+            )
+            SELECT
+                pl.issued_ts,
+                pl.target_ts,
+                pl.horizon_hr,
+                pl.model_error,
+                pl.harmonie_error,
+                pl.model_abs_error,
+                pl.harmonie_abs_error,
+                pl.model_sq_error,
+                pl.harmonie_sq_error
+            FROM {PREDICTION_LOG_TABLE} AS pl
+            INNER JOIN first_issue AS fi
+                ON pl.site = fi.site
+               AND pl.model_type = fi.model_type
+               AND pl.prediction_kind = fi.prediction_kind
+               AND pl.anchor_ts = fi.anchor_ts
+               AND pl.target_ts = fi.target_ts
+               AND pl.issued_ts = fi.issued_ts
+            WHERE {" AND ".join(filters)}
+            ORDER BY pl.issued_ts ASC, pl.target_ts ASC
+            """,
+            [*first_issue_params, *params],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT
+                pl.issued_ts,
+                pl.target_ts,
+                pl.horizon_hr,
+                pl.model_error,
+                pl.harmonie_error,
+                pl.model_abs_error,
+                pl.harmonie_abs_error,
+                pl.model_sq_error,
+                pl.harmonie_sq_error
+            FROM {PREDICTION_LOG_TABLE} AS pl
+            WHERE {" AND ".join(filters)}
+            ORDER BY pl.issued_ts ASC, pl.target_ts ASC
+            """,
+            params,
+        ).fetchall()
+
+    return [
+        (
+            int(row[0]),
+            int(row[1]),
+            None if row[2] is None else float(row[2]),
+            float(row[3]),
+            float(row[4]),
+            float(row[5]),
+            float(row[6]),
+            float(row[7]),
+            float(row[8]),
+        )
+        for row in rows
+    ]
+
+
 def _utc_day_string(ms: int) -> str:
     return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -822,6 +974,11 @@ def _finalize_error_summary(
     harmonie_abs_sum: float,
     model_sq_sum: float,
     harmonie_sq_sum: float,
+    model_error_sum: float = 0.0,
+    harmonie_error_sum: float = 0.0,
+    model_win_count: int = 0,
+    harmonie_win_count: int = 0,
+    tie_count: int = 0,
 ) -> Dict[str, Any]:
     if count <= 0:
         return {
@@ -830,10 +987,18 @@ def _finalize_error_summary(
             "harmonie_mae": None,
             "model_rmse": None,
             "harmonie_rmse": None,
+            "model_bias": None,
+            "harmonie_bias": None,
             "mae_improvement": None,
             "rmse_improvement": None,
             "mae_improvement_pct": None,
             "rmse_improvement_pct": None,
+            "model_win_count_vs_harmonie": 0,
+            "harmonie_win_count_vs_model": 0,
+            "tie_count": 0,
+            "model_win_rate_vs_harmonie": None,
+            "harmonie_win_rate_vs_model": None,
+            "tie_rate": None,
         }
 
     model_mae = float(model_abs_sum / count)
@@ -846,10 +1011,18 @@ def _finalize_error_summary(
         "harmonie_mae": harmonie_mae,
         "model_rmse": model_rmse,
         "harmonie_rmse": harmonie_rmse,
+        "model_bias": float(model_error_sum / count),
+        "harmonie_bias": float(harmonie_error_sum / count),
         "mae_improvement": float(harmonie_mae - model_mae),
         "rmse_improvement": float(harmonie_rmse - model_rmse),
         "mae_improvement_pct": _safe_pct_improvement(harmonie_mae, model_mae),
         "rmse_improvement_pct": _safe_pct_improvement(harmonie_rmse, model_rmse),
+        "model_win_count_vs_harmonie": int(model_win_count),
+        "harmonie_win_count_vs_model": int(harmonie_win_count),
+        "tie_count": int(tie_count),
+        "model_win_rate_vs_harmonie": float(model_win_count / count),
+        "harmonie_win_rate_vs_model": float(harmonie_win_count / count),
+        "tie_rate": float(tie_count / count),
     }
 
 
@@ -857,11 +1030,13 @@ def _load_next_day_realized_rows(
     conn: sqlite3.Connection,
     site: Optional[str] = None,
     prediction_kind: str = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
     issued_ts_from_ms: Optional[int] = None,
     issued_ts_to_ms: Optional[int] = None,
     target_ts_from_ms: Optional[int] = None,
     target_ts_to_ms: Optional[int] = None,
-) -> list[tuple[int, int, Optional[float], float, float, float, float]]:
+) -> list[tuple[int, int, Optional[float], float, float, float, float, float, float]]:
     """
     Load realised frozen next-day evaluation rows from prediction_log.
 
@@ -871,81 +1046,19 @@ def _load_next_day_realized_rows(
     When the same anchor_ts/target_ts was rerun later, we keep the earliest
     issued_ts branch so frozen next-day reporting does not drift with reruns.
     """
-    first_issue_filters = [
-        "model_type = 'next_day'",
-        "prediction_kind = ?",
-    ]
-    first_issue_params: list[Any] = [prediction_kind]
-    if site is not None:
-        first_issue_filters.append("site = ?")
-        first_issue_params.append(site)
-
-    filters = [
-        "pl.actual_value IS NOT NULL",
-        "pl.model_abs_error IS NOT NULL",
-        "pl.harmonie_abs_error IS NOT NULL",
-        "pl.model_sq_error IS NOT NULL",
-        "pl.harmonie_sq_error IS NOT NULL",
-    ]
-    params: list[Any] = []
-    if issued_ts_from_ms is not None:
-        filters.append("pl.issued_ts >= ?")
-        params.append(int(issued_ts_from_ms))
-    if issued_ts_to_ms is not None:
-        filters.append("pl.issued_ts <= ?")
-        params.append(int(issued_ts_to_ms))
-    if target_ts_from_ms is not None:
-        filters.append("pl.target_ts >= ?")
-        params.append(int(target_ts_from_ms))
-    if target_ts_to_ms is not None:
-        filters.append("pl.target_ts <= ?")
-        params.append(int(target_ts_to_ms))
-
-    rows = conn.execute(
-        f"""
-        WITH first_issue AS (
-            SELECT
-                site,
-                prediction_kind,
-                anchor_ts,
-                target_ts,
-                MIN(issued_ts) AS issued_ts
-            FROM {PREDICTION_LOG_TABLE}
-            WHERE {" AND ".join(first_issue_filters)}
-            GROUP BY site, prediction_kind, anchor_ts, target_ts
-        )
-        SELECT
-            pl.issued_ts,
-            pl.target_ts,
-            pl.horizon_hr,
-            pl.model_abs_error,
-            pl.harmonie_abs_error,
-            pl.model_sq_error,
-            pl.harmonie_sq_error
-        FROM {PREDICTION_LOG_TABLE} AS pl
-        INNER JOIN first_issue AS fi
-            ON pl.site = fi.site
-           AND pl.prediction_kind = fi.prediction_kind
-           AND pl.anchor_ts = fi.anchor_ts
-           AND pl.target_ts = fi.target_ts
-           AND pl.issued_ts = fi.issued_ts
-        WHERE {" AND ".join(filters)}
-        ORDER BY pl.issued_ts ASC, pl.target_ts ASC
-        """,
-        [*first_issue_params, *params],
-    ).fetchall()
-    return [
-        (
-            int(row[0]),
-            int(row[1]),
-            None if row[2] is None else float(row[2]),
-            float(row[3]),
-            float(row[4]),
-            float(row[5]),
-            float(row[6]),
-        )
-        for row in rows
-    ]
+    return _load_prediction_log_realized_rows(
+        conn,
+        site=site,
+        model_type="next_day",
+        prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
+        issued_ts_from_ms=issued_ts_from_ms,
+        issued_ts_to_ms=issued_ts_to_ms,
+        target_ts_from_ms=target_ts_from_ms,
+        target_ts_to_ms=target_ts_to_ms,
+        frozen_next_day=True,
+    )
 
 
 def load_next_day_realized_detail_rows(
@@ -1045,6 +1158,8 @@ def summarize_next_day_vs_harmonie(
     conn: sqlite3.Connection,
     site: Optional[str] = None,
     prediction_kind: str = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
     issued_ts_from_ms: Optional[int] = None,
     issued_ts_to_ms: Optional[int] = None,
     target_ts_from_ms: Optional[int] = None,
@@ -1061,6 +1176,8 @@ def summarize_next_day_vs_harmonie(
         conn,
         site=site,
         prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
         issued_ts_from_ms=issued_ts_from_ms,
         issued_ts_to_ms=issued_ts_to_ms,
         target_ts_from_ms=target_ts_from_ms,
@@ -1068,16 +1185,23 @@ def summarize_next_day_vs_harmonie(
     )
     summary = _finalize_error_summary(
         count=len(rows),
-        model_abs_sum=sum(row[3] for row in rows),
-        harmonie_abs_sum=sum(row[4] for row in rows),
-        model_sq_sum=sum(row[5] for row in rows),
-        harmonie_sq_sum=sum(row[6] for row in rows),
+        model_error_sum=sum(row[3] for row in rows),
+        harmonie_error_sum=sum(row[4] for row in rows),
+        model_abs_sum=sum(row[5] for row in rows),
+        harmonie_abs_sum=sum(row[6] for row in rows),
+        model_sq_sum=sum(row[7] for row in rows),
+        harmonie_sq_sum=sum(row[8] for row in rows),
+        model_win_count=sum(1 for row in rows if row[5] < row[6]),
+        harmonie_win_count=sum(1 for row in rows if row[6] < row[5]),
+        tie_count=sum(1 for row in rows if row[5] == row[6]),
     )
     summary.update(
         {
             "site": site,
             "model_type": "next_day",
             "prediction_kind": prediction_kind,
+            "model_artifact": model_artifact,
+            "model_version": model_version,
             "issued_ts_from_ms": issued_ts_from_ms,
             "issued_ts_to_ms": issued_ts_to_ms,
             "target_ts_from_ms": target_ts_from_ms,
@@ -1091,6 +1215,8 @@ def summarize_next_day_vs_harmonie_by_issued_day(
     conn: sqlite3.Connection,
     site: Optional[str] = None,
     prediction_kind: str = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
     issued_ts_from_ms: Optional[int] = None,
     issued_ts_to_ms: Optional[int] = None,
     target_ts_from_ms: Optional[int] = None,
@@ -1107,33 +1233,59 @@ def summarize_next_day_vs_harmonie_by_issued_day(
         conn,
         site=site,
         prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
         issued_ts_from_ms=issued_ts_from_ms,
         issued_ts_to_ms=issued_ts_to_ms,
         target_ts_from_ms=target_ts_from_ms,
         target_ts_to_ms=target_ts_to_ms,
     )
     grouped: Dict[str, Dict[str, float | int]] = {}
-    for issued_ts, _target_ts, _horizon_hr, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
+    for issued_ts, _target_ts, _horizon_hr, model_error, harmonie_error, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
         issued_day = _utc_day_string(issued_ts)
         bucket = grouped.setdefault(
             issued_day,
-            {"count": 0, "model_abs_sum": 0.0, "harmonie_abs_sum": 0.0, "model_sq_sum": 0.0, "harmonie_sq_sum": 0.0},
+            {
+                "count": 0,
+                "model_error_sum": 0.0,
+                "harmonie_error_sum": 0.0,
+                "model_abs_sum": 0.0,
+                "harmonie_abs_sum": 0.0,
+                "model_sq_sum": 0.0,
+                "harmonie_sq_sum": 0.0,
+                "model_win_count": 0,
+                "harmonie_win_count": 0,
+                "tie_count": 0,
+            },
         )
         bucket["count"] += 1
+        bucket["model_error_sum"] += model_error
+        bucket["harmonie_error_sum"] += harmonie_error
         bucket["model_abs_sum"] += model_abs
         bucket["harmonie_abs_sum"] += harmonie_abs
         bucket["model_sq_sum"] += model_sq
         bucket["harmonie_sq_sum"] += harmonie_sq
+        if model_abs < harmonie_abs:
+            bucket["model_win_count"] += 1
+        elif harmonie_abs < model_abs:
+            bucket["harmonie_win_count"] += 1
+        else:
+            bucket["tie_count"] += 1
 
     out: list[Dict[str, Any]] = []
     for issued_day in sorted(grouped):
         bucket = grouped[issued_day]
         summary = _finalize_error_summary(
             count=int(bucket["count"]),
+            model_error_sum=float(bucket["model_error_sum"]),
+            harmonie_error_sum=float(bucket["harmonie_error_sum"]),
             model_abs_sum=float(bucket["model_abs_sum"]),
             harmonie_abs_sum=float(bucket["harmonie_abs_sum"]),
             model_sq_sum=float(bucket["model_sq_sum"]),
             harmonie_sq_sum=float(bucket["harmonie_sq_sum"]),
+            model_win_count=int(bucket["model_win_count"]),
+            harmonie_win_count=int(bucket["harmonie_win_count"]),
+            tie_count=int(bucket["tie_count"]),
         )
         summary.update(
             {
@@ -1141,6 +1293,8 @@ def summarize_next_day_vs_harmonie_by_issued_day(
                 "site": site,
                 "model_type": "next_day",
                 "prediction_kind": prediction_kind,
+                "model_artifact": model_artifact,
+                "model_version": model_version,
             }
         )
         out.append(summary)
@@ -1151,6 +1305,8 @@ def summarize_next_day_vs_harmonie_by_horizon(
     conn: sqlite3.Connection,
     site: Optional[str] = None,
     prediction_kind: str = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
     issued_ts_from_ms: Optional[int] = None,
     issued_ts_to_ms: Optional[int] = None,
     target_ts_from_ms: Optional[int] = None,
@@ -1167,35 +1323,61 @@ def summarize_next_day_vs_harmonie_by_horizon(
         conn,
         site=site,
         prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
         issued_ts_from_ms=issued_ts_from_ms,
         issued_ts_to_ms=issued_ts_to_ms,
         target_ts_from_ms=target_ts_from_ms,
         target_ts_to_ms=target_ts_to_ms,
     )
     grouped: Dict[int, Dict[str, float | int]] = {}
-    for _issued_ts, _target_ts, horizon_hr, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
+    for _issued_ts, _target_ts, horizon_hr, model_error, harmonie_error, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
         if horizon_hr is None:
             continue
         horizon_key = int(round(horizon_hr))
         bucket = grouped.setdefault(
             horizon_key,
-            {"count": 0, "model_abs_sum": 0.0, "harmonie_abs_sum": 0.0, "model_sq_sum": 0.0, "harmonie_sq_sum": 0.0},
+            {
+                "count": 0,
+                "model_error_sum": 0.0,
+                "harmonie_error_sum": 0.0,
+                "model_abs_sum": 0.0,
+                "harmonie_abs_sum": 0.0,
+                "model_sq_sum": 0.0,
+                "harmonie_sq_sum": 0.0,
+                "model_win_count": 0,
+                "harmonie_win_count": 0,
+                "tie_count": 0,
+            },
         )
         bucket["count"] += 1
+        bucket["model_error_sum"] += model_error
+        bucket["harmonie_error_sum"] += harmonie_error
         bucket["model_abs_sum"] += model_abs
         bucket["harmonie_abs_sum"] += harmonie_abs
         bucket["model_sq_sum"] += model_sq
         bucket["harmonie_sq_sum"] += harmonie_sq
+        if model_abs < harmonie_abs:
+            bucket["model_win_count"] += 1
+        elif harmonie_abs < model_abs:
+            bucket["harmonie_win_count"] += 1
+        else:
+            bucket["tie_count"] += 1
 
     out: list[Dict[str, Any]] = []
     for horizon_hr in sorted(grouped):
         bucket = grouped[horizon_hr]
         summary = _finalize_error_summary(
             count=int(bucket["count"]),
+            model_error_sum=float(bucket["model_error_sum"]),
+            harmonie_error_sum=float(bucket["harmonie_error_sum"]),
             model_abs_sum=float(bucket["model_abs_sum"]),
             harmonie_abs_sum=float(bucket["harmonie_abs_sum"]),
             model_sq_sum=float(bucket["model_sq_sum"]),
             harmonie_sq_sum=float(bucket["harmonie_sq_sum"]),
+            model_win_count=int(bucket["model_win_count"]),
+            harmonie_win_count=int(bucket["harmonie_win_count"]),
+            tie_count=int(bucket["tie_count"]),
         )
         summary.update(
             {
@@ -1203,6 +1385,258 @@ def summarize_next_day_vs_harmonie_by_horizon(
                 "site": site,
                 "model_type": "next_day",
                 "prediction_kind": prediction_kind,
+                "model_artifact": model_artifact,
+                "model_version": model_version,
+            }
+        )
+        out.append(summary)
+    return out
+
+
+def summarize_prediction_log_vs_harmonie(
+    conn: sqlite3.Connection,
+    *,
+    site: Optional[str] = None,
+    model_type: Optional[str] = None,
+    prediction_kind: Optional[str] = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
+    issued_ts_from_ms: Optional[int] = None,
+    issued_ts_to_ms: Optional[int] = None,
+    target_ts_from_ms: Optional[int] = None,
+    target_ts_to_ms: Optional[int] = None,
+    min_horizon_hr: Optional[float] = None,
+    max_horizon_hr: Optional[float] = None,
+    frozen_next_day: bool = False,
+) -> Dict[str, Any]:
+    rows = _load_prediction_log_realized_rows(
+        conn,
+        site=site,
+        model_type=model_type,
+        prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
+        issued_ts_from_ms=issued_ts_from_ms,
+        issued_ts_to_ms=issued_ts_to_ms,
+        target_ts_from_ms=target_ts_from_ms,
+        target_ts_to_ms=target_ts_to_ms,
+        min_horizon_hr=min_horizon_hr,
+        max_horizon_hr=max_horizon_hr,
+        frozen_next_day=frozen_next_day,
+    )
+    summary = _finalize_error_summary(
+        count=len(rows),
+        model_error_sum=sum(row[3] for row in rows),
+        harmonie_error_sum=sum(row[4] for row in rows),
+        model_abs_sum=sum(row[5] for row in rows),
+        harmonie_abs_sum=sum(row[6] for row in rows),
+        model_sq_sum=sum(row[7] for row in rows),
+        harmonie_sq_sum=sum(row[8] for row in rows),
+        model_win_count=sum(1 for row in rows if row[5] < row[6]),
+        harmonie_win_count=sum(1 for row in rows if row[6] < row[5]),
+        tie_count=sum(1 for row in rows if row[5] == row[6]),
+    )
+    summary.update(
+        {
+            "site": site,
+            "model_type": model_type,
+            "prediction_kind": prediction_kind,
+            "model_artifact": model_artifact,
+            "model_version": model_version,
+            "issued_ts_from_ms": issued_ts_from_ms,
+            "issued_ts_to_ms": issued_ts_to_ms,
+            "target_ts_from_ms": target_ts_from_ms,
+            "target_ts_to_ms": target_ts_to_ms,
+            "min_horizon_hr": min_horizon_hr,
+            "max_horizon_hr": max_horizon_hr,
+            "frozen_next_day": bool(frozen_next_day),
+        }
+    )
+    return summary
+
+
+def summarize_prediction_log_vs_harmonie_by_issued_day(
+    conn: sqlite3.Connection,
+    *,
+    site: Optional[str] = None,
+    model_type: Optional[str] = None,
+    prediction_kind: Optional[str] = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
+    issued_ts_from_ms: Optional[int] = None,
+    issued_ts_to_ms: Optional[int] = None,
+    target_ts_from_ms: Optional[int] = None,
+    target_ts_to_ms: Optional[int] = None,
+    min_horizon_hr: Optional[float] = None,
+    max_horizon_hr: Optional[float] = None,
+    frozen_next_day: bool = False,
+) -> list[Dict[str, Any]]:
+    rows = _load_prediction_log_realized_rows(
+        conn,
+        site=site,
+        model_type=model_type,
+        prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
+        issued_ts_from_ms=issued_ts_from_ms,
+        issued_ts_to_ms=issued_ts_to_ms,
+        target_ts_from_ms=target_ts_from_ms,
+        target_ts_to_ms=target_ts_to_ms,
+        min_horizon_hr=min_horizon_hr,
+        max_horizon_hr=max_horizon_hr,
+        frozen_next_day=frozen_next_day,
+    )
+    grouped: Dict[str, Dict[str, float | int]] = {}
+    for issued_ts, _target_ts, _horizon_hr, model_error, harmonie_error, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
+        issued_day = _utc_day_string(issued_ts)
+        bucket = grouped.setdefault(
+            issued_day,
+            {
+                "count": 0,
+                "model_error_sum": 0.0,
+                "harmonie_error_sum": 0.0,
+                "model_abs_sum": 0.0,
+                "harmonie_abs_sum": 0.0,
+                "model_sq_sum": 0.0,
+                "harmonie_sq_sum": 0.0,
+                "model_win_count": 0,
+                "harmonie_win_count": 0,
+                "tie_count": 0,
+            },
+        )
+        bucket["count"] += 1
+        bucket["model_error_sum"] += model_error
+        bucket["harmonie_error_sum"] += harmonie_error
+        bucket["model_abs_sum"] += model_abs
+        bucket["harmonie_abs_sum"] += harmonie_abs
+        bucket["model_sq_sum"] += model_sq
+        bucket["harmonie_sq_sum"] += harmonie_sq
+        if model_abs < harmonie_abs:
+            bucket["model_win_count"] += 1
+        elif harmonie_abs < model_abs:
+            bucket["harmonie_win_count"] += 1
+        else:
+            bucket["tie_count"] += 1
+
+    out: list[Dict[str, Any]] = []
+    for issued_day in sorted(grouped):
+        bucket = grouped[issued_day]
+        summary = _finalize_error_summary(
+            count=int(bucket["count"]),
+            model_error_sum=float(bucket["model_error_sum"]),
+            harmonie_error_sum=float(bucket["harmonie_error_sum"]),
+            model_abs_sum=float(bucket["model_abs_sum"]),
+            harmonie_abs_sum=float(bucket["harmonie_abs_sum"]),
+            model_sq_sum=float(bucket["model_sq_sum"]),
+            harmonie_sq_sum=float(bucket["harmonie_sq_sum"]),
+            model_win_count=int(bucket["model_win_count"]),
+            harmonie_win_count=int(bucket["harmonie_win_count"]),
+            tie_count=int(bucket["tie_count"]),
+        )
+        summary.update(
+            {
+                "issued_day_utc": issued_day,
+                "site": site,
+                "model_type": model_type,
+                "prediction_kind": prediction_kind,
+                "model_artifact": model_artifact,
+                "model_version": model_version,
+                "frozen_next_day": bool(frozen_next_day),
+            }
+        )
+        out.append(summary)
+    return out
+
+
+def summarize_prediction_log_vs_harmonie_by_horizon(
+    conn: sqlite3.Connection,
+    *,
+    site: Optional[str] = None,
+    model_type: Optional[str] = None,
+    prediction_kind: Optional[str] = "wind_speed",
+    model_artifact: Optional[str] = None,
+    model_version: Optional[str] = None,
+    issued_ts_from_ms: Optional[int] = None,
+    issued_ts_to_ms: Optional[int] = None,
+    target_ts_from_ms: Optional[int] = None,
+    target_ts_to_ms: Optional[int] = None,
+    min_horizon_hr: Optional[float] = None,
+    max_horizon_hr: Optional[float] = None,
+    frozen_next_day: bool = False,
+) -> list[Dict[str, Any]]:
+    rows = _load_prediction_log_realized_rows(
+        conn,
+        site=site,
+        model_type=model_type,
+        prediction_kind=prediction_kind,
+        model_artifact=model_artifact,
+        model_version=model_version,
+        issued_ts_from_ms=issued_ts_from_ms,
+        issued_ts_to_ms=issued_ts_to_ms,
+        target_ts_from_ms=target_ts_from_ms,
+        target_ts_to_ms=target_ts_to_ms,
+        min_horizon_hr=min_horizon_hr,
+        max_horizon_hr=max_horizon_hr,
+        frozen_next_day=frozen_next_day,
+    )
+    grouped: Dict[int, Dict[str, float | int]] = {}
+    for _issued_ts, _target_ts, horizon_hr, model_error, harmonie_error, model_abs, harmonie_abs, model_sq, harmonie_sq in rows:
+        if horizon_hr is None:
+            continue
+        horizon_key = int(round(horizon_hr))
+        bucket = grouped.setdefault(
+            horizon_key,
+            {
+                "count": 0,
+                "model_error_sum": 0.0,
+                "harmonie_error_sum": 0.0,
+                "model_abs_sum": 0.0,
+                "harmonie_abs_sum": 0.0,
+                "model_sq_sum": 0.0,
+                "harmonie_sq_sum": 0.0,
+                "model_win_count": 0,
+                "harmonie_win_count": 0,
+                "tie_count": 0,
+            },
+        )
+        bucket["count"] += 1
+        bucket["model_error_sum"] += model_error
+        bucket["harmonie_error_sum"] += harmonie_error
+        bucket["model_abs_sum"] += model_abs
+        bucket["harmonie_abs_sum"] += harmonie_abs
+        bucket["model_sq_sum"] += model_sq
+        bucket["harmonie_sq_sum"] += harmonie_sq
+        if model_abs < harmonie_abs:
+            bucket["model_win_count"] += 1
+        elif harmonie_abs < model_abs:
+            bucket["harmonie_win_count"] += 1
+        else:
+            bucket["tie_count"] += 1
+
+    out: list[Dict[str, Any]] = []
+    for horizon_hr in sorted(grouped):
+        bucket = grouped[horizon_hr]
+        summary = _finalize_error_summary(
+            count=int(bucket["count"]),
+            model_error_sum=float(bucket["model_error_sum"]),
+            harmonie_error_sum=float(bucket["harmonie_error_sum"]),
+            model_abs_sum=float(bucket["model_abs_sum"]),
+            harmonie_abs_sum=float(bucket["harmonie_abs_sum"]),
+            model_sq_sum=float(bucket["model_sq_sum"]),
+            harmonie_sq_sum=float(bucket["harmonie_sq_sum"]),
+            model_win_count=int(bucket["model_win_count"]),
+            harmonie_win_count=int(bucket["harmonie_win_count"]),
+            tie_count=int(bucket["tie_count"]),
+        )
+        summary.update(
+            {
+                "horizon_hr": int(horizon_hr),
+                "site": site,
+                "model_type": model_type,
+                "prediction_kind": prediction_kind,
+                "model_artifact": model_artifact,
+                "model_version": model_version,
+                "frozen_next_day": bool(frozen_next_day),
             }
         )
         out.append(summary)

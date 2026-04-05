@@ -17,3 +17,8 @@ next_day_wind_model/artifacts/*.pth
 next_day_wind_model/web_dashboard/*.csv
 next_day_wind_model/web_dashboard/*.png
 data/*.csv
+
+# Archived generated material kept outside the active workflow
+old/artifacts/
+old/data/
+old/plots/

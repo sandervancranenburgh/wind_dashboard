@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +14,7 @@ import pandas as pd
 import torch
 
 from data_pipeline import DatasetConfig, _apply_standardizer, build_all_training_arrays
+from db_store import init_db, log_prediction_batch, materialize_prediction_log_evaluation
 from train_lstm import NextDayLSTM
 from update_model_and_predict import _build_speed_calibration_context, _predict_speed_batch
 
@@ -99,7 +101,7 @@ def _inverse_standardizer(X_scaled: np.ndarray, mean: np.ndarray, std: np.ndarra
     return X_scaled * std.reshape(1, 1, -1) + mean.reshape(1, 1, -1)
 
 
-def _build_frozen_backfill_daily_frame(
+def _build_frozen_backfill_prediction_detail_frame(
     db_path: Path,
     cfg: DatasetConfig,
     model: NextDayLSTM,
@@ -124,6 +126,10 @@ def _build_frozen_backfill_daily_frame(
     y_actual_raw = np.asarray(speed_arrays["y_actual_all_raw"], dtype=np.float32)
     y_forecast_raw = np.asarray(speed_arrays["y_forecast_all_raw"], dtype=np.float32)
     anchor_times_utc = pd.to_datetime(speed_arrays["timestamps"], utc=True, errors="coerce")
+    target_times_all = np.asarray(speed_arrays["target_times_all"], dtype=object)
+    target_run_ts_all = np.asarray(speed_arrays["target_run_ts_all"], dtype=np.int64)
+    target_fetched_ts_all = np.asarray(speed_arrays["target_fetched_ts_all"], dtype=np.int64)
+    target_horizon_hr_all = np.asarray(speed_arrays["target_horizon_hr_all"], dtype=np.float32)
     if anchor_times_utc.isna().any():
         raise ValueError("Canonical backfill samples contain invalid anchor timestamps.")
 
@@ -153,35 +159,169 @@ def _build_frozen_backfill_daily_frame(
     )
 
     tz = ZoneInfo(local_tz)
-    sample_df = pd.DataFrame(
-        {
-            "anchor_time_utc": anchor_times_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "issue_local_time": anchor_times_utc.tz_convert(tz).strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "target_start_utc": target_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "target_start_local": target_start_utc.tz_convert(tz).strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "day_local": target_start_utc.tz_convert(tz).date.astype(str),
-            "mae_forecast": np.mean(np.abs(y_forecast_raw - y_actual_raw), axis=1).astype(float),
-            "mae_lstm": np.mean(np.abs(pred_speed - y_actual_raw), axis=1).astype(float),
-            "avg_actual_wind_speed": np.mean(y_actual_raw, axis=1).astype(float),
-            "avg_forecast_wind_speed": np.mean(y_forecast_raw, axis=1).astype(float),
-            "avg_lstm_wind_speed": np.mean(pred_speed, axis=1).astype(float),
-            "improvement_vs_forecast": (np.mean(np.abs(y_forecast_raw - y_actual_raw), axis=1) - np.mean(np.abs(pred_speed - y_actual_raw), axis=1)).astype(float),
-            "n_points": np.sum(~np.isnan(y_actual_raw), axis=1).astype(int),
-            "evaluation_type": "day_ahead_frozen_backfill",
-        }
-    )
-    sample_df = sample_df.loc[frozen_mask].copy()
-    if sample_df.empty:
+    detail_rows: list[dict[str, object]] = []
+    frozen_indices = np.flatnonzero(frozen_mask)
+    if frozen_indices.size == 0:
         raise ValueError("No frozen day-ahead samples remained after canonical filtering.")
 
-    # One canonical frozen issue per target day: the day-start issue context.
-    sample_df["date"] = sample_df["day_local"]
-    sample_df = sample_df.sort_values(["day_local", "anchor_time_utc"]).drop_duplicates(subset=["day_local"], keep="first")
-    daily_df = sample_df.sort_values("day_local").reset_index(drop=True)
+    for idx in frozen_indices.tolist():
+        anchor_time = anchor_times_utc[idx]
+        target_times = pd.to_datetime(target_times_all[idx], utc=True, errors="coerce")
+        if target_times.isna().any():
+            raise ValueError("Canonical backfill sample contains invalid target timestamps.")
+        issue_local_time = anchor_time.tz_convert(tz)
+        for step, target_time in enumerate(target_times):
+            target_local = target_time.tz_convert(tz)
+            detail_rows.append(
+                {
+                    "anchor_time_utc": anchor_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "anchor_time_local": issue_local_time.isoformat(),
+                    "issued_time_utc": anchor_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "issued_time_local": issue_local_time.isoformat(),
+                    "target_time_utc": target_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "target_time_local": target_local.isoformat(),
+                    "target_day_local": target_local.strftime("%Y-%m-%d"),
+                    "horizon_hr": float(target_horizon_hr_all[idx, step]),
+                    "actual_value": float(y_actual_raw[idx, step]),
+                    "harmonie_value": float(y_forecast_raw[idx, step]),
+                    "prediction_value": float(pred_speed[idx, step]),
+                    "harmonie_run_ts": int(target_run_ts_all[idx, step]),
+                    "harmonie_fetched_ts": int(target_fetched_ts_all[idx, step]),
+                    "evaluation_type": "day_ahead_frozen_backfill",
+                }
+            )
+
+    detail_df = pd.DataFrame.from_records(detail_rows)
+    if detail_df.empty:
+        raise ValueError("No frozen day-ahead target rows were built for canonical backfill.")
+    return detail_df
+
+
+def _build_frozen_backfill_daily_frame(
+    db_path: Path,
+    cfg: DatasetConfig,
+    model: NextDayLSTM,
+    ckpt: dict,
+    x_mean_saved: np.ndarray,
+    x_std_saved: np.ndarray,
+    y_mean_saved: float,
+    y_std_saved: float,
+    local_tz: str,
+) -> pd.DataFrame:
+    detail_df = _build_frozen_backfill_prediction_detail_frame(
+        db_path=db_path,
+        cfg=cfg,
+        model=model,
+        ckpt=ckpt,
+        x_mean_saved=x_mean_saved,
+        x_std_saved=x_std_saved,
+        y_mean_saved=y_mean_saved,
+        y_std_saved=y_std_saved,
+        local_tz=local_tz,
+    )
+    daily_df = (
+        detail_df.groupby("target_day_local", sort=True)
+        .agg(
+            anchor_time_utc=("anchor_time_utc", "first"),
+            issue_local_time=("issued_time_local", "first"),
+            target_start_utc=("target_time_utc", "first"),
+            target_start_local=("target_time_local", "first"),
+            day_local=("target_day_local", "first"),
+            mae_forecast=("harmonie_value", lambda s: float(np.mean(np.abs(np.asarray(s, dtype=float) - detail_df.loc[s.index, "actual_value"].to_numpy(dtype=float))))),
+            mae_lstm=("prediction_value", lambda s: float(np.mean(np.abs(np.asarray(s, dtype=float) - detail_df.loc[s.index, "actual_value"].to_numpy(dtype=float))))),
+            avg_actual_wind_speed=("actual_value", lambda s: float(np.mean(np.asarray(s, dtype=float)))),
+            avg_forecast_wind_speed=("harmonie_value", lambda s: float(np.mean(np.asarray(s, dtype=float)))),
+            avg_lstm_wind_speed=("prediction_value", lambda s: float(np.mean(np.asarray(s, dtype=float)))),
+            n_points=("actual_value", "count"),
+        )
+        .reset_index(drop=True)
+    )
+    daily_df["improvement_vs_forecast"] = daily_df["mae_forecast"] - daily_df["mae_lstm"]
+    daily_df["evaluation_type"] = "day_ahead_frozen_backfill"
     daily_df["day_local"] = pd.to_datetime(daily_df["day_local"], errors="coerce")
     daily_df["date"] = daily_df["day_local"].dt.strftime("%Y-%m-%d")
     daily_df = daily_df.dropna(subset=["day_local"]).reset_index(drop=True)
     return daily_df
+
+
+def backfill_next_day_prediction_log(
+    db_path: Path,
+    cfg: DatasetConfig,
+    model: NextDayLSTM,
+    ckpt: dict,
+    x_mean_saved: np.ndarray,
+    x_std_saved: np.ndarray,
+    y_mean_saved: float,
+    y_std_saved: float,
+    local_tz: str,
+    *,
+    model_type: str = "next_day_backfill",
+    model_artifact: str,
+    model_version: str | None,
+    model_name: str = "NextDayLSTM",
+    prediction_kind: str = "wind_speed",
+    run_context_prefix: str = "backfill_current_champion_report",
+) -> tuple[int, int]:
+    """
+    Materialize historical frozen next-day champion rows into prediction_log.
+
+    Each row represents one target timestamp from one canonical historical
+    day-ahead issue context, with issued_ts set to that historical anchor time
+    so reporting by issued day reflects the frozen operational context rather
+    than the time this backfill was executed.
+    """
+    detail_df = _build_frozen_backfill_prediction_detail_frame(
+        db_path=db_path,
+        cfg=cfg,
+        model=model,
+        ckpt=ckpt,
+        x_mean_saved=x_mean_saved,
+        x_std_saved=x_std_saved,
+        y_mean_saved=y_mean_saved,
+        y_std_saved=y_std_saved,
+        local_tz=local_tz,
+    )
+    rows: list[dict[str, object]] = []
+    for rec in detail_df.itertuples(index=False):
+        rows.append(
+            {
+                "site": cfg.site,
+                "model_type": model_type,
+                "prediction_kind": prediction_kind,
+                "model_name": model_name,
+                "model_version": model_version,
+                "model_artifact": model_artifact,
+                "issued_ts": int(pd.Timestamp(rec.issued_time_utc).timestamp() * 1000),
+                "anchor_ts": int(pd.Timestamp(rec.anchor_time_utc).timestamp() * 1000),
+                "target_ts": int(pd.Timestamp(rec.target_time_utc).timestamp() * 1000),
+                "horizon_hr": float(rec.horizon_hr),
+                "prediction_value": float(rec.prediction_value),
+                "harmonie_value": float(rec.harmonie_value),
+                "harmonie_run_ts": int(rec.harmonie_run_ts),
+                "harmonie_fetched_ts": int(rec.harmonie_fetched_ts),
+                "actual_value": float(rec.actual_value),
+                "run_context": f"{run_context_prefix}:{str(rec.target_day_local)}",
+                "metadata_json": {
+                    "source": "backfill_current_model_history",
+                    "forecast_model": cfg.model,
+                    "evaluation_type": "day_ahead_frozen_backfill",
+                },
+            }
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        init_db(conn)
+        inserted = log_prediction_batch(conn, rows)
+        materialized = materialize_prediction_log_evaluation(
+            conn,
+            site=cfg.site,
+            model_type=model_type,
+            prediction_kind=prediction_kind,
+        )
+        return int(inserted), int(materialized)
+    finally:
+        conn.close()
 
 
 def main() -> None:

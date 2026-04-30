@@ -58,7 +58,7 @@ from intraday_model import (
     summarize_intraday_champion_vs_challenger,
     train_intraday_model,
 )
-from train_lstm import NextDayLSTM
+from train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
 
 
 LSTM_HIGHLIGHT_COLOR = "#d7191c"
@@ -454,6 +454,15 @@ def _build_speed_calibration_context(
     }
 
 
+def _next_day_feature_schema_from_scalers(arrays: dict) -> str:
+    x_mean = np.asarray(arrays.get("x_mean"), dtype=float).reshape(-1)
+    if x_mean.shape[0] == 16:
+        return "speed_v3_actual_history"
+    if x_mean.shape[0] == 10:
+        return "speed_v2"
+    return "legacy"
+
+
 def _speed_calibration_feature_matrix(
     signal_values: np.ndarray,
     speed_calibration_context: dict | None,
@@ -512,6 +521,133 @@ def _speed_calibration_feature_matrix(
             "signal_x_dir_cos",
             "signal_x_month_sin",
             "signal_x_month_cos",
+        ],
+    }
+
+
+def _slice_speed_calibration_context(context: dict | None, row_slice) -> dict | None:
+    if context is None:
+        return None
+    sliced: dict = {}
+    for key, value in context.items():
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            sliced[key] = value
+        elif arr.shape[0] == np.asarray(context.get("anchor_dir_deg", arr)).reshape(-1).shape[0]:
+            sliced[key] = arr[row_slice]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _target_hour_speed_calibration_feature_matrix(
+    pred_arr: np.ndarray,
+    forecast_arr: np.ndarray,
+    speed_calibration_context: dict | None,
+    stats: dict | None = None,
+) -> tuple[np.ndarray, dict] | None:
+    if speed_calibration_context is None:
+        return None
+    required = ["target_forecast_dir_deg", "target_times_utc", "target_horizon_hr"]
+    if any(key not in speed_calibration_context for key in required):
+        return None
+
+    pred = np.asarray(pred_arr, dtype=np.float32)
+    forecast = np.asarray(forecast_arr, dtype=np.float32)
+    target_dir = np.asarray(speed_calibration_context["target_forecast_dir_deg"], dtype=np.float32)
+    target_horizon = np.asarray(speed_calibration_context["target_horizon_hr"], dtype=np.float32)
+    target_times_raw = np.asarray(speed_calibration_context["target_times_utc"])
+    if pred.shape != forecast.shape or target_dir.shape != pred.shape or target_horizon.shape != pred.shape:
+        return None
+    if target_times_raw.shape != pred.shape:
+        return None
+
+    pred_flat = pred.reshape(-1)
+    forecast_flat = forecast.reshape(-1)
+    dir_flat = target_dir.reshape(-1)
+    horizon_flat = target_horizon.reshape(-1)
+    target_times = pd.to_datetime(target_times_raw.reshape(-1), utc=True)
+
+    if stats is None:
+        pred_mean = float(np.nanmean(pred_flat))
+        pred_std = float(np.nanstd(pred_flat))
+        forecast_mean = float(np.nanmean(forecast_flat))
+        forecast_std = float(np.nanstd(forecast_flat))
+        horizon_mean = float(np.nanmean(horizon_flat))
+        horizon_std = float(np.nanstd(horizon_flat))
+    else:
+        pred_mean = float(stats["pred_mean"])
+        pred_std = float(stats["pred_std"])
+        forecast_mean = float(stats["forecast_mean"])
+        forecast_std = float(stats["forecast_std"])
+        horizon_mean = float(stats["horizon_mean"])
+        horizon_std = float(stats["horizon_std"])
+    if pred_std <= 0.0:
+        pred_std = 1.0
+    if forecast_std <= 0.0:
+        forecast_std = 1.0
+    if horizon_std <= 0.0:
+        horizon_std = 1.0
+
+    pred_norm = ((pred_flat - pred_mean) / pred_std).astype(np.float32)
+    forecast_norm = ((forecast_flat - forecast_mean) / forecast_std).astype(np.float32)
+    horizon_norm = ((horizon_flat - horizon_mean) / horizon_std).astype(np.float32)
+    dir_rad = np.deg2rad(dir_flat % 360.0)
+    dir_sin = np.sin(dir_rad).astype(np.float32)
+    dir_cos = np.cos(dir_rad).astype(np.float32)
+    hour_angle = (2.0 * np.pi * target_times.hour.to_numpy(dtype=np.float32)) / 24.0
+    month_angle = (2.0 * np.pi * (target_times.month.to_numpy(dtype=np.float32) - 1.0)) / 12.0
+    hour_sin = np.sin(hour_angle).astype(np.float32)
+    hour_cos = np.cos(hour_angle).astype(np.float32)
+    month_sin = np.sin(month_angle).astype(np.float32)
+    month_cos = np.cos(month_angle).astype(np.float32)
+
+    features = np.column_stack(
+        [
+            np.ones_like(pred_norm),
+            pred_norm,
+            forecast_norm,
+            pred_norm - forecast_norm,
+            dir_sin,
+            dir_cos,
+            hour_sin,
+            hour_cos,
+            month_sin,
+            month_cos,
+            horizon_norm,
+            pred_norm * dir_sin,
+            pred_norm * dir_cos,
+            forecast_norm * dir_sin,
+            forecast_norm * dir_cos,
+            hour_sin * dir_sin,
+            hour_cos * dir_cos,
+        ]
+    ).astype(np.float32)
+    return features, {
+        "pred_mean": pred_mean,
+        "pred_std": pred_std,
+        "forecast_mean": forecast_mean,
+        "forecast_std": forecast_std,
+        "horizon_mean": horizon_mean,
+        "horizon_std": horizon_std,
+        "feature_names": [
+            "bias",
+            "pred_norm",
+            "forecast_norm",
+            "pred_minus_forecast_norm",
+            "target_dir_sin",
+            "target_dir_cos",
+            "target_hour_sin",
+            "target_hour_cos",
+            "target_month_sin",
+            "target_month_cos",
+            "target_horizon_norm",
+            "pred_x_target_dir_sin",
+            "pred_x_target_dir_cos",
+            "forecast_x_target_dir_sin",
+            "forecast_x_target_dir_cos",
+            "target_hour_sin_x_target_dir_sin",
+            "target_hour_cos_x_target_dir_cos",
         ],
     }
 
@@ -644,6 +780,84 @@ def _fit_contextual_speed_calibration(
     }
 
 
+def _fit_target_hour_speed_calibration(
+    pred_arr: np.ndarray,
+    forecast_arr: np.ndarray,
+    actual_arr: np.ndarray,
+    speed_calibration_context: dict | None,
+) -> dict | None:
+    built = _target_hour_speed_calibration_feature_matrix(
+        pred_arr,
+        forecast_arr,
+        speed_calibration_context,
+    )
+    if built is None:
+        return None
+    X, feature_meta = built
+    y = (actual_arr - pred_arr).reshape(-1).astype(np.float32)
+    mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    if int(np.sum(mask)) < 64:
+        return None
+
+    xt = X[mask].astype(np.float64)
+    yt = y[mask].astype(np.float64)
+    split_idx = int(round(xt.shape[0] * 0.7))
+    split_idx = max(1, min(split_idx, xt.shape[0] - 1))
+    x_fit, x_val = xt[:split_idx], xt[split_idx:]
+    y_fit, y_val = yt[:split_idx], yt[split_idx:]
+    identity = np.eye(xt.shape[1], dtype=np.float64)
+    identity[0, 0] = 0.0
+
+    best_ridge: float | None = None
+    best_coef: np.ndarray | None = None
+    best_val_mae = float("inf")
+    for ridge in (0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0):
+        try:
+            coef = np.linalg.solve(x_fit.T @ x_fit + float(ridge) * identity, x_fit.T @ y_fit)
+        except np.linalg.LinAlgError:
+            continue
+        val_mae = float(np.mean(np.abs((x_val @ coef) - y_val)))
+        if val_mae + 1e-9 < best_val_mae:
+            best_val_mae = val_mae
+            best_ridge = float(ridge)
+    if best_ridge is None:
+        return None
+
+    try:
+        best_coef = np.linalg.solve(xt.T @ xt + best_ridge * identity, xt.T @ yt).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return None
+    correction = (X.astype(np.float32) @ best_coef).reshape(pred_arr.shape)
+    calibrated = np.maximum(pred_arr + correction.astype(np.float32), 0.0)
+
+    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    calibrated_mae = float(np.mean(np.abs(calibrated - actual_arr)))
+    improvement_abs = baseline_mae - calibrated_mae
+    if improvement_abs <= 1e-6:
+        return None
+    return {
+        "enabled": True,
+        "type": "target_hour_ridge_v1",
+        "ridge": float(best_ridge),
+        "stats": {
+            "pred_mean": float(feature_meta["pred_mean"]),
+            "pred_std": float(feature_meta["pred_std"]),
+            "forecast_mean": float(feature_meta["forecast_mean"]),
+            "forecast_std": float(feature_meta["forecast_std"]),
+            "horizon_mean": float(feature_meta["horizon_mean"]),
+            "horizon_std": float(feature_meta["horizon_std"]),
+        },
+        "feature_names": feature_meta["feature_names"],
+        "coefficients": [float(v) for v in best_coef.tolist()],
+        "baseline_mae": float(baseline_mae),
+        "calibrated_mae": float(calibrated_mae),
+        "improvement_abs": float(improvement_abs),
+        "improvement_pct": float(improvement_abs / max(baseline_mae, 1e-6)),
+        "n_samples": int(pred_arr.shape[0]),
+        "n_points": int(pred_arr.size),
+    }
+
+
 def fit_speed_regime_calibration(
     pred_speed: np.ndarray,
     forecast_speed: np.ndarray,
@@ -669,7 +883,13 @@ def fit_speed_regime_calibration(
         speed_calibration_context,
         signal,
     )
-    candidates = [c for c in [threshold_cal, contextual_cal] if c is not None]
+    target_hour_cal = _fit_target_hour_speed_calibration(
+        pred_arr,
+        forecast_arr,
+        actual_arr,
+        speed_calibration_context,
+    )
+    candidates = [c for c in [threshold_cal, contextual_cal, target_hour_cal] if c is not None]
     if not candidates:
         return None
     return min(candidates, key=lambda c: float(c["calibrated_mae"]))
@@ -697,6 +917,25 @@ def apply_speed_regime_calibration(
         raise ValueError("Speed calibration expects a 1D or 2D prediction array.")
 
     cal_type = str(speed_calibration.get("type", "threshold_v1")).strip().lower()
+    if cal_type == "target_hour_ridge_v1":
+        built = _target_hour_speed_calibration_feature_matrix(
+            pred_arr,
+            forecast_arr,
+            speed_calibration_context,
+            stats=speed_calibration.get("stats"),
+        )
+        if built is None:
+            return np.asarray(pred_speed, dtype=np.float32)
+        features, _ = built
+        coef = np.asarray(speed_calibration.get("coefficients", []), dtype=np.float32)
+        if coef.shape[0] != features.shape[1]:
+            raise ValueError("Speed target-hour calibration coefficients do not match feature dimensions.")
+        correction = (features @ coef).reshape(pred_arr.shape).astype(np.float32)
+        calibrated = np.maximum(pred_arr + correction, 0.0).astype(np.float32)
+        if input_was_vector:
+            return calibrated[0].astype(np.float32)
+        return calibrated.astype(np.float32)
+
     signal_values = _extract_speed_regime_signal(
         pred_arr,
         forecast_arr,
@@ -821,6 +1060,22 @@ def _predict_direction_batch(
 def _angular_mae_deg(pred: np.ndarray, actual: np.ndarray) -> float:
     diff = ((pred - actual + 180.0) % 360.0) - 180.0
     return float(np.mean(np.abs(diff)))
+
+
+def _circular_mean_deg(values: np.ndarray | pd.Series | list[float]) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[~np.isnan(arr)]
+    if len(arr) == 0:
+        return float("nan")
+    return float(
+        np.rad2deg(
+            np.arctan2(
+                np.nanmean(np.sin(np.deg2rad(arr))),
+                np.nanmean(np.cos(np.deg2rad(arr))),
+            )
+        )
+        % 360.0
+    )
 
 
 def _eval_start_index(n_samples: int, eval_fraction: float, min_eval_samples: int) -> int:
@@ -1501,34 +1756,19 @@ def build_current_day_table(
             raise ValueError("Missing forecast rows in current-day target window.")
 
         x_window = history_frame[feature_cols].to_numpy(dtype=np.float32)[np.newaxis, :, :]
-        x_speed = _apply_standardizer(x_window, speed_scalers["x_mean"], speed_scalers["x_std"]).astype(np.float32)
         x_dir = _apply_standardizer(x_window, direction_scalers["x_mean"], direction_scalers["x_std"]).astype(np.float32)
 
-        speed_model.eval()
         direction_model.eval()
         with torch.no_grad():
-            speed_res_scaled = speed_model(torch.from_numpy(x_speed).float().to(device)).cpu().numpy()[0]
             dir_res_scaled = direction_model(torch.from_numpy(x_dir).float().to(device)).cpu().numpy()[0]
 
-        speed_out = speed_res_scaled * float(speed_scalers["y_std"][0]) + float(speed_scalers["y_mean"][0])
         dir_res = dir_res_scaled * float(direction_scalers["y_std"][0]) + float(direction_scalers["y_mean"][0])
-        speed_out = speed_out[:target_n]
         dir_res = dir_res[:target_n]
 
         fc_speed = future_frame["forecast_avg"].to_numpy(dtype=np.float32)
         fc_dir = future_frame["forecast_dir"].to_numpy(dtype=np.float32)
-        mode = str(speed_target_mode).strip().lower()
-        if mode == "residual":
-            lstm_speed = fc_speed + speed_out
-        elif mode == "constrained_logratio":
-            eps = float(0.1 if speed_constraint_eps is None else speed_constraint_eps)
-            lstm_speed = np.exp(np.log(fc_speed + eps) + speed_out)
-        elif mode == "absolute":
-            lstm_speed = speed_out
-        else:
-            raise ValueError(f"Unsupported speed target mode: {speed_target_mode}")
         lstm_dir = _angle_add_deg(fc_dir, dir_res.astype(np.float32))
-        return lstm_speed.astype(np.float32), lstm_dir.astype(np.float32)
+        return fc_speed.astype(np.float32), lstm_dir.astype(np.float32)
 
     tz = ZoneInfo(local_tz)
     now_local = _resolve_now_local(local_tz, test_now_local_hour)
@@ -2014,6 +2254,26 @@ def save_current_day_plot(
                         label="_nolegend_",
                     )
                 historical_harmonie_plotted = True
+            if "forecast_wind_max" in harmonie_overlay.columns:
+                harmonie_max_y = pd.to_numeric(harmonie_overlay["forecast_wind_max"], errors="coerce").to_numpy(dtype=float)
+                harmonie_max_valid = (~np.isnan(harmonie_x)) & (~np.isnan(harmonie_max_y))
+                if np.any(harmonie_max_valid):
+                    h_max_x = harmonie_x[harmonie_max_valid]
+                    h_max_y = harmonie_max_y[harmonie_max_valid]
+                    order = np.argsort(h_max_x)
+                    h_max_x = h_max_x[order]
+                    h_max_y = h_max_y[order]
+                    if len(h_max_x) >= 2:
+                        ax.plot(
+                            h_max_x,
+                            h_max_y,
+                            color="#666666",
+                            linestyle="--",
+                            linewidth=1.1,
+                            alpha=max(float(overlay_alpha), 0.5),
+                            zorder=2.25,
+                            label="_nolegend_",
+                        )
 
     # The solid current comparison is anchored to the latest active Harmonie
     # update. We plot the Super local branch issued at that same anchor so the
@@ -2050,17 +2310,6 @@ def save_current_day_plot(
         if current_branch_boundary_idx is None and len(branch_positions) > 0:
             current_branch_boundary_idx = int(branch_positions[0])
 
-    ax.fill_between(
-        x,
-        harmonie_current_low,
-        harmonie_current_high,
-        color="#7a7a7a",
-        alpha=0.16,
-        linewidth=0.6,
-        edgecolor="none",
-        label="_nolegend_",
-        zorder=1.1,
-    )
     ax.plot(
         x,
         harmonie_current_high,
@@ -2407,17 +2656,21 @@ def _save_model(
     target_name: str,
     target_mode: str,
     output_activation: str,
+    model_class: str = "NextDayLSTM",
+    history_hours: int | None = None,
     extra: dict | None = None,
 ) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
-        "model_class": "NextDayLSTM",
+        "model_class": str(model_class),
         "n_features": int(n_features),
         "target_hours": int(target_hours),
         "target_name": target_name,
         "target_mode": target_mode,
         "output_activation": output_activation,
     }
+    if history_hours is not None:
+        payload["history_hours"] = int(history_hours)
     if extra:
         payload.update(extra)
     torch.save(
@@ -2428,11 +2681,20 @@ def _save_model(
 
 def _load_model(path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     ckpt = torch.load(path, map_location=device)
-    model = NextDayLSTM(
-        n_features=int(ckpt["n_features"]),
-        target_hours=int(ckpt["target_hours"]),
-        output_activation=str(ckpt.get("output_activation", "linear")),
-    ).to(device)
+    model_class = str(ckpt.get("model_class", "NextDayLSTM"))
+    if model_class == "TargetAwareNextDayLSTM":
+        model = TargetAwareNextDayLSTM(
+            n_features=int(ckpt["n_features"]),
+            target_hours=int(ckpt["target_hours"]),
+            history_hours=int(ckpt.get("history_hours", 72)),
+            output_activation=str(ckpt.get("output_activation", "linear")),
+        ).to(device)
+    else:
+        model = NextDayLSTM(
+            n_features=int(ckpt["n_features"]),
+            target_hours=int(ckpt["target_hours"]),
+            output_activation=str(ckpt.get("output_activation", "linear")),
+        ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, ckpt
@@ -3506,6 +3768,8 @@ def save_model_gate_eval_history_plot(
     plot_png: Path,
     local_tz: str = "Europe/Amsterdam",
     eval_details_csv: Path | None = None,
+    db_path: Path | None = None,
+    site: str | None = None,
 ) -> None:
     def _model_id_date_label(model_id: str | None) -> str | None:
         value = str(model_id or "").strip()
@@ -3551,6 +3815,25 @@ def save_model_gate_eval_history_plot(
             det["target_time_utc"] = pd.to_datetime(det["target_time_utc"], errors="coerce", utc=True)
             for col in ["actual_wind_speed", "forecast_wind_speed", "champion_wind_speed", "challenger_wind_speed"]:
                 det[col] = pd.to_numeric(det.get(col), errors="coerce")
+            if "forecast_wind_dir_deg" in det.columns:
+                det["forecast_wind_dir_deg"] = pd.to_numeric(det["forecast_wind_dir_deg"], errors="coerce")
+            direction_col = "forecast_wind_dir_deg" if "forecast_wind_dir_deg" in det.columns else None
+            direction_label = "6-hour Harmonie wind direction"
+            if direction_col is None and db_path is not None and site:
+                try:
+                    conn = sqlite3.connect(str(db_path))
+                    try:
+                        obs_raw = _load_observations_raw(conn, site)
+                    finally:
+                        conn.close()
+                    if not obs_raw.empty and "actual_dir" in obs_raw.columns:
+                        hourly_dir = obs_raw["actual_dir"].dropna().resample("1h").agg(_circular_mean_deg).dropna()
+                        if not hourly_dir.empty:
+                            det["actual_wind_dir_deg"] = det["target_time_utc"].dt.floor("h").map(hourly_dir)
+                            direction_col = "actual_wind_dir_deg"
+                            direction_label = "6-hour measured wind direction"
+                except Exception:
+                    direction_col = None
             det = det.dropna(subset=["target_time_utc", "actual_wind_speed"])
             if not det.empty:
                 det = det.sort_values("target_time_utc").reset_index(drop=True)
@@ -3789,6 +4072,52 @@ def save_model_gate_eval_history_plot(
                 ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
                 ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
 
+                if direction_col is not None and direction_col in det_view.columns and det_view[direction_col].notna().any():
+                    direction_bins = (
+                        det_view.dropna(subset=[direction_col])
+                        .set_index("target_time_utc")
+                        .sort_index()[direction_col]
+                        .resample("6h")
+                        .agg(_circular_mean_deg)
+                        .dropna()
+                    )
+                    y_base_axes = -0.21
+                    arrow_len_axes = 0.062
+                    for ts_utc, direction_deg in direction_bins.items():
+                        ts_local = ts_utc.tz_convert(ZoneInfo(local_tz)) + pd.Timedelta(hours=3)
+                        if ts_local < x_start_local or ts_local > x_end_local:
+                            continue
+                        theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
+                        dx_days = 0.065 * np.sin(theta)
+                        dy = arrow_len_axes * np.cos(theta)
+                        ax_bottom.annotate(
+                            "",
+                            xy=(mdates.date2num(ts_local.to_pydatetime()) + dx_days, y_base_axes + dy),
+                            xytext=(mdates.date2num(ts_local.to_pydatetime()), y_base_axes),
+                            xycoords=ax_bottom.get_xaxis_transform(),
+                            textcoords=ax_bottom.get_xaxis_transform(),
+                            arrowprops={
+                                "arrowstyle": "-|>",
+                                "color": "#4d4d4d",
+                                "lw": 1.0,
+                                "shrinkA": 0,
+                                "shrinkB": 0,
+                            },
+                            clip_on=False,
+                            zorder=5,
+                        )
+                    ax_bottom.text(
+                        0.0,
+                        -0.31,
+                        direction_label,
+                        transform=ax_bottom.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=8.5,
+                        color="#4d4d4d",
+                        clip_on=False,
+                    )
+
                 bottom_legend_labels = [
                     ("Harmonie", mae_forecast, harmonie_color),
                     (challenger_label, mae_chall, challenger_color),
@@ -3858,7 +4187,7 @@ def save_model_gate_eval_history_plot(
                 bottom_legend.patch.set_edgecolor("none")
                 ax_bottom.add_artist(bottom_legend)
 
-                fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.10)
+                fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.19)
                 fig.savefig(plot_png, dpi=150)
                 plt.close(fig)
                 return
@@ -4333,7 +4662,41 @@ def main() -> None:
         direction_train_stats = None
         n_samples_all_speed = None
         n_samples_all_direction = None
-        feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+        speed_feature_schema = _next_day_feature_schema_from_scalers(speed_arrays)
+        if speed_feature_schema == "speed_v3_actual_history":
+            feature_cols = [
+                "forecast_avg",
+                "forecast_max",
+                "forecast_dir_sin",
+                "forecast_dir_cos",
+                "hour_sin",
+                "hour_cos",
+                "month_sin",
+                "month_cos",
+                "horizon_hr",
+                "is_target",
+                "history_actual_avg",
+                "history_actual_max",
+                "history_actual_dir_sin",
+                "history_actual_dir_cos",
+                "history_avg_residual",
+                "history_max_residual",
+            ]
+        elif speed_feature_schema == "speed_v2":
+            feature_cols = [
+                "forecast_avg",
+                "forecast_max",
+                "forecast_dir_sin",
+                "forecast_dir_cos",
+                "hour_sin",
+                "hour_cos",
+                "month_sin",
+                "month_cos",
+                "horizon_hr",
+                "is_target",
+            ]
+        else:
+            feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
         intraday_train_stats = None
         intraday_hparams = {
             "hidden1": intraday_ckpt.get("hidden1"),
@@ -4389,15 +4752,32 @@ def main() -> None:
         speed_actual_eval = speed_arrays_full["y_actual_all_raw"][speed_eval_start:]
         speed_forecast_train = speed_arrays_full["y_forecast_all_raw"][:speed_eval_start]
         speed_forecast_eval = speed_arrays_full["y_forecast_all_raw"][speed_eval_start:]
+        speed_forecast_dir_eval = speed_arrays_full["target_forecast_dir_all_raw"][speed_eval_start:]
+        speed_anchor_dir_train = speed_arrays_full["anchor_forecast_dir_all_raw"][:speed_eval_start]
+        speed_anchor_dir_eval = speed_arrays_full["anchor_forecast_dir_all_raw"][speed_eval_start:]
         speed_train_anchor_times_utc = pd.to_datetime(speed_arrays_full["timestamps"][:speed_eval_start], utc=True)
         speed_eval_anchor_times_utc = pd.to_datetime(speed_arrays_full["timestamps"][speed_eval_start:], utc=True)
         speed_train_calibration_context = _build_speed_calibration_context(
-            anchor_dir_deg=speed_X_train_raw[:, -1, 2],
+            anchor_dir_deg=speed_anchor_dir_train,
             target_times_utc=speed_train_anchor_times_utc + pd.Timedelta(hours=1),
         )
+        speed_train_calibration_context.update(
+            {
+                "target_forecast_dir_deg": speed_arrays_full["target_forecast_dir_all_raw"][:speed_eval_start],
+                "target_times_utc": speed_arrays_full["target_times_all"][:speed_eval_start],
+                "target_horizon_hr": speed_arrays_full["target_horizon_hr_all"][:speed_eval_start],
+            }
+        )
         speed_eval_calibration_context = _build_speed_calibration_context(
-            anchor_dir_deg=speed_X_eval_raw[:, -1, 2],
+            anchor_dir_deg=speed_anchor_dir_eval,
             target_times_utc=speed_eval_anchor_times_utc + pd.Timedelta(hours=1),
+        )
+        speed_eval_calibration_context.update(
+            {
+                "target_forecast_dir_deg": speed_arrays_full["target_forecast_dir_all_raw"][speed_eval_start:],
+                "target_times_utc": speed_arrays_full["target_times_all"][speed_eval_start:],
+                "target_horizon_hr": speed_arrays_full["target_horizon_hr_all"][speed_eval_start:],
+            }
         )
 
         direction_X_train_raw = direction_X_raw_all[:direction_eval_start]
@@ -4432,9 +4812,10 @@ def main() -> None:
         }
 
         # Train challengers from scratch.
-        speed_model_challenger = NextDayLSTM(
+        speed_model_challenger = TargetAwareNextDayLSTM(
             n_features=speed_X_train.shape[2],
             target_hours=speed_y_train.shape[1],
+            history_hours=cfg.window_hours,
             output_activation="linear",
         ).to(device)
         speed_model_challenger, speed_train_stats = train_with_validation(
@@ -4463,10 +4844,10 @@ def main() -> None:
             ),
             forecast_speed=speed_forecast_train[speed_calibration_start:],
             actual_speed=speed_actual_train[speed_calibration_start:],
-            speed_calibration_context={
-                "anchor_dir_deg": speed_train_calibration_context["anchor_dir_deg"][speed_calibration_start:],
-                "target_month": speed_train_calibration_context["target_month"][speed_calibration_start:],
-            },
+            speed_calibration_context=_slice_speed_calibration_context(
+                speed_train_calibration_context,
+                slice(speed_calibration_start, None),
+            ),
             signal="pred_max",
         )
 
@@ -4564,8 +4945,47 @@ def main() -> None:
                 args.local_timezone,
             )
 
+            champion_speed_feature_schema = _next_day_feature_schema_from_scalers(champion_speed_arrays)
+            if champion_speed_feature_schema == str(speed_arrays_full.get("feature_schema", "speed_v2")):
+                speed_X_eval_champion_raw = speed_X_eval_raw
+                speed_eval_calibration_context_champion = speed_eval_calibration_context
+            else:
+                champion_speed_arrays_full = build_all_training_arrays(
+                    db_path,
+                    cfg,
+                    target_mode="residual",
+                    feature_schema=champion_speed_feature_schema,
+                )
+                champion_eval_start = _eval_start_index(
+                    int(champion_speed_arrays_full["X_all"].shape[0]),
+                    args.challenge_eval_split,
+                    args.challenge_min_eval_samples,
+                )
+                speed_X_eval_champion_raw = _inverse_standardizer(
+                    champion_speed_arrays_full["X_all"][champion_eval_start:],
+                    champion_speed_arrays_full["x_mean"],
+                    champion_speed_arrays_full["x_std"],
+                ).astype(np.float32)
+                champion_eval_anchor_times_utc = pd.to_datetime(
+                    champion_speed_arrays_full["timestamps"][champion_eval_start:],
+                    utc=True,
+                )
+                speed_eval_calibration_context_champion = _build_speed_calibration_context(
+                    anchor_dir_deg=champion_speed_arrays_full["anchor_forecast_dir_all_raw"][champion_eval_start:],
+                    target_times_utc=champion_eval_anchor_times_utc + pd.Timedelta(hours=1),
+                )
+                speed_eval_calibration_context_champion.update(
+                    {
+                        "target_forecast_dir_deg": champion_speed_arrays_full["target_forecast_dir_all_raw"][
+                            champion_eval_start:
+                        ],
+                        "target_times_utc": champion_speed_arrays_full["target_times_all"][champion_eval_start:],
+                        "target_horizon_hr": champion_speed_arrays_full["target_horizon_hr_all"][champion_eval_start:],
+                    }
+                )
+
             speed_X_eval_champion = _apply_standardizer(
-                speed_X_eval_raw, champion_speed_arrays["x_mean"], champion_speed_arrays["x_std"]
+                speed_X_eval_champion_raw, champion_speed_arrays["x_mean"], champion_speed_arrays["x_std"]
             ).astype(np.float32)
             direction_X_eval_champion = _apply_standardizer(
                 direction_X_eval_raw, champion_direction_arrays["x_mean"], champion_direction_arrays["x_std"]
@@ -4580,7 +5000,7 @@ def main() -> None:
                 target_mode=champion_speed_mode,
                 constraint_eps=champion_speed_eps,
                 speed_calibration=champion_speed_calibration,
-                speed_calibration_context=speed_eval_calibration_context,
+                speed_calibration_context=speed_eval_calibration_context_champion,
                 device=device,
             )
             champion_direction_mae = _angular_mae_deg(
@@ -4715,6 +5135,8 @@ def main() -> None:
                 target_name="wind_speed",
                 target_mode=speed_target_mode,
                 output_activation="linear",
+                model_class="TargetAwareNextDayLSTM",
+                history_hours=cfg.window_hours,
                 extra={
                     "constraint_eps": speed_constraint_eps,
                     "trained_at_utc": now_train_utc,
@@ -4784,21 +5206,62 @@ def main() -> None:
                     "target_time_utc": pd.to_datetime(target_ns, utc=True),
                     "actual_wind_speed": speed_actual_eval.reshape(-1).astype(float),
                     "forecast_wind_speed": speed_forecast_eval.reshape(-1).astype(float),
+                    "forecast_wind_dir_deg": speed_forecast_dir_eval.reshape(-1).astype(float),
                     "challenger_wind_speed": challenger_speed_eval_pred.reshape(-1).astype(float),
                     "champion_wind_speed": champion_speed_eval_pred.reshape(-1).astype(float),
                 }
             )
             agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
+            direction_by_target = raw_eval.groupby("target_time_utc")["forecast_wind_dir_deg"].agg(
+                _circular_mean_deg
+            )
+            agg_eval["forecast_wind_dir_deg"] = agg_eval["target_time_utc"].map(direction_by_target)
             agg_eval["n_overlaps"] = raw_eval.groupby("target_time_utc").size().to_numpy()
             agg_eval["abs_err_forecast"] = np.abs(agg_eval["forecast_wind_speed"] - agg_eval["actual_wind_speed"])
             agg_eval["abs_err_challenger"] = np.abs(agg_eval["challenger_wind_speed"] - agg_eval["actual_wind_speed"])
             agg_eval["abs_err_champion"] = np.abs(agg_eval["champion_wind_speed"] - agg_eval["actual_wind_speed"])
+            sector_labels = np.array(["N", "NE", "E", "SE", "S", "SW", "W", "NW"], dtype=object)
+            sector_idx = (
+                np.floor(((agg_eval["forecast_wind_dir_deg"].to_numpy(dtype=float) % 360.0) + 22.5) / 45.0)
+                .astype(int)
+                % 8
+            )
+            agg_eval["forecast_wind_dir_sector"] = sector_labels[sector_idx]
+            direction_rows: list[dict] = []
+            for sector_name, sector_frame in agg_eval.groupby("forecast_wind_dir_sector", sort=False):
+                actual_vals = sector_frame["actual_wind_speed"].to_numpy(dtype=float)
+                forecast_vals = sector_frame["forecast_wind_speed"].to_numpy(dtype=float)
+                challenger_vals = sector_frame["challenger_wind_speed"].to_numpy(dtype=float)
+                champion_vals = sector_frame["champion_wind_speed"].to_numpy(dtype=float)
+                direction_rows.append(
+                    {
+                        "sector": str(sector_name),
+                        "n_points": int(len(sector_frame)),
+                        "forecast_mae": float(np.mean(np.abs(forecast_vals - actual_vals))),
+                        "forecast_bias_pred_minus_actual": float(np.mean(forecast_vals - actual_vals)),
+                        "challenger_mae": float(np.mean(np.abs(challenger_vals - actual_vals))),
+                        "challenger_bias_pred_minus_actual": float(np.mean(challenger_vals - actual_vals)),
+                        "champion_mae": float(np.mean(np.abs(champion_vals - actual_vals))),
+                        "champion_bias_pred_minus_actual": float(np.mean(champion_vals - actual_vals)),
+                        "challenger_mae_gain_vs_forecast": float(
+                            np.mean(np.abs(forecast_vals - actual_vals))
+                            - np.mean(np.abs(challenger_vals - actual_vals))
+                        ),
+                        "challenger_mae_gain_vs_champion": float(
+                            np.mean(np.abs(champion_vals - actual_vals))
+                            - np.mean(np.abs(challenger_vals - actual_vals))
+                        ),
+                    }
+                )
+            gate_eval_direction_csv = details_dir / f"{stamp}_model_gate_eval_speed_by_direction.csv"
+            pd.DataFrame(direction_rows).to_csv(gate_eval_direction_csv, index=False)
             agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
             agg_eval.to_csv(gate_eval_details_csv, index=False)
             gate_eval_details_csv_src = gate_eval_details_csv
             model_selection_report["speed_eval_details_csv"] = str(gate_eval_details_csv)
+            model_selection_report["speed_eval_direction_csv"] = str(gate_eval_direction_csv)
 
         intraday_challenger_extra = {
             "trained_at_utc": now_train_utc,
@@ -4964,16 +5427,29 @@ def main() -> None:
         cfg=cfg,
         x_mean=speed_arrays["x_mean"],
         x_std=speed_arrays["x_std"],
+        feature_schema=_next_day_feature_schema_from_scalers(speed_arrays),
     )
     inference_input_direction = build_next_day_inference_input(
         db_path=db_path,
         cfg=cfg,
         x_mean=direction_arrays["x_mean"],
         x_std=direction_arrays["x_std"],
+        feature_schema="legacy",
     )
     speed_inference_calibration_context = _build_speed_calibration_context(
         anchor_dir_deg=float(inference_input_speed["anchor_forecast_dir"]),
         target_times_utc=pd.to_datetime([inference_input_speed["target_times"][0]], utc=True),
+    )
+    speed_inference_calibration_context.update(
+        {
+            "target_forecast_dir_deg": np.asarray(inference_input_speed["forecast_dir_next24"], dtype=np.float32)[
+                np.newaxis, :
+            ],
+            "target_times_utc": np.asarray(inference_input_speed["target_times"], dtype=object)[np.newaxis, :],
+            "target_horizon_hr": np.asarray(inference_input_speed["target_horizon_hr"], dtype=np.float32)[
+                np.newaxis, :
+            ],
+        }
     )
 
     speed_pred = predict_speed(
@@ -5253,6 +5729,8 @@ def main() -> None:
                 gate_eval_history_png,
                 local_tz=args.local_timezone,
                 eval_details_csv=gate_eval_details_csv_src,
+                db_path=db_path,
+                site=cfg.site,
             )
             gate_eval_history_png_src = gate_eval_history_png
     if not is_test_mode:
@@ -5327,6 +5805,8 @@ def main() -> None:
                 gate_eval_history_png,
                 local_tz=args.local_timezone,
                 eval_details_csv=gate_eval_details_csv_src,
+                db_path=db_path,
+                site=cfg.site,
             )
             gate_eval_history_png_src = gate_eval_history_png
         web_publish = publish_web_dashboard(

@@ -40,6 +40,54 @@ class NextDayLSTM(nn.Module):
         return x
 
 
+class TargetAwareNextDayLSTM(nn.Module):
+    def __init__(
+        self,
+        n_features: int,
+        target_hours: int,
+        history_hours: int = 72,
+        output_activation: str = "linear",
+    ) -> None:
+        super().__init__()
+        if target_hours <= 0:
+            raise ValueError("target_hours must be positive.")
+        if history_hours <= 0:
+            raise ValueError("history_hours must be positive.")
+        self.target_hours = int(target_hours)
+        self.history_hours = int(history_hours)
+        self.history_encoder = nn.LSTM(input_size=n_features, hidden_size=64, batch_first=True)
+        self.dropout = nn.Dropout(0.2)
+        self.target_mlp = nn.Sequential(
+            nn.Linear(64 + n_features, 96),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(96, 48),
+            nn.ReLU(),
+            nn.Linear(48, 1),
+        )
+        self.output_activation = str(output_activation).strip().lower()
+        if self.output_activation not in {"linear", "softplus"}:
+            raise ValueError("output_activation must be 'linear' or 'softplus'.")
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(1) < self.history_hours + self.target_hours:
+            raise ValueError(
+                "TargetAwareNextDayLSTM expects concatenated history and target rows "
+                f"({self.history_hours + self.target_hours} timesteps)."
+            )
+        history = x[:, : self.history_hours, :]
+        target = x[:, self.history_hours : self.history_hours + self.target_hours, :]
+        _, (hidden, _) = self.history_encoder(history)
+        context = self.dropout(hidden[-1])
+        context = context.unsqueeze(1).expand(-1, self.target_hours, -1)
+        x = torch.cat([context, target], dim=2)
+        x = self.target_mlp(x).squeeze(-1)
+        if self.output_activation == "softplus":
+            x = self.softplus(x)
+        return x
+
+
 def evaluate_denormalized(
     model: nn.Module,
     X_val: np.ndarray,

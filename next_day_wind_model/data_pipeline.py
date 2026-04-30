@@ -218,9 +218,121 @@ def _add_calendar_features(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _add_cyclical_forecast_features(frame: pd.DataFrame) -> pd.DataFrame:
+    out = _add_calendar_features(frame)
+    direction = pd.to_numeric(out["forecast_dir"], errors="coerce").astype(np.float32)
+    dir_rad = np.deg2rad(direction)
+    out["forecast_dir_sin"] = np.sin(dir_rad)
+    out["forecast_dir_cos"] = np.cos(dir_rad)
+    hour = out.index.hour.astype(np.float32)
+    hour_angle = (2.0 * np.pi * hour) / 24.0
+    out["hour_sin"] = np.sin(hour_angle)
+    out["hour_cos"] = np.cos(hour_angle)
+    if "horizon_hr" not in out.columns:
+        out["horizon_hr"] = 0.0
+    return out
+
+
+def _speed_v2_feature_cols() -> list[str]:
+    return [
+        "forecast_avg",
+        "forecast_max",
+        "forecast_dir_sin",
+        "forecast_dir_cos",
+        "hour_sin",
+        "hour_cos",
+        "month_sin",
+        "month_cos",
+        "horizon_hr",
+        "is_target",
+    ]
+
+
+def _speed_v3_actual_history_feature_cols() -> list[str]:
+    return _speed_v2_feature_cols() + [
+        "history_actual_avg",
+        "history_actual_max",
+        "history_actual_dir_sin",
+        "history_actual_dir_cos",
+        "history_avg_residual",
+        "history_max_residual",
+    ]
+
+
+def _legacy_feature_cols() -> list[str]:
+    return ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+
+
+def _add_actual_history_features(frame: pd.DataFrame, *, is_target: bool) -> pd.DataFrame:
+    out = frame.copy()
+    if is_target:
+        out["history_actual_avg"] = 0.0
+        out["history_actual_max"] = 0.0
+        out["history_actual_dir_sin"] = 0.0
+        out["history_actual_dir_cos"] = 0.0
+        out["history_avg_residual"] = 0.0
+        out["history_max_residual"] = 0.0
+        return out
+
+    required = ["actual_avg", "actual_max", "actual_dir", "forecast_avg", "forecast_max"]
+    if any(col not in out.columns for col in required):
+        out["history_actual_avg"] = np.nan
+        out["history_actual_max"] = np.nan
+        out["history_actual_dir_sin"] = np.nan
+        out["history_actual_dir_cos"] = np.nan
+        out["history_avg_residual"] = np.nan
+        out["history_max_residual"] = np.nan
+        return out
+
+    actual_dir_rad = np.deg2rad(out["actual_dir"].astype(float) % 360.0)
+    out["history_actual_avg"] = out["actual_avg"].astype(float)
+    out["history_actual_max"] = out["actual_max"].astype(float)
+    out["history_actual_dir_sin"] = np.sin(actual_dir_rad)
+    out["history_actual_dir_cos"] = np.cos(actual_dir_rad)
+    out["history_avg_residual"] = out["actual_avg"].astype(float) - out["forecast_avg"].astype(float)
+    out["history_max_residual"] = out["actual_max"].astype(float) - out["forecast_max"].astype(float)
+    return out
+
+
+def _build_feature_sequence(
+    history_frame: pd.DataFrame,
+    target_frame: pd.DataFrame,
+    *,
+    feature_schema: str,
+) -> tuple[np.ndarray, list[str]] | None:
+    schema = str(feature_schema).strip().lower()
+    if schema in {"speed_v2", "speed_v3_actual_history"}:
+        history_features = _add_cyclical_forecast_features(history_frame)
+        target_features = _add_cyclical_forecast_features(target_frame)
+        history_features["is_target"] = 0.0
+        target_features["is_target"] = 1.0
+        if schema == "speed_v3_actual_history":
+            history_features = _add_actual_history_features(history_features, is_target=False)
+            target_features = _add_actual_history_features(target_features, is_target=True)
+            feature_cols = _speed_v3_actual_history_feature_cols()
+        else:
+            feature_cols = _speed_v2_feature_cols()
+        sequence = pd.concat(
+            [
+                history_features[feature_cols],
+                target_features[feature_cols],
+            ],
+            axis=0,
+        )
+    elif schema == "legacy":
+        feature_cols = _legacy_feature_cols()
+        sequence = history_frame[feature_cols]
+    else:
+        raise ValueError(f"Unsupported feature schema: {feature_schema}")
+
+    if sequence[feature_cols].isna().any().any():
+        return None
+    return sequence[feature_cols].to_numpy(dtype=np.float32), feature_cols
+
+
 def _interpolate_missing_features(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    feature_cols = ["forecast_avg", "forecast_min", "forecast_max", "forecast_dir", "actual_max", "actual_dir"]
+    feature_cols = ["forecast_avg", "forecast_min", "forecast_max", "forecast_dir", "actual_avg", "actual_max", "actual_dir"]
     for col in feature_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -611,7 +723,21 @@ def _build_vintage_aware_samples(
     cfg: DatasetConfig,
     actual_col: str,
     forecast_target_col: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    feature_schema: str = "legacy",
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    schema = str(feature_schema).strip().lower()
     bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
     conn = sqlite3.connect(str(db_path))
     try:
@@ -619,12 +745,14 @@ def _build_vintage_aware_samples(
     finally:
         conn.close()
 
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+    feature_cols: list[str] | None = None
     X_list: List[np.ndarray] = []
     y_actual_list: List[np.ndarray] = []
     y_forecast_list: List[np.ndarray] = []
     timestamps: List[str] = []
+    anchor_forecast_dir_list: List[float] = []
     target_times_list: List[np.ndarray] = []
+    target_forecast_dir_list: List[np.ndarray] = []
     target_run_ts_list: List[np.ndarray] = []
     target_fetched_ts_list: List[np.ndarray] = []
     target_horizon_hr_list: List[np.ndarray] = []
@@ -646,33 +774,52 @@ def _build_vintage_aware_samples(
         history_frame = _build_history_forecast_frame(target_lookup, history_times, anchor_ts_ms)
         if history_frame is None:
             continue
+        if schema == "speed_v3_actual_history":
+            history_frame = history_frame.join(obs[["actual_avg", "actual_max", "actual_dir"]], how="left")
+            history_frame = _interpolate_missing_features(history_frame)
         target_frame = _select_latest_complete_run_frame(run_entries, target_times, anchor_ts_ms)
         if target_frame is None:
             continue
 
         actual_next = obs.iloc[i + 1 : i + 1 + horizon][actual_col].to_numpy(dtype=np.float32)
         forecast_next = target_frame[forecast_target_col].to_numpy(dtype=np.float32)
-        x_window = history_frame[feature_cols].to_numpy(dtype=np.float32)
+        forecast_dir_next = target_frame["forecast_dir"].to_numpy(dtype=np.float32)
+        built_features = _build_feature_sequence(
+            history_frame,
+            target_frame,
+            feature_schema=feature_schema,
+        )
+        if built_features is None:
+            continue
+        x_window, built_feature_cols = built_features
+        if feature_cols is None:
+            feature_cols = built_feature_cols
 
-        if np.isnan(x_window).any() or np.isnan(actual_next).any() or np.isnan(forecast_next).any():
+        if np.isnan(x_window).any() or np.isnan(actual_next).any() or np.isnan(forecast_next).any() or np.isnan(forecast_dir_next).any():
             continue
 
         X_list.append(x_window)
         y_actual_list.append(actual_next)
         y_forecast_list.append(forecast_next)
         timestamps.append(anchor_time.isoformat())
+        anchor_forecast_dir_list.append(float(history_frame["forecast_dir"].iloc[-1]))
         target_times_list.append(np.array([ts.isoformat() for ts in target_times], dtype=object))
+        target_forecast_dir_list.append(forecast_dir_next)
         target_run_ts_list.append(target_frame["run_ts"].to_numpy(dtype=np.int64))
         target_fetched_ts_list.append(target_frame["fetched_ts"].to_numpy(dtype=np.int64))
         target_horizon_hr_list.append(target_frame["horizon_hr"].to_numpy(dtype=np.float32))
 
     if not X_list:
         raise ValueError("No vintage-aware training samples could be built with the current window/horizon settings.")
+    if feature_cols is None:
+        raise ValueError("No feature columns were built.")
 
     X_raw = np.stack(X_list).astype(np.float32)
     y_actual_raw = np.stack(y_actual_list).astype(np.float32)
     y_forecast_raw = np.stack(y_forecast_list).astype(np.float32)
+    anchor_forecast_dir_all = np.asarray(anchor_forecast_dir_list, dtype=np.float32)
     target_times_all = np.stack(target_times_list)
+    target_forecast_dir_all = np.stack(target_forecast_dir_list).astype(np.float32)
     target_run_ts_all = np.stack(target_run_ts_list).astype(np.int64)
     target_fetched_ts_all = np.stack(target_fetched_ts_list).astype(np.int64)
     target_horizon_hr_all = np.stack(target_horizon_hr_list).astype(np.float32)
@@ -681,10 +828,13 @@ def _build_vintage_aware_samples(
         y_actual_raw,
         y_forecast_raw,
         np.array(timestamps),
+        anchor_forecast_dir_all,
         target_times_all,
+        target_forecast_dir_all,
         target_run_ts_all,
         target_fetched_ts_all,
         target_horizon_hr_all,
+        np.array(feature_cols, dtype=object),
     )
 
 
@@ -692,24 +842,29 @@ def build_all_training_arrays(
     db_path: Path,
     cfg: DatasetConfig,
     target_mode: str = "absolute",
+    feature_schema: str = "speed_v2",
 ) -> Dict[str, np.ndarray | List[str]]:
     target_mode = _resolve_target_mode(target_mode)
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+    schema = str(feature_schema).strip().lower()
     target_col = "actual_avg"
     (
         X_raw,
         y_actual_raw,
         y_forecast_raw,
         timestamps,
+        anchor_forecast_dir_all,
         target_times_all,
+        target_forecast_dir_all,
         target_run_ts_all,
         target_fetched_ts_all,
         target_horizon_hr_all,
+        feature_cols,
     ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col=target_col,
         forecast_target_col="forecast_avg",
+        feature_schema=schema,
     )
     if target_mode == "residual":
         y_target_raw = y_actual_raw - y_forecast_raw
@@ -727,6 +882,7 @@ def build_all_training_arrays(
         "y_actual_all_raw": y_actual_raw,
         "y_forecast_all_raw": y_forecast_raw,
         "target_times_all": target_times_all,
+        "target_forecast_dir_all_raw": target_forecast_dir_all,
         "target_run_ts_all": target_run_ts_all,
         "target_fetched_ts_all": target_fetched_ts_all,
         "target_horizon_hr_all": target_horizon_hr_all,
@@ -735,7 +891,9 @@ def build_all_training_arrays(
         "y_mean": np.array([y_mean], dtype=np.float32),
         "y_std": np.array([y_std], dtype=np.float32),
         "timestamps": timestamps,
-        "feature_cols": feature_cols,
+        "anchor_forecast_dir_all_raw": anchor_forecast_dir_all,
+        "feature_cols": [str(col) for col in feature_cols.tolist()],
+        "feature_schema": schema,
         "target_col": target_col,
         "target_mode": target_mode,
     }
@@ -745,24 +903,29 @@ def build_training_arrays(
     db_path: Path,
     cfg: DatasetConfig,
     target_mode: str = "absolute",
+    feature_schema: str = "speed_v2",
 ) -> Dict[str, np.ndarray | Dict | List[str]]:
     target_mode = _resolve_target_mode(target_mode)
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+    schema = str(feature_schema).strip().lower()
     target_col = "actual_avg"
     (
         X_raw,
         y_actual_raw,
         y_forecast_raw,
         timestamps,
+        anchor_forecast_dir_all,
         target_times_all,
+        target_forecast_dir_all,
         target_run_ts_all,
         target_fetched_ts_all,
         target_horizon_hr_all,
+        feature_cols,
     ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col=target_col,
         forecast_target_col="forecast_avg",
+        feature_schema=schema,
     )
     if target_mode == "residual":
         y_target_raw = y_actual_raw - y_forecast_raw
@@ -804,7 +967,9 @@ def build_training_arrays(
         "y_mean": np.array([y_mean], dtype=np.float32),
         "y_std": np.array([y_std], dtype=np.float32),
         "timestamps": timestamps,
-        "feature_cols": feature_cols,
+        "anchor_forecast_dir_all_raw": anchor_forecast_dir_all,
+        "feature_cols": [str(col) for col in feature_cols.tolist()],
+        "feature_schema": schema,
         "target_col": target_col,
         "target_mode": target_mode,
     }
@@ -814,21 +979,24 @@ def build_all_direction_training_arrays(
     db_path: Path,
     cfg: DatasetConfig,
 ) -> Dict[str, np.ndarray | List[str]]:
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
     (
         X_raw,
         y_actual_raw,
         y_forecast_raw,
         timestamps,
+        anchor_forecast_dir_all,
         target_times_all,
+        target_forecast_dir_all,
         target_run_ts_all,
         target_fetched_ts_all,
         target_horizon_hr_all,
+        feature_cols,
     ) = _build_vintage_aware_samples(
         db_path,
         cfg,
         actual_col="actual_dir",
         forecast_target_col="forecast_dir",
+        feature_schema="legacy",
     )
     y_target_raw = _angle_diff_deg(y_actual_raw, y_forecast_raw)
 
@@ -843,6 +1011,7 @@ def build_all_direction_training_arrays(
         "y_actual_all_raw": y_actual_raw,
         "y_forecast_all_raw": y_forecast_raw,
         "target_times_all": target_times_all,
+        "target_forecast_dir_all_raw": target_forecast_dir_all,
         "target_run_ts_all": target_run_ts_all,
         "target_fetched_ts_all": target_fetched_ts_all,
         "target_horizon_hr_all": target_horizon_hr_all,
@@ -851,7 +1020,9 @@ def build_all_direction_training_arrays(
         "y_mean": np.array([y_mean], dtype=np.float32),
         "y_std": np.array([y_std], dtype=np.float32),
         "timestamps": timestamps,
-        "feature_cols": feature_cols,
+        "anchor_forecast_dir_all_raw": anchor_forecast_dir_all,
+        "feature_cols": [str(col) for col in feature_cols.tolist()],
+        "feature_schema": "legacy",
         "target_col": "actual_dir",
         "target_mode": "residual",
     }
@@ -862,11 +1033,13 @@ def build_next_day_inference_input(
     cfg: DatasetConfig,
     x_mean: np.ndarray,
     x_std: np.ndarray,
+    feature_schema: str = "legacy",
 ) -> Dict[str, np.ndarray | str]:
-    feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+    schema = str(feature_schema).strip().lower()
     conn = sqlite3.connect(str(db_path))
     try:
         latest_obs = _latest_observation_time(conn, cfg.site)
+        obs = _load_observations(conn, cfg.site) if schema == "speed_v3_actual_history" else None
     finally:
         conn.close()
 
@@ -897,12 +1070,29 @@ def build_next_day_inference_input(
     )
     history_frame = context["history_frame"]
     target_frame = context["target_frame"]
-    if history_frame is None or history_frame[feature_cols].isna().any().any():
+    if history_frame is None:
         raise ValueError("Missing anchor-time forecast history for next-day inference.")
+    if schema == "speed_v3_actual_history":
+        if obs is None:
+            raise ValueError("Missing observations for actual-history next-day inference.")
+        history_frame = history_frame.join(obs[["actual_avg", "actual_max", "actual_dir"]], how="left")
+        history_frame = _interpolate_missing_features(history_frame)
     if target_frame is None or target_frame[["forecast_avg", "forecast_max", "forecast_dir"]].isna().any().any():
         raise ValueError("Missing anchor-time forecast run for next-day inference target window.")
 
-    x_window = history_frame[feature_cols].to_numpy(dtype=np.float32)
+    built_features = _build_feature_sequence(
+        history_frame,
+        target_frame,
+        feature_schema=schema,
+    )
+    if built_features is None:
+        raise ValueError("Missing anchor-time forecast features for next-day inference.")
+    x_window, feature_cols = built_features
+    if x_window.shape[-1] != np.asarray(x_mean).reshape(-1).shape[0]:
+        raise ValueError(
+            "Saved scaler feature width does not match requested next-day feature schema "
+            f"({x_window.shape[-1]} vs {np.asarray(x_mean).reshape(-1).shape[0]})."
+        )
     forecast_next = target_frame["forecast_avg"].to_numpy(dtype=np.float32)
     forecast_min_next = target_frame["forecast_min"].to_numpy(dtype=np.float32)
     forecast_max_next = target_frame["forecast_max"].to_numpy(dtype=np.float32)
@@ -919,6 +1109,8 @@ def build_next_day_inference_input(
         "target_fetched_ts": target_frame["fetched_ts"].to_numpy(dtype=np.int64),
         "target_horizon_hr": target_frame["horizon_hr"].to_numpy(dtype=np.float32),
         "anchor_forecast_dir": np.float32(history_frame["forecast_dir"].iloc[-1]),
+        "feature_cols": [str(col) for col in feature_cols],
+        "feature_schema": schema,
         "target_times": np.array([t.isoformat() for t in target_times]),
         "anchor_time": anchor_time.isoformat(),
         "reference_observation_time": latest_obs.isoformat(),

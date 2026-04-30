@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate the final deployed-champion vs Harmonie performance report from canonical SQLite data.",
     )
-    parser.add_argument("--db", default="data/wind_data.db", help="Path to SQLite DB.")
+    parser.add_argument("--db", default="data/wind_data_all_sites.db", help="Path to SQLite DB.")
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument(

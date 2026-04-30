@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Backtest tuned vs default hyperparameters for next-day and intraday models.",
     )
-    parser.add_argument("--db", default="data/wind_data.db", help="Path to SQLite DB.")
+    parser.add_argument("--db", default="data/wind_data_all_sites.db", help="Path to SQLite DB.")
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours.")

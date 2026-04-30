@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -9,13 +11,55 @@ import requests
 
 from db_store import connect_db, init_db, upsert_observations, upsert_forecasts
 
-# --- Endpoints (Valkenburgse Meer / node7) ---
-OBS_URL = "https://1.windsurfice.com/PHP_scripts/Wind_laatste_dag.php?Site=windsurfice-v25-node7&WaterTemp=0&Direction=1"
+# --- Windsurfice endpoints ---
+OBS_URL = "https://1.windsurfice.com/PHP_scripts/Wind_laatste_dag.php"
 FC_URL = "https://1.windsurfice.com/PHP_scripts/GetForecastDB.php"
-SITE = "valkenburgsemeer"
+
+
+@dataclass(frozen=True)
+class SiteConfig:
+    site: str
+    display_name: str
+    windsurfice_obs_site: str
+    forecast_lat: str
+    forecast_lon: str
+    referer: str
+
+    @property
+    def observation_params(self) -> dict[str, str | int]:
+        return {
+            "Site": self.windsurfice_obs_site,
+            "WaterTemp": 0,
+            "Direction": 1,
+        }
+
+    @property
+    def forecast_payload(self) -> dict[str, str]:
+        return {
+            "lat": self.forecast_lat,
+            "lon": self.forecast_lon,
+        }
+
+
+SITES = {
+    "valkenburgsemeer": SiteConfig(
+        site="valkenburgsemeer",
+        display_name="Valkenburgse Meer",
+        windsurfice_obs_site="windsurfice-v25-node7",
+        forecast_lat="52.1603",
+        forecast_lon="4.44197",
+        referer="https://windsurfice.com/en/locations/valkenburgsemeer",
+    ),
+    "oostvoorne": SiteConfig(
+        site="oostvoorne",
+        display_name="Oostvoornse Meer",
+        windsurfice_obs_site="windsurfice-v25-node6",
+        forecast_lat="51.9278",
+        forecast_lon="4.05502",
+        referer="https://windsurfice.com/en/locations/oostvoorne",
+    ),
+}
 MODEL = "HARMONIE"
-LAT = "52.1603"
-LON = "4.44197"
 
 RUN_TS_CANDIDATE_KEYS = (
     "run_ts",
@@ -49,9 +93,7 @@ RUN_TS_CANDIDATE_KEYS = (
     "createdAt",
 )
 
-# --- Headers ---
-# Optional cookie can be passed via LOCAL_WIND_COOKIE env var.
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": os.getenv(
         "LOCAL_WIND_UA",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -59,12 +101,18 @@ HEADERS = {
         "Chrome/124 Safari/537.36",
     ),
     "Accept": "application/json,text/plain,*/*",
-    "Referer": "https://windsurfice.com/en/locations/valkenburgsemeer",
     "Origin": "https://windsurfice.com",
 }
-_cookie = os.getenv("LOCAL_WIND_COOKIE")
-if _cookie:
-    HEADERS["Cookie"] = _cookie
+
+
+def build_headers(site_config: SiteConfig) -> dict[str, str]:
+    """Build browser-like headers for the selected Windsurfice location."""
+    headers = dict(BASE_HEADERS)
+    headers["Referer"] = site_config.referer
+    cookie = os.getenv("LOCAL_WIND_COOKIE")
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
 
 
 def ts_to_iso_any(t):
@@ -170,14 +218,15 @@ def add_iso_time(records):
     return records
 
 
-def fetch_json(url, name, method="GET", params=None, data=None):
+def fetch_json(url, name, method="GET", params=None, data=None, headers=None):
     """Fetch JSON with browser-like headers; support GET/POST; show helpful preview."""
     print(f"Fetching {name} -> {url}")
+    request_headers = headers or BASE_HEADERS
     try:
         if method.upper() == "POST":
-            r = requests.post(url, headers=HEADERS, params=params, data=data, timeout=30)
+            r = requests.post(url, headers=request_headers, params=params, data=data, timeout=30)
         else:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            r = requests.get(url, headers=request_headers, params=params, timeout=30)
     except requests.RequestException as e:
         raise RuntimeError(f"{name}: request failed: {e}") from e
 
@@ -195,6 +244,7 @@ def fetch_json(url, name, method="GET", params=None, data=None):
 
 
 def save_csv(data, prefix, out_dir="."):
+    os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(data)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     filename = os.path.join(out_dir, f"{stamp}_{prefix}.csv")
@@ -202,25 +252,41 @@ def save_csv(data, prefix, out_dir="."):
     print(f"Saved {len(df)} rows -> {filename}")
 
 
-def main(out_dir="."):
+def fetch_site(site_config: SiteConfig, out_dir="."):
+    headers = build_headers(site_config)
+    site = site_config.site
+    site_out_dir = os.path.join(out_dir, site)
+    print(f"Fetching Windsurfice data for {site_config.display_name} ({site})")
+
     # 1) Observations (last 24 h)
-    obs = fetch_json(OBS_URL, "observations (last day)")
+    obs = fetch_json(
+        OBS_URL,
+        "observations (last day)",
+        params=site_config.observation_params,
+        headers=headers,
+    )
     obs = add_iso_time(obs)
-    save_csv(obs, "valkenburgsemeer_last_day", out_dir)
+    save_csv(obs, "last_day", site_out_dir)
     try:
         conn = connect_db(out_dir)
         init_db(conn)
-        n_obs = upsert_observations(conn, SITE, obs)
+        n_obs = upsert_observations(conn, site, obs)
         print(f"Upserted {n_obs} observation rows into SQLite")
     except Exception as e:
         print(f"Failed to upsert observations into DB: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # 2) Forecast (HARMONIE)
     fc_payload = fetch_json(
         FC_URL,
         "forecast (HARMONIE)",
         method="POST",
-        data={"lat": LAT, "lon": LON},
+        data=site_config.forecast_payload,
+        headers=headers,
     )
     fetched_ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     run_ts_ms, run_ts_quality = resolve_forecast_run_ts(fc_payload, fetched_ts_ms)
@@ -239,13 +305,13 @@ def main(out_dir="."):
         row_csv["forecast_fetched_iso"] = ts_to_iso_any(fetched_ts_ms)
         row_csv["forecast_run_ts_quality"] = run_ts_quality
         fc_rows_csv.append(row_csv)
-    save_csv(fc_rows_csv, "valkenburgsemeer_forecast", out_dir)
+    save_csv(fc_rows_csv, "forecast", site_out_dir)
     try:
         conn = connect_db(out_dir)
         init_db(conn)
         n_fc = upsert_forecasts(
             conn,
-            SITE,
+            site,
             MODEL,
             fc_rows,
             run_ts_ms=run_ts_ms,
@@ -254,9 +320,43 @@ def main(out_dir="."):
         print(f"Upserted {n_fc} forecast rows into SQLite")
     except Exception as e:
         print(f"Failed to upsert forecasts into DB: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch Windsurfice observations and forecasts.")
+    parser.add_argument(
+        "out_dir",
+        nargs="?",
+        default="./data",
+        help="Root directory for per-site CSV snapshot folders and wind_data_all_sites.db.",
+    )
+    parser.add_argument(
+        "--site",
+        default=None,
+        choices=sorted(SITES),
+        help="Configured site to fetch. If omitted, all configured sites are fetched.",
+    )
+    parser.add_argument(
+        "--all-sites",
+        action="store_true",
+        help="Fetch every configured site. This is the default when --site is omitted.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    site_configs = list(SITES.values()) if args.all_sites or args.site is None else [SITES[args.site]]
+    for site_config in site_configs:
+        fetch_site(site_config, args.out_dir)
 
 
 if __name__ == "__main__":
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "./data"
-    os.makedirs(outdir, exist_ok=True)
-    main(outdir)
+    main()

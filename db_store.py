@@ -1,12 +1,14 @@
 import os
 import json
 import math
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from typing import Iterable, Dict, Any, Optional, Tuple
 
 
-DB_FILENAME = "wind_data.db"
+DB_FILENAME = "wind_data_all_sites.db"
+LEGACY_DB_FILENAME = "wind_data.db"
 FORECASTS_TABLE = "forecasts"
 PREDICTION_LOG_TABLE = "prediction_log"
 HOUR_MS = 3_600_000
@@ -24,8 +26,20 @@ def db_path(out_dir: str) -> str:
     return os.path.join(out_dir, DB_FILENAME)
 
 
-def connect_db(out_dir: str) -> sqlite3.Connection:
+def _legacy_db_path(out_dir: str) -> str:
+    return os.path.join(out_dir, LEGACY_DB_FILENAME)
+
+
+def _ensure_named_shared_db(out_dir: str) -> str:
     path = db_path(out_dir)
+    legacy_path = _legacy_db_path(out_dir)
+    if not os.path.exists(path) and os.path.exists(legacy_path):
+        shutil.copy2(legacy_path, path)
+    return path
+
+
+def connect_db(out_dir: str) -> sqlite3.Connection:
+    path = _ensure_named_shared_db(out_dir)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")

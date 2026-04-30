@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retrain residual models (speed + direction) on all data and output next-day predictions.",
     )
-    parser.add_argument("--db", default="data/wind_data.db", help="Path to SQLite DB.")
+    parser.add_argument("--db", default="data/wind_data_all_sites.db", help="Path to SQLite DB.")
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
@@ -1367,7 +1367,7 @@ def save_prediction_plot(
     order_map = {label: handle for handle, label in zip(handles, labels)}
     ordered_handles = [order_map[label] for label in desired_order if label in order_map]
     ordered_labels = [label for label in desired_order if label in order_map]
-    ax.legend(
+    legend = ax.legend(
         ordered_handles,
         ordered_labels,
         loc="upper left",
@@ -1375,6 +1375,9 @@ def save_prediction_plot(
         borderaxespad=0.0,
         fontsize=legend_fs,
     )
+    legend.get_frame().set_facecolor("white")
+    legend.get_frame().set_alpha(0.96)
+    legend.set_zorder(20)
     ax.set_xticks(x, table["hour_label"], rotation=0)
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)
@@ -1786,7 +1789,18 @@ def save_current_day_plot(
                 .str.lower()
                 .isin(["true", "1", "yes"])
             )
-            frame = frame[is_future_mask | frame["time_local"].eq(issue_anchor)].copy()
+            if bool(is_future_mask.any()):
+                first_future_time = frame.loc[is_future_mask, "time_local"].min()
+                # Keep the partial-hour bridge from the issue anchor up to the
+                # first true future target so prior issued branches connect
+                # cleanly into the next full forecast hour.
+                bridge_mask = (
+                    (frame["time_local"] >= issue_anchor)
+                    & (frame["time_local"] <= first_future_time)
+                )
+                frame = frame[is_future_mask | bridge_mask].copy()
+            else:
+                frame = frame[frame["time_local"] >= issue_anchor].copy()
         frame = frame[frame["time_local"] >= issue_anchor].copy()
         if frame.empty:
             return None
@@ -1852,12 +1866,14 @@ def save_current_day_plot(
 
     fig_size = (8.4, 8.8) if mobile else (14, 7.2)
     title_fs = 14 if mobile else None
+    title_pad = 18 if mobile else 28
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
     meta_fs = 10 if mobile else 9
     mae_fs = 11 if mobile else 10
-    meta_y = 1.16 if mobile else 1.13
+    meta_text_y = 1.19 if mobile else 1.16
+    metric_box_y = 1.29 if mobile else 1.24
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
@@ -2103,7 +2119,7 @@ def save_current_day_plot(
             label="_nolegend_",
         )
 
-    ax.set_title(f"Current-day wind prediction: {day_label}", fontsize=title_fs)
+    ax.set_title(f"Current-day wind prediction: {day_label}", fontsize=title_fs, pad=title_pad)
     ax.set_xlabel("Time", fontsize=label_fs)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
@@ -2203,7 +2219,7 @@ def save_current_day_plot(
         latest_actual_idx = int(actual_idx[-1])
         latest_actual_value = float(actual_avg[latest_actual_idx])
         # Mark "now" at the latest available measured point on the dense timeline.
-        ax.axvline(float(latest_actual_idx), color="gray", linestyle="--", linewidth=1.0)
+        ax.axvline(float(latest_actual_idx), color="gray", linestyle="--", linewidth=1.0, zorder=0.8)
         ax.annotate(
             f"{int(round(latest_actual_value))} kts",
             xy=(latest_actual_idx, latest_actual_value),
@@ -2306,7 +2322,7 @@ def save_current_day_plot(
         child=mse_box,
         pad=0.2,
         frameon=True,
-        bbox_to_anchor=(0.992, meta_y + (0.13 if mobile else 0.11)),
+        bbox_to_anchor=(0.992, metric_box_y),
         bbox_transform=ax.transAxes,
         borderpad=0.35,
     )
@@ -2318,7 +2334,7 @@ def save_current_day_plot(
 
     ax.text(
         0.015,
-        meta_y,
+        meta_text_y,
         _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="left",
@@ -2364,7 +2380,7 @@ def save_current_day_plot(
                 zorder=z,
             )
 
-    layout_top = 0.92 if mobile else 0.965
+    layout_top = 0.89 if mobile else 0.94
     layout_bottom = 0.055 if mobile else 0.04
     fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
     fig.savefig(plot_path, dpi=150)

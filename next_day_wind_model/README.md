@@ -4,7 +4,7 @@ This folder contains a trainable LSTM pipeline that predicts the **next 24 hours
 
 ## Data source
 
-- SQLite database: `data/wind_data.db`
+- SQLite database: `data/wind_data_all_sites.db`
 - Input table: `forecasts`
 - Target table: `observations`
 
@@ -31,7 +31,7 @@ pip install -r next_day_wind_model/requirements.txt
 
 ```bash
 python3 next_day_wind_model/train_lstm.py \
-  --db data/wind_data.db \
+  --db data/wind_data_all_sites.db \
   --site valkenburgsemeer \
   --model HARMONIE \
   --window-hours 72 \
@@ -50,7 +50,7 @@ Tune both:
 
 ```bash
 python3 next_day_wind_model/tune_hyperparameters.py \
-  --db data/wind_data.db \
+  --db data/wind_data_all_sites.db \
   --site valkenburgsemeer \
   --model HARMONIE \
   --n-splits 3 \
@@ -81,7 +81,7 @@ It trains two residual models:
 
 ```bash
 python3 next_day_wind_model/update_model_and_predict.py \
-  --db data/wind_data.db \
+  --db data/wind_data_all_sites.db \
   --site valkenburgsemeer \
   --model HARMONIE \
   --window-hours 72 \

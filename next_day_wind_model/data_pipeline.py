@@ -263,6 +263,10 @@ def _legacy_feature_cols() -> list[str]:
     return ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
 
 
+def _direction_v2_feature_cols() -> list[str]:
+    return ["forecast_avg", "forecast_max", "forecast_dir_sin", "forecast_dir_cos", "month_sin", "month_cos"]
+
+
 def _add_actual_history_features(frame: pd.DataFrame, *, is_target: bool) -> pd.DataFrame:
     out = frame.copy()
     if is_target:
@@ -322,6 +326,10 @@ def _build_feature_sequence(
     elif schema == "legacy":
         feature_cols = _legacy_feature_cols()
         sequence = history_frame[feature_cols]
+    elif schema == "direction_v2":
+        history_features = _add_cyclical_forecast_features(history_frame)
+        feature_cols = _direction_v2_feature_cols()
+        sequence = history_features[feature_cols]
     else:
         raise ValueError(f"Unsupported feature schema: {feature_schema}")
 
@@ -978,7 +986,9 @@ def build_training_arrays(
 def build_all_direction_training_arrays(
     db_path: Path,
     cfg: DatasetConfig,
+    feature_schema: str = "direction_v2",
 ) -> Dict[str, np.ndarray | List[str]]:
+    schema = str(feature_schema).strip().lower()
     (
         X_raw,
         y_actual_raw,
@@ -996,7 +1006,7 @@ def build_all_direction_training_arrays(
         cfg,
         actual_col="actual_dir",
         forecast_target_col="forecast_dir",
-        feature_schema="legacy",
+        feature_schema=schema,
     )
     y_target_raw = _angle_diff_deg(y_actual_raw, y_forecast_raw)
 
@@ -1022,7 +1032,7 @@ def build_all_direction_training_arrays(
         "timestamps": timestamps,
         "anchor_forecast_dir_all_raw": anchor_forecast_dir_all,
         "feature_cols": [str(col) for col in feature_cols.tolist()],
-        "feature_schema": "legacy",
+        "feature_schema": schema,
         "target_col": "actual_dir",
         "target_mode": "residual",
     }

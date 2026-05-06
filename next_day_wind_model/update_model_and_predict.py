@@ -463,6 +463,13 @@ def _next_day_feature_schema_from_scalers(arrays: dict) -> str:
     return "legacy"
 
 
+def _direction_feature_schema_from_scalers(arrays: dict) -> str:
+    x_mean = np.asarray(arrays.get("x_mean"), dtype=float).reshape(-1)
+    if x_mean.shape[0] == 6:
+        return "direction_v2"
+    return "legacy"
+
+
 def _speed_calibration_feature_matrix(
     signal_values: np.ndarray,
     speed_calibration_context: dict | None,
@@ -1445,6 +1452,36 @@ def _interp_hourly_to_dense(hourly_values: np.ndarray, hourly_index: pd.Datetime
     return dense.to_numpy(dtype=np.float32)
 
 
+def _interp_direction_hourly_to_dense(
+    hourly_degrees: np.ndarray,
+    hourly_index: pd.DatetimeIndex,
+    dense_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    direction = pd.Series(hourly_degrees, index=hourly_index, dtype=float).dropna()
+    if direction.empty:
+        return np.full(len(dense_index), np.nan, dtype=np.float32)
+    rad = np.deg2rad(direction.to_numpy(dtype=float) % 360.0)
+    sin_dense = (
+        pd.Series(np.sin(rad), index=direction.index, dtype=float)
+        .reindex(direction.index.union(dense_index))
+        .sort_index()
+        .interpolate(method="time")
+        .reindex(dense_index)
+        .to_numpy(dtype=float)
+    )
+    cos_dense = (
+        pd.Series(np.cos(rad), index=direction.index, dtype=float)
+        .reindex(direction.index.union(dense_index))
+        .sort_index()
+        .interpolate(method="time")
+        .reindex(dense_index)
+        .to_numpy(dtype=float)
+    )
+    dense = np.rad2deg(np.arctan2(sin_dense, cos_dense)) % 360.0
+    dense[np.isnan(sin_dense) | np.isnan(cos_dense)] = np.nan
+    return dense.astype(np.float32)
+
+
 def _interp_series_at_times(series: pd.Series, query_index: pd.DatetimeIndex) -> np.ndarray:
     """
     Linearly interpolate a frozen forecast curve at arbitrary timestamps.
@@ -1738,7 +1775,7 @@ def build_current_day_table(
         history_utc_for_targets = history_local_for_targets.tz_convert("UTC")
         target_utc_index = target_local_index.tz_convert("UTC")
 
-        feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+        direction_feature_schema = _direction_feature_schema_from_scalers(direction_scalers)
         context = build_anchor_forecast_context(
             db_path=db_path,
             cfg=cfg,
@@ -1750,12 +1787,29 @@ def build_current_day_table(
         future_frame = context["target_frame"]
         if history_frame is None or future_frame is None:
             raise ValueError("Missing forecast rows for current-day anchor context.")
-        if history_frame[feature_cols].isna().any().any():
-            raise ValueError("Missing forecast rows in history window for current-day inference.")
         if future_frame[["forecast_avg", "forecast_dir"]].isna().any().any():
             raise ValueError("Missing forecast rows in current-day target window.")
 
-        x_window = history_frame[feature_cols].to_numpy(dtype=np.float32)[np.newaxis, :, :]
+        if direction_feature_schema == "direction_v2":
+            history_features = history_frame.copy()
+            dir_rad = np.deg2rad(pd.to_numeric(history_features["forecast_dir"], errors="coerce").astype(float) % 360.0)
+            history_features["forecast_dir_sin"] = np.sin(dir_rad)
+            history_features["forecast_dir_cos"] = np.cos(dir_rad)
+            feature_cols = [
+                "forecast_avg",
+                "forecast_max",
+                "forecast_dir_sin",
+                "forecast_dir_cos",
+                "month_sin",
+                "month_cos",
+            ]
+        else:
+            history_features = history_frame
+            feature_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+        if history_features[feature_cols].isna().any().any():
+            raise ValueError("Missing forecast rows in history window for current-day inference.")
+
+        x_window = history_features[feature_cols].to_numpy(dtype=np.float32)[np.newaxis, :, :]
         x_dir = _apply_standardizer(x_window, direction_scalers["x_mean"], direction_scalers["x_std"]).astype(np.float32)
 
         direction_model.eval()
@@ -1894,9 +1948,13 @@ def build_current_day_table(
     fc_speed_dense = _interp_hourly_to_dense(fc_avg, full_hours, dense_times)
     fc_min_dense = _interp_hourly_to_dense(fc_low, full_hours, dense_times)
     fc_max_dense = _interp_hourly_to_dense(fc_high, full_hours, dense_times)
-    fc_dir_dense = _interp_hourly_to_dense(fc_today["forecast_dir"].to_numpy(dtype=np.float32), full_hours, dense_times)
+    fc_dir_dense = _interp_direction_hourly_to_dense(
+        fc_today["forecast_dir"].to_numpy(dtype=np.float32),
+        full_hours,
+        dense_times,
+    )
     lstm_full_dense = _interp_hourly_to_dense(intraday_speed_full.astype(np.float32), full_hours, dense_times)
-    lstm_dir_full_dense = _interp_hourly_to_dense(lstm_dir_full.astype(np.float32), full_hours, dense_times)
+    lstm_dir_full_dense = _interp_direction_hourly_to_dense(lstm_dir_full.astype(np.float32), full_hours, dense_times)
 
     rem_hourly_speed = pd.Series(np.nan, index=full_hours, dtype=float)
     rem_hourly_dir = pd.Series(np.nan, index=full_hours, dtype=float)
@@ -1923,12 +1981,10 @@ def build_current_day_table(
         .reindex(dense_times)
         .to_numpy(dtype=np.float32)
     )
-    rem_dense_dir = (
-        rem_hourly_dir.reindex(rem_hourly_dir.index.union(dense_times))
-        .sort_index()
-        .interpolate(method="time")
-        .reindex(dense_times)
-        .to_numpy(dtype=np.float32)
+    rem_dense_dir = _interp_direction_hourly_to_dense(
+        rem_hourly_dir.to_numpy(dtype=np.float32),
+        rem_hourly_dir.index,
+        dense_times,
     )
 
     # Actual measurements at higher cadence (latest known values up to now).
@@ -4317,6 +4373,403 @@ def save_model_gate_eval_history_plot(
     plt.close(fig)
 
 
+def _direction_performance_summary_text(direction_csv: Path | None) -> str:
+    if direction_csv is None or not direction_csv.exists():
+        return (
+            "The spider diagram compares mean absolute error by forecast wind direction. "
+            "Lower values are better."
+        )
+    try:
+        df = pd.read_csv(direction_csv)
+    except Exception:
+        return (
+            "The spider diagram compares mean absolute error by forecast wind direction. "
+            "Lower values are better."
+        )
+    required = {"sector", "forecast_mae", "champion_mae"}
+    if df.empty or not required.issubset(df.columns):
+        return (
+            "The spider diagram compares mean absolute error by forecast wind direction. "
+            "Lower values are better."
+        )
+    for col in ["forecast_mae", "champion_mae"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["gain"] = df["forecast_mae"] - df["champion_mae"]
+    df = df.dropna(subset=["sector", "gain"])
+    if df.empty:
+        return (
+            "The spider diagram compares mean absolute error by forecast wind direction. "
+            "Lower values are better."
+        )
+
+    strong = df[df["gain"] >= 0.25].sort_values("gain", ascending=False)
+    weak = df[df["gain"] < 0.10].sort_values("gain")
+    parts = [
+        "The spider diagram compares mean absolute error by forecast wind direction; lower values are better."
+    ]
+    if not strong.empty:
+        sectors = ", ".join(str(v) for v in strong["sector"].head(4).tolist())
+        parts.append(f"The next-day champion improves most for {sectors} winds.")
+    if not weak.empty:
+        sectors = ", ".join(str(v) for v in weak["sector"].head(4).tolist())
+        parts.append(f"The advantage is smallest for {sectors} winds.")
+    else:
+        parts.append("Across all shown wind sectors the champion is better than Harmonie.")
+    return " ".join(parts)
+
+
+def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: Path) -> None:
+    if not direction_csv.exists():
+        return
+    df = pd.read_csv(direction_csv)
+    required = {"sector", "forecast_mae", "champion_mae"}
+    if df.empty or not required.issubset(df.columns):
+        return
+    order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    df = df.copy()
+    for col in ["forecast_mae", "champion_mae"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "n_points" in df.columns:
+        df["n_points"] = pd.to_numeric(df["n_points"], errors="coerce")
+    df["sector"] = df["sector"].astype(str)
+    df = df.set_index("sector").reindex(order).dropna(subset=["forecast_mae", "champion_mae"])
+    if len(df) < 3:
+        return
+
+    labels = df.index.to_list()
+    harmonie = df["forecast_mae"].to_numpy(dtype=float)
+    champion = df["champion_mae"].to_numpy(dtype=float)
+    weights = df["n_points"].to_numpy(dtype=float) if "n_points" in df.columns else np.ones(len(df), dtype=float)
+    if np.isnan(weights).any() or float(np.nansum(weights)) <= 0.0:
+        weights = np.ones(len(df), dtype=float)
+    harmonie_mae = float(np.average(harmonie, weights=weights))
+    champion_mae = float(np.average(champion, weights=weights))
+    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
+    angles_closed = np.r_[angles, angles[0]]
+    harmonie_closed = np.r_[harmonie, harmonie[0]]
+    champion_closed = np.r_[champion, champion[0]]
+
+    fig = plt.figure(figsize=(7.4, 7.0))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.plot(
+        angles_closed,
+        harmonie_closed,
+        color="#777777",
+        linewidth=2.0,
+        marker="o",
+        markersize=4,
+        label=f"Harmonie ({harmonie_mae:.2f} kts)",
+    )
+    ax.plot(
+        angles_closed,
+        champion_closed,
+        color="#f28e2b",
+        linewidth=2.3,
+        marker="o",
+        markersize=4,
+        label=f"Champion next-day ({champion_mae:.2f} kts)",
+    )
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylim(0.0, 3.5)
+    ax.set_rlabel_position(225)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.grid(color="#d7d7d7", linewidth=0.8)
+    ax.spines["polar"].set_color("#cfcfcf")
+    ax.set_title("MAE for next-day models by forecast wind direction", pad=22, fontsize=14, fontweight="bold")
+    ax.text(
+        0.5,
+        -0.08,
+        "Lower radial value means lower mean absolute error (kts).",
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=10,
+        color="#444444",
+    )
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=1, frameon=False, fontsize=10)
+    fig.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.18)
+    fig.savefig(plot_png, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    plt.close(fig)
+
+
+def save_current_day_direction_performance_csv(
+    db_path: Path,
+    cfg: DatasetConfig,
+    direction_csv: Path,
+) -> Path | None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = pd.read_sql_query(
+            """
+            WITH first_issue AS (
+                SELECT
+                    anchor_ts,
+                    target_ts,
+                    MIN(issued_ts) AS issued_ts
+                FROM prediction_log
+                WHERE site = ?
+                  AND model_type = 'intraday'
+                  AND prediction_kind = 'wind_speed'
+                  AND actual_value IS NOT NULL
+                  AND prediction_value IS NOT NULL
+                  AND harmonie_value IS NOT NULL
+                  AND harmonie_run_ts IS NOT NULL
+                GROUP BY anchor_ts, target_ts
+            )
+            SELECT
+                pl.anchor_ts,
+                pl.issued_ts,
+                pl.target_ts,
+                pl.horizon_hr,
+                pl.prediction_value,
+                pl.harmonie_value,
+                pl.actual_value,
+                fc.wind_dir AS forecast_wind_dir_deg
+            FROM prediction_log AS pl
+            INNER JOIN first_issue AS fi
+                ON pl.anchor_ts = fi.anchor_ts
+               AND pl.target_ts = fi.target_ts
+               AND pl.issued_ts = fi.issued_ts
+            INNER JOIN forecasts AS fc
+                ON fc.site = pl.site
+               AND fc.model = ?
+               AND fc.run_ts = pl.harmonie_run_ts
+               AND fc.target_ts = pl.target_ts
+            WHERE pl.site = ?
+              AND pl.model_type = 'intraday'
+              AND pl.prediction_kind = 'wind_speed'
+              AND pl.actual_value IS NOT NULL
+              AND fc.wind_dir IS NOT NULL
+            ORDER BY pl.target_ts ASC
+            """,
+            conn,
+            params=[cfg.site, cfg.model, cfg.site],
+        )
+    finally:
+        conn.close()
+
+    columns = [
+        "sector",
+        "dir_min_deg",
+        "dir_max_deg",
+        "n_points",
+        "forecast_mae",
+        "superlocal_mae",
+        "mae_gain_vs_harmonie",
+        "forecast_bias_pred_minus_actual",
+        "superlocal_bias_pred_minus_actual",
+        "bias_adjustment_vs_harmonie",
+    ]
+    direction_csv.parent.mkdir(parents=True, exist_ok=True)
+    if rows.empty:
+        pd.DataFrame(columns=columns).to_csv(direction_csv, index=False)
+        return None
+
+    numeric_cols = ["prediction_value", "harmonie_value", "actual_value", "forecast_wind_dir_deg"]
+    for col in numeric_cols:
+        rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    rows = rows.dropna(subset=numeric_cols).copy()
+    if rows.empty:
+        pd.DataFrame(columns=columns).to_csv(direction_csv, index=False)
+        return None
+
+    sector_order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    sector_labels = np.array(sector_order)
+    sector_idx = (np.floor(((rows["forecast_wind_dir_deg"].to_numpy(dtype=float) % 360.0) + 22.5) / 45.0).astype(int) % 8)
+    rows["sector"] = sector_labels[sector_idx]
+    rows["model_abs_error"] = np.abs(rows["prediction_value"] - rows["actual_value"])
+    rows["harmonie_abs_error"] = np.abs(rows["harmonie_value"] - rows["actual_value"])
+    rows["model_error"] = rows["prediction_value"] - rows["actual_value"]
+    rows["harmonie_error"] = rows["harmonie_value"] - rows["actual_value"]
+
+    summary_rows = []
+    for idx, sector in enumerate(sector_order):
+        group = rows[rows["sector"] == sector]
+        if group.empty:
+            summary_rows.append(
+                {
+                    "sector": sector,
+                    "dir_min_deg": float((idx * 45 - 22.5) % 360.0),
+                    "dir_max_deg": float((idx * 45 + 22.5) % 360.0),
+                    "n_points": 0,
+                    "forecast_mae": np.nan,
+                    "superlocal_mae": np.nan,
+                    "mae_gain_vs_harmonie": np.nan,
+                    "forecast_bias_pred_minus_actual": np.nan,
+                    "superlocal_bias_pred_minus_actual": np.nan,
+                    "bias_adjustment_vs_harmonie": np.nan,
+                }
+            )
+            continue
+        forecast_mae = float(group["harmonie_abs_error"].mean())
+        superlocal_mae = float(group["model_abs_error"].mean())
+        forecast_bias = float(group["harmonie_error"].mean())
+        superlocal_bias = float(group["model_error"].mean())
+        summary_rows.append(
+            {
+                "sector": sector,
+                "dir_min_deg": float((idx * 45 - 22.5) % 360.0),
+                "dir_max_deg": float((idx * 45 + 22.5) % 360.0),
+                "n_points": int(len(group)),
+                "forecast_mae": forecast_mae,
+                "superlocal_mae": superlocal_mae,
+                "mae_gain_vs_harmonie": forecast_mae - superlocal_mae,
+                "forecast_bias_pred_minus_actual": forecast_bias,
+                "superlocal_bias_pred_minus_actual": superlocal_bias,
+                "bias_adjustment_vs_harmonie": superlocal_bias - forecast_bias,
+            }
+        )
+
+    pd.DataFrame(summary_rows, columns=columns).to_csv(direction_csv, index=False)
+    return direction_csv
+
+
+def _bias_phrase(value: float) -> str:
+    if not np.isfinite(value):
+        return "has no stable bias estimate"
+    if abs(value) < 0.15:
+        return "is close to unbiased"
+    direction = "overestimates" if value > 0 else "underestimates"
+    return f"{direction} by {abs(value):.1f} kts"
+
+
+def _current_day_direction_performance_summary_text(direction_csv: Path | None) -> str:
+    if direction_csv is None or not direction_csv.exists():
+        return (
+            "The spider diagram compares realised current-day forecast error by forecast wind direction. "
+            "Lower values are better."
+        )
+    try:
+        df = pd.read_csv(direction_csv)
+    except Exception:
+        return (
+            "The spider diagram compares realised current-day forecast error by forecast wind direction. "
+            "Lower values are better."
+        )
+    required = {
+        "sector",
+        "forecast_mae",
+        "superlocal_mae",
+        "mae_gain_vs_harmonie",
+        "superlocal_bias_pred_minus_actual",
+    }
+    if df.empty or not required.issubset(df.columns):
+        return (
+            "The spider diagram compares realised current-day forecast error by forecast wind direction. "
+            "Lower values are better."
+        )
+    for col in ["forecast_mae", "superlocal_mae", "mae_gain_vs_harmonie", "superlocal_bias_pred_minus_actual"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["sector", "mae_gain_vs_harmonie"]).copy()
+    if df.empty:
+        return (
+            "The spider diagram compares realised current-day forecast error by forecast wind direction. "
+            "Lower values are better."
+        )
+
+    strong = df[df["mae_gain_vs_harmonie"] >= 0.25].sort_values("mae_gain_vs_harmonie", ascending=False)
+    weak = df[df["mae_gain_vs_harmonie"] < 0.10].sort_values("mae_gain_vs_harmonie")
+    parts = [
+        "The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better."
+    ]
+    if not strong.empty:
+        best = strong.iloc[0]
+        sectors = ", ".join(str(v) for v in strong["sector"].head(4).tolist())
+        parts.append(
+            f"Super local improves most for {sectors} winds; the largest gain is {float(best['mae_gain_vs_harmonie']):.1f} kts for {best['sector']}."
+        )
+        parts.append(
+            f"For that sector the super-local model {_bias_phrase(float(best['superlocal_bias_pred_minus_actual']))} on average."
+        )
+    if not weak.empty:
+        sectors = ", ".join(str(v) for v in weak["sector"].head(4).tolist())
+        parts.append(f"The advantage is smallest, or negative, for {sectors} winds.")
+    else:
+        parts.append("Across all shown wind sectors the super-local current-day model is better than Harmonie.")
+    return " ".join(parts)
+
+
+def save_current_day_direction_performance_spider_plot(direction_csv: Path, plot_png: Path) -> None:
+    if not direction_csv.exists():
+        return
+    df = pd.read_csv(direction_csv)
+    required = {"sector", "forecast_mae", "superlocal_mae"}
+    if df.empty or not required.issubset(df.columns):
+        return
+    order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    df = df.copy()
+    for col in ["forecast_mae", "superlocal_mae"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "n_points" in df.columns:
+        df["n_points"] = pd.to_numeric(df["n_points"], errors="coerce")
+    df["sector"] = df["sector"].astype(str)
+    df = df.set_index("sector").reindex(order).dropna(subset=["forecast_mae", "superlocal_mae"])
+    if len(df) < 3:
+        return
+
+    labels = df.index.to_list()
+    harmonie = df["forecast_mae"].to_numpy(dtype=float)
+    superlocal = df["superlocal_mae"].to_numpy(dtype=float)
+    weights = df["n_points"].to_numpy(dtype=float) if "n_points" in df.columns else np.ones(len(df), dtype=float)
+    if np.isnan(weights).any() or float(np.nansum(weights)) <= 0.0:
+        weights = np.ones(len(df), dtype=float)
+    harmonie_mae = float(np.average(harmonie, weights=weights))
+    superlocal_mae = float(np.average(superlocal, weights=weights))
+    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
+    angles_closed = np.r_[angles, angles[0]]
+    harmonie_closed = np.r_[harmonie, harmonie[0]]
+    superlocal_closed = np.r_[superlocal, superlocal[0]]
+
+    fig = plt.figure(figsize=(7.4, 7.0))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.plot(
+        angles_closed,
+        harmonie_closed,
+        color="#777777",
+        linewidth=2.0,
+        marker="o",
+        markersize=4,
+        label=f"Harmonie ({harmonie_mae:.2f} kts)",
+    )
+    ax.plot(
+        angles_closed,
+        superlocal_closed,
+        color="#f28e2b",
+        linewidth=2.3,
+        marker="o",
+        markersize=4,
+        label=f"Super local current-day ({superlocal_mae:.2f} kts)",
+    )
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylim(0.0, 3.5)
+    ax.set_rlabel_position(225)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.grid(color="#d7d7d7", linewidth=0.8)
+    ax.spines["polar"].set_color("#cfcfcf")
+    ax.set_title("MAE for current-day models by forecast wind direction", pad=22, fontsize=14, fontweight="bold")
+    ax.text(
+        0.5,
+        -0.08,
+        "Lower radial value means lower mean absolute error (kts).",
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=10,
+        color="#444444",
+    )
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=1, frameon=False, fontsize=10)
+    fig.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.18)
+    plot_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_png, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    plt.close(fig)
+
+
 def publish_web_dashboard(
     web_out_dir: Path,
     local_tz: str,
@@ -4332,6 +4785,10 @@ def publish_web_dashboard(
     daily_mae_csv: Path | None,
     gate_eval_png: Path | None,
     gate_eval_csv: Path | None,
+    direction_spider_png: Path | None,
+    direction_spider_csv: Path | None,
+    current_day_direction_spider_png: Path | None,
+    current_day_direction_spider_csv: Path | None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4347,6 +4804,10 @@ def publish_web_dashboard(
         (daily_mae_csv, "daily_mae_history.csv"),
         (gate_eval_png, "model_gate_eval_history.png"),
         (gate_eval_csv, "model_gate_eval_history.csv"),
+        (direction_spider_png, "model_gate_direction_spider.png"),
+        (direction_spider_csv, "model_gate_speed_by_direction.csv"),
+        (current_day_direction_spider_png, "current_day_direction_spider.png"),
+        (current_day_direction_spider_csv, "current_day_speed_by_direction.csv"),
     ]
     copied: dict[str, str] = {}
     for src, dst_name in publish_pairs:
@@ -4386,6 +4847,44 @@ def publish_web_dashboard(
       <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
       <img src="{gate_eval_src}" alt="Model gate evaluation history">
     </div>"""
+    direction_spider_row = ""
+    if "model_gate_direction_spider.png" in copied:
+        direction_spider_src = f"model_gate_direction_spider.png?v={cache_bust}"
+        direction_text = _direction_performance_summary_text(direction_spider_csv)
+        direction_spider_row = f"""
+      <div class="direction-card">
+      <div class="direction-copy">
+        <h3>Next-day performance by wind direction</h3>
+        <p class="desc">{direction_text}</p>
+      </div>
+      <div class="direction-plot">
+        <img src="{direction_spider_src}" alt="Next-day prediction performance by wind direction">
+      </div>
+    </div>"""
+    current_day_direction_spider_row = ""
+    if "current_day_direction_spider.png" in copied:
+        current_day_direction_spider_src = f"current_day_direction_spider.png?v={cache_bust}"
+        current_day_direction_text = _current_day_direction_performance_summary_text(
+            current_day_direction_spider_csv
+        )
+        current_day_direction_spider_row = f"""
+      <div class="direction-card">
+      <div class="direction-copy">
+        <h3>Current-day performance by wind direction</h3>
+        <p class="desc">{current_day_direction_text}</p>
+      </div>
+      <div class="direction-plot">
+        <img src="{current_day_direction_spider_src}" alt="Current-day prediction performance by wind direction">
+      </div>
+    </div>"""
+    performance_section = ""
+    if current_day_direction_spider_row or direction_spider_row:
+        performance_section = f"""
+    <section class="card performance-section">
+      <h2 class="section-title">How much better are the super local forecasts?</h2>
+{current_day_direction_spider_row}
+{direction_spider_row}
+    </section>"""
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -4402,11 +4901,19 @@ def publish_web_dashboard(
     .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }}
     .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }}
     .desc {{ margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }}
+    .section-title {{ margin: 0 0 18px 0; font-size: 24px; line-height: 1.2; color: #111; }}
+    .performance-section h3 {{ margin: 0 0 8px 0; font-size: 19px; }}
+    .direction-card {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 18px; }}
+    .direction-card + .direction-card {{ border-top: 1px solid #e6e6e6; margin-top: 18px; padding-top: 18px; }}
+    .direction-copy {{ padding: 4px 8px 4px 2px; }}
+    .direction-plot img {{ max-width: 620px; margin: 0 auto; }}
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
     @media (max-width: 768px) {{
       body {{ margin: 10px; }}
       h1 {{ font-size: 24px; margin: 0 0 6px 0; }}
       h2 {{ font-size: 20px; margin: 0 0 6px 0; }}
+      .section-title {{ font-size: 21px; margin: 0 0 12px 0; }}
+      .performance-section h3 {{ font-size: 17px; margin: 0 0 6px 0; }}
       .meta {{ margin: 0 0 10px 0; font-size: 14px; }}
       .overview {{ font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }}
       .overview-desktop {{ display: none; }}
@@ -4414,6 +4921,9 @@ def publish_web_dashboard(
       .grid {{ gap: 12px; }}
       .card {{ padding: 8px; border-radius: 6px; }}
       .desc {{ font-size: 14px; margin: 2px 0 8px 0; }}
+      .direction-card {{ display: block; }}
+      .direction-copy {{ padding: 0; }}
+      .direction-plot img {{ max-width: none; margin: 0; }}
       img {{ max-height: 60vh; object-fit: contain; }}
     }}
   </style>
@@ -4446,6 +4956,7 @@ def publish_web_dashboard(
       </picture>
     </div>
 {gate_eval_card}
+{performance_section}
   </div>
   <p class="overview overview-mobile">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
@@ -4627,6 +5138,10 @@ def main() -> None:
     model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
     intraday_model_selection_report: dict = {"enabled": False, "reason": "skip_training"}
     gate_eval_details_csv_src: Path | None = None
+    gate_eval_direction_csv_src: Path | None = None
+    gate_eval_direction_spider_png_src: Path | None = None
+    current_day_direction_csv_src: Path | None = None
+    current_day_direction_spider_png_src: Path | None = None
     intraday_gate_eval_details_csv_src: Path | None = None
     speed_calibration: dict | None = None
     pre_run_champion_states = _load_active_champion_states(
@@ -4987,8 +5502,37 @@ def main() -> None:
             speed_X_eval_champion = _apply_standardizer(
                 speed_X_eval_champion_raw, champion_speed_arrays["x_mean"], champion_speed_arrays["x_std"]
             ).astype(np.float32)
+            champion_direction_feature_schema = _direction_feature_schema_from_scalers(champion_direction_arrays)
+            if champion_direction_feature_schema == str(direction_arrays_full.get("feature_schema", "direction_v2")):
+                direction_X_eval_champion_raw = direction_X_eval_raw
+                direction_forecast_eval_champion = direction_forecast_eval
+                direction_actual_eval_champion = direction_actual_eval
+            else:
+                champion_direction_arrays_full = build_all_direction_training_arrays(
+                    db_path,
+                    cfg,
+                    feature_schema=champion_direction_feature_schema,
+                )
+                champion_direction_eval_start = _eval_start_index(
+                    int(champion_direction_arrays_full["X_all"].shape[0]),
+                    args.challenge_eval_split,
+                    args.challenge_min_eval_samples,
+                )
+                direction_X_eval_champion_raw = _inverse_standardizer(
+                    champion_direction_arrays_full["X_all"][champion_direction_eval_start:],
+                    champion_direction_arrays_full["x_mean"],
+                    champion_direction_arrays_full["x_std"],
+                ).astype(np.float32)
+                direction_forecast_eval_champion = champion_direction_arrays_full["y_forecast_all_raw"][
+                    champion_direction_eval_start:
+                ]
+                direction_actual_eval_champion = champion_direction_arrays_full["y_actual_all_raw"][
+                    champion_direction_eval_start:
+                ]
             direction_X_eval_champion = _apply_standardizer(
-                direction_X_eval_raw, champion_direction_arrays["x_mean"], champion_direction_arrays["x_std"]
+                direction_X_eval_champion_raw,
+                champion_direction_arrays["x_mean"],
+                champion_direction_arrays["x_std"],
             ).astype(np.float32)
 
             champion_speed_eval_pred = _predict_speed_batch(
@@ -5007,12 +5551,12 @@ def main() -> None:
                 _predict_direction_batch(
                     champion_direction_model,
                     direction_X_eval_champion,
-                    direction_forecast_eval,
+                    direction_forecast_eval_champion,
                     y_mean=float(champion_direction_arrays["y_mean"][0]),
                     y_std=float(champion_direction_arrays["y_std"][0]),
                     device=device,
                 ),
-                direction_actual_eval,
+                direction_actual_eval_champion,
             )
 
             speed_promotion_summary = summarize_champion_vs_challenger(
@@ -5169,7 +5713,10 @@ def main() -> None:
                 target_name="wind_direction",
                 target_mode=direction_target_mode,
                 output_activation="linear",
-                extra={"trained_at_utc": now_train_utc},
+                extra={
+                    "trained_at_utc": now_train_utc,
+                    "feature_schema": str(direction_arrays_full.get("feature_schema", "direction_v2")),
+                },
             )
             np.save(direction_scalers_path["x_mean"], direction_arrays["x_mean"])
             np.save(direction_scalers_path["x_std"], direction_arrays["x_std"])
@@ -5243,6 +5790,10 @@ def main() -> None:
                         "challenger_bias_pred_minus_actual": float(np.mean(challenger_vals - actual_vals)),
                         "champion_mae": float(np.mean(np.abs(champion_vals - actual_vals))),
                         "champion_bias_pred_minus_actual": float(np.mean(champion_vals - actual_vals)),
+                        "champion_mae_gain_vs_forecast": float(
+                            np.mean(np.abs(forecast_vals - actual_vals))
+                            - np.mean(np.abs(champion_vals - actual_vals))
+                        ),
                         "challenger_mae_gain_vs_forecast": float(
                             np.mean(np.abs(forecast_vals - actual_vals))
                             - np.mean(np.abs(challenger_vals - actual_vals))
@@ -5254,14 +5805,19 @@ def main() -> None:
                     }
                 )
             gate_eval_direction_csv = details_dir / f"{stamp}_model_gate_eval_speed_by_direction.csv"
-            pd.DataFrame(direction_rows).to_csv(gate_eval_direction_csv, index=False)
+            gate_eval_direction_stable_csv = out_dir / "model_gate_eval_speed_by_direction.csv"
+            direction_frame = pd.DataFrame(direction_rows)
+            direction_frame.to_csv(gate_eval_direction_csv, index=False)
+            direction_frame.to_csv(gate_eval_direction_stable_csv, index=False)
             agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
             agg_eval.to_csv(gate_eval_details_csv, index=False)
             gate_eval_details_csv_src = gate_eval_details_csv
+            gate_eval_direction_csv_src = gate_eval_direction_stable_csv
             model_selection_report["speed_eval_details_csv"] = str(gate_eval_details_csv)
             model_selection_report["speed_eval_direction_csv"] = str(gate_eval_direction_csv)
+            model_selection_report["speed_eval_direction_stable_csv"] = str(gate_eval_direction_stable_csv)
 
         intraday_challenger_extra = {
             "trained_at_utc": now_train_utc,
@@ -5434,7 +5990,7 @@ def main() -> None:
         cfg=cfg,
         x_mean=direction_arrays["x_mean"],
         x_std=direction_arrays["x_std"],
-        feature_schema="legacy",
+        feature_schema=_direction_feature_schema_from_scalers(direction_arrays),
     )
     speed_inference_calibration_context = _build_speed_calibration_context(
         anchor_dir_deg=float(inference_input_speed["anchor_forecast_dir"]),
@@ -5677,6 +6233,20 @@ def main() -> None:
             local_tz=args.local_timezone,
             prior_prediction_tables=current_day_prior_prediction_tables,
         )
+        current_day_direction_csv = out_dir / "current_day_eval_speed_by_direction.csv"
+        current_day_direction_spider_png = out_dir / "current_day_direction_spider.png"
+        if save_current_day_direction_performance_csv(
+            db_path=db_path,
+            cfg=cfg,
+            direction_csv=current_day_direction_csv,
+        ):
+            current_day_direction_csv_src = current_day_direction_csv
+            save_current_day_direction_performance_spider_plot(
+                current_day_direction_csv,
+                current_day_direction_spider_png,
+            )
+            if current_day_direction_spider_png.exists():
+                current_day_direction_spider_png_src = current_day_direction_spider_png
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
     current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
@@ -5799,6 +6369,24 @@ def main() -> None:
                 detail_files = sorted(details_dir.glob("*_model_gate_eval_speed.csv"))
                 if detail_files:
                     gate_eval_details_csv_src = detail_files[-1]
+        if gate_eval_direction_csv_src is None:
+            stable_direction_csv = out_dir / "model_gate_eval_speed_by_direction.csv"
+            if stable_direction_csv.exists():
+                gate_eval_direction_csv_src = stable_direction_csv
+            else:
+                details_dir = out_dir / "model_gate_eval_details"
+                if details_dir.exists():
+                    direction_files = sorted(details_dir.glob("*_model_gate_eval_speed_by_direction.csv"))
+                    if direction_files:
+                        gate_eval_direction_csv_src = direction_files[-1]
+        if gate_eval_direction_csv_src is not None:
+            gate_eval_direction_spider_png = out_dir / "model_gate_direction_spider.png"
+            save_wind_direction_performance_spider_plot(
+                gate_eval_direction_csv_src,
+                gate_eval_direction_spider_png,
+            )
+            if gate_eval_direction_spider_png.exists():
+                gate_eval_direction_spider_png_src = gate_eval_direction_spider_png
         if gate_eval_history_csv_src is not None:
             save_model_gate_eval_history_plot(
                 gate_eval_history_csv_src,
@@ -5824,6 +6412,10 @@ def main() -> None:
             daily_mae_csv=daily_mae_csv_src,
             gate_eval_png=gate_eval_history_png_src,
             gate_eval_csv=gate_eval_history_csv_src,
+            direction_spider_png=gate_eval_direction_spider_png_src,
+            direction_spider_csv=gate_eval_direction_csv_src,
+            current_day_direction_spider_png=current_day_direction_spider_png_src,
+            current_day_direction_spider_csv=current_day_direction_csv_src,
         )
         if args.git_auto_push_pages:
             repo_root = Path(__file__).resolve().parents[1]
@@ -5942,6 +6534,14 @@ def main() -> None:
         "model_gate_eval_history_csv": None if gate_eval_history_csv_src is None else str(gate_eval_history_csv_src),
         "model_gate_eval_history_png": None if gate_eval_history_png_src is None else str(gate_eval_history_png_src),
         "model_gate_eval_details_csv": None if gate_eval_details_csv_src is None else str(gate_eval_details_csv_src),
+        "model_gate_direction_csv": None if gate_eval_direction_csv_src is None else str(gate_eval_direction_csv_src),
+        "model_gate_direction_spider_png": (
+            None if gate_eval_direction_spider_png_src is None else str(gate_eval_direction_spider_png_src)
+        ),
+        "current_day_direction_csv": None if current_day_direction_csv_src is None else str(current_day_direction_csv_src),
+        "current_day_direction_spider_png": (
+            None if current_day_direction_spider_png_src is None else str(current_day_direction_spider_png_src)
+        ),
         "web_dashboard_dir": None if web_publish is None else str(Path(args.web_out_dir).resolve()),
         "web_dashboard_files": web_publish,
         "web_dashboard_git_publish": git_publish,
@@ -6012,6 +6612,14 @@ def main() -> None:
     if daily_mae_csv is not None and daily_mae_png is not None:
         print(f"Daily MAE history saved to: {daily_mae_csv}")
         print(f"Daily MAE history plot saved to: {daily_mae_png}")
+    if gate_eval_direction_csv_src is not None:
+        print(f"Direction performance summary saved to: {gate_eval_direction_csv_src}")
+    if gate_eval_direction_spider_png_src is not None:
+        print(f"Direction performance spider plot saved to: {gate_eval_direction_spider_png_src}")
+    if current_day_direction_csv_src is not None:
+        print(f"Current-day direction performance summary saved to: {current_day_direction_csv_src}")
+    if current_day_direction_spider_png_src is not None:
+        print(f"Current-day direction performance spider plot saved to: {current_day_direction_spider_png_src}")
     if intraday_model_selection_report.get("enabled"):
         print(
             "Intraday selection | "

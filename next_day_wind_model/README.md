@@ -110,9 +110,14 @@ This creates:
 - `next_day_wind_model/artifacts/next_day_lstm_direction_residual.pt`
 - `next_day_wind_model/web_dashboard/index.html` (static dashboard)
 
-## Browser Dashboard (Public-Friendly)
+## Browser Dashboard + Rider Portal
 
-Each normal run (non-test mode) now updates a static dashboard folder:
+The forecast dashboard and the rider/session features are intentionally deployed as two linked apps:
+
+- Forecast dashboard: static HTML/images/CSVs, suitable for GitHub Pages.
+- Rider portal: separate Flask app for login, profiles, surf experience submission, measured-wind attachment, and submissions/detail/delete.
+
+Each normal model run (non-test mode) updates the static dashboard folder:
 
 - `next_day_wind_model/web_dashboard/index.html`
 - `next_day_wind_model/web_dashboard/current_day_predictions.png`
@@ -127,15 +132,47 @@ python3 -m http.server 8080 -d next_day_wind_model/web_dashboard
 
 Then browse to `http://<server-ip>:8080`.
 
-For public hosting, publish the `next_day_wind_model/web_dashboard` folder via:
+For the rider portal companion app, run Flask separately:
+
+```bash
+pip install -r next_day_wind_model/requirements.txt
+python3 next_day_wind_model/web_dashboard/app.py
+```
+
+Then browse to `http://127.0.0.1:8080`.
+
+For public hosting, publish the static dashboard folder via:
 
 - GitHub Pages (commit and push updated dashboard files on your cron cadence), or
 - any web server (Nginx/Caddy/Apache) serving that directory.
 
+Host the Flask rider portal separately, for example on a small VM, PaaS, or internal server. The static dashboard links to the portal; GitHub Pages does not run Flask.
+
+Deployment URL settings:
+
+- Static dashboard -> rider portal: set `COMPANION_APP_BASE_URL` or pass `--companion-app-base-url`.
+- Rider portal -> static dashboard: set `FORECAST_DASHBOARD_BASE_URL`.
+- For production, set `WIND_DASHBOARD_SECRET_KEY` and usually `WIND_DASHBOARD_COOKIE_SECURE=true`.
+- Do not point users at the rider portal's `/forecast-preview` path for the forecast dashboard. That path redirects to `FORECAST_DASHBOARD_BASE_URL` so the portal cannot serve an outdated dashboard copy.
+
 Useful web options:
 
 - `--web-out-dir next_day_wind_model/web_dashboard`
+- `--web-out-dir docs` when GitHub Pages is configured to publish the repository `docs/` folder
 - `--web-refresh-seconds 900`
+- `--companion-app-base-url https://your-rider-portal.example.com`
+
+Example local split:
+
+```bash
+python3 -m http.server 8081 -d next_day_wind_model/web_dashboard
+
+FORECAST_DASHBOARD_BASE_URL=http://127.0.0.1:8081 \
+COMPANION_APP_BASE_URL=http://127.0.0.1:8080 \
+python3 next_day_wind_model/web_dashboard/app.py
+```
+
+If your GitHub Pages site is served from `docs/`, use `--web-out-dir docs` in the prediction/update job and set `FORECAST_DASHBOARD_BASE_URL` to the public GitHub Pages URL. Serving an older generated folder locally will show older plot timestamps even though the rider portal itself is current.
 
 Plot notes:
 - Date title uses European style (e.g. `1 March 2026`).

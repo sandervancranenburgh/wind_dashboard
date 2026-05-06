@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import html
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -188,6 +190,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=900,
         help="Auto-refresh interval for dashboard HTML.",
+    )
+    parser.add_argument(
+        "--companion-app-base-url",
+        default=os.environ.get("COMPANION_APP_BASE_URL", "http://127.0.0.1:8080"),
+        help="Public base URL for the Flask rider portal companion app linked from the static dashboard.",
     )
     parser.add_argument(
         "--git-auto-push-pages",
@@ -4789,6 +4796,7 @@ def publish_web_dashboard(
     direction_spider_csv: Path | None,
     current_day_direction_spider_png: Path | None,
     current_day_direction_spider_csv: Path | None,
+    companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4823,6 +4831,16 @@ def publish_web_dashboard(
     generated_local_str = generated_local.strftime("%d %B %Y %H:%M:%S %Z")
     cache_bust = int(datetime.now(timezone.utc).timestamp())
     refresh = max(60, int(web_refresh_seconds))
+    companion_base = (companion_app_base_url or "").rstrip("/")
+    companion_links = ""
+    if companion_base:
+        companion_url = html.escape(companion_base)
+        companion_links = f"""
+    <nav class="dashboard-actions" aria-label="Rider portal">
+      <a class="button primary" href="{companion_url}/">Rider portal</a>
+      <a class="button" href="{companion_url}/experience/new">Submit experience</a>
+      <a class="button" href="{companion_url}/experiences">My sessions</a>
+    </nav>"""
     current_day_mobile_src = (
         f"current_day_predictions_mobile.png?v={cache_bust}"
         if "current_day_predictions_mobile.png" in copied
@@ -4895,6 +4913,10 @@ def publish_web_dashboard(
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
+    .page-header {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; flex-wrap: wrap; }}
+    .dashboard-actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }}
+    .button {{ display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font-size: 15px; }}
+    .button.primary {{ border-color: #135f86; background: #135f86; color: #fff; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
     .overview {{ color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }}
     .overview-mobile {{ display: none; }}
@@ -4910,6 +4932,8 @@ def publish_web_dashboard(
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
     @media (max-width: 768px) {{
       body {{ margin: 10px; }}
+      .page-header {{ display: block; }}
+      .dashboard-actions {{ justify-content: flex-start; margin: 8px 0 10px 0; }}
       h1 {{ font-size: 24px; margin: 0 0 6px 0; }}
       h2 {{ font-size: 20px; margin: 0 0 6px 0; }}
       .section-title {{ font-size: 21px; margin: 0 0 12px 0; }}
@@ -4929,8 +4953,13 @@ def publish_web_dashboard(
   </style>
 </head>
 <body>
-  <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
-  <p class="meta">Last updated: {generated_local_str}</p>
+  <header class="page-header">
+    <div>
+      <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
+      <p class="meta">Last updated: {generated_local_str}</p>
+    </div>
+{companion_links}
+  </header>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
     The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
@@ -6416,6 +6445,7 @@ def main() -> None:
             direction_spider_csv=gate_eval_direction_csv_src,
             current_day_direction_spider_png=current_day_direction_spider_png_src,
             current_day_direction_spider_csv=current_day_direction_csv_src,
+            companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
             repo_root = Path(__file__).resolve().parents[1]

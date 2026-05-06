@@ -4,7 +4,7 @@ import math
 import shutil
 import sqlite3
 from datetime import datetime, timezone
-from typing import Iterable, Dict, Any, Optional, Tuple
+from typing import Iterable, Dict, Any, Optional, Tuple, List
 
 
 DB_FILENAME = "wind_data_all_sites.db"
@@ -19,6 +19,15 @@ PREDICTION_LOG_EVAL_COLUMNS = {
     "harmonie_abs_error": "REAL",
     "model_sq_error": "REAL",
     "harmonie_sq_error": "REAL",
+}
+SPOT_TO_SITE = {
+    "Valkenburgse meer": "valkenburgsemeer",
+    "Oostvoornse meer": "oostvoorne",
+}
+SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
+    "min_measured_wind_speed": "REAL",
+    "mean_measured_direction": "REAL",
+    "mean_measured_direction_label": "TEXT",
 }
 
 
@@ -291,6 +300,77 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pred_target ON predictions(target_ts)")
     _migrate_prediction_log_table(conn)
+    init_account_db(conn)
+    conn.commit()
+
+
+def init_account_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            username_norm TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            created_iso TEXT NOT NULL,
+            last_login_ts INTEGER,
+            last_login_iso TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            rider_name TEXT,
+            rider_weight INTEGER,
+            default_spot TEXT,
+            updated_ts INTEGER NOT NULL,
+            updated_iso TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surf_experiences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            submitted_ts INTEGER NOT NULL,
+            submitted_iso TEXT NOT NULL,
+            rider TEXT NOT NULL,
+            spot TEXT NOT NULL,
+            date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            start_ts INTEGER NOT NULL,
+            end_ts INTEGER NOT NULL,
+            session_rating INTEGER NOT NULL,
+            rider_review TEXT,
+            rider_weight INTEGER,
+            wing_size INTEGER NOT NULL,
+            foil_size INTEGER NOT NULL,
+            rider_notes TEXT,
+            measured_wind_data_json TEXT NOT NULL,
+            measured_wind_status TEXT NOT NULL,
+            measured_wind_point_count INTEGER NOT NULL DEFAULT 0,
+            avg_measured_wind_speed REAL,
+            max_measured_wind_speed REAL,
+            min_measured_wind_speed REAL,
+            avg_measured_wind_dir REAL,
+            mean_measured_direction REAL,
+            mean_measured_direction_label TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    existing_columns = _table_columns(conn, "surf_experiences")
+    for column_name, column_type in SURF_EXPERIENCE_OPTIONAL_COLUMNS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE surf_experiences ADD COLUMN {column_name} {column_type}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_user_date ON surf_experiences(user_id, date, start_time)")
     conn.commit()
 
 
@@ -1696,3 +1776,533 @@ def upsert_predictions(
         n += 1
     conn.commit()
     return n
+
+
+def _now_ms() -> int:
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+
+def _username_norm(username: str) -> str:
+    return username.strip().casefold()
+
+
+def create_user(conn: sqlite3.Connection, username: str, password_hash: str) -> int:
+    now = _now_ms()
+    cur = conn.execute(
+        """
+        INSERT INTO users(username, username_norm, password_hash, created_ts, created_iso)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            username.strip(),
+            _username_norm(username),
+            password_hash,
+            now,
+            _iso_utc_from_ms(now),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def get_user_by_username(conn: sqlite3.Connection, username: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT id, username, username_norm, password_hash, created_ts, created_iso, last_login_ts, last_login_iso
+        FROM users
+        WHERE username_norm = ?
+        """,
+        (_username_norm(username),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row[0]),
+        "username": row[1],
+        "username_norm": row[2],
+        "password_hash": row[3],
+        "created_ts": row[4],
+        "created_iso": row[5],
+        "last_login_ts": row[6],
+        "last_login_iso": row[7],
+    }
+
+
+def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT id, username, username_norm, password_hash, created_ts, created_iso, last_login_ts, last_login_iso
+        FROM users
+        WHERE id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row[0]),
+        "username": row[1],
+        "username_norm": row[2],
+        "password_hash": row[3],
+        "created_ts": row[4],
+        "created_iso": row[5],
+        "last_login_ts": row[6],
+        "last_login_iso": row[7],
+    }
+
+
+def mark_user_login(conn: sqlite3.Connection, user_id: int) -> None:
+    now = _now_ms()
+    conn.execute(
+        """
+        UPDATE users
+        SET last_login_ts = ?, last_login_iso = ?
+        WHERE id = ?
+        """,
+        (now, _iso_utc_from_ms(now), int(user_id)),
+    )
+    conn.commit()
+
+
+def get_user_profile(conn: sqlite3.Connection, user_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT user_id, rider_name, rider_weight, default_spot, updated_ts, updated_iso
+        FROM user_profiles
+        WHERE user_id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "user_id": int(row[0]),
+        "rider_name": row[1] or "",
+        "rider_weight": row[2],
+        "default_spot": row[3] or "",
+        "updated_ts": row[4],
+        "updated_iso": row[5],
+    }
+
+
+def upsert_user_profile(
+    conn: sqlite3.Connection,
+    user_id: int,
+    rider_name: str,
+    rider_weight: Optional[int],
+    default_spot: str,
+) -> None:
+    now = _now_ms()
+    conn.execute(
+        """
+        INSERT INTO user_profiles(
+            user_id, rider_name, rider_weight, default_spot, updated_ts, updated_iso
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            rider_name = excluded.rider_name,
+            rider_weight = excluded.rider_weight,
+            default_spot = excluded.default_spot,
+            updated_ts = excluded.updated_ts,
+            updated_iso = excluded.updated_iso
+        """,
+        (
+            int(user_id),
+            rider_name.strip() or None,
+            rider_weight,
+            default_spot or None,
+            now,
+            _iso_utc_from_ms(now),
+        ),
+    )
+    conn.commit()
+
+
+def _extract_observation_measurement(
+    payload_raw: Optional[str],
+    fallback_value: Any,
+    payload_keys: Iterable[str],
+) -> Optional[float]:
+    payload: Dict[str, Any] = {}
+    if payload_raw:
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            payload = {}
+    value = _extract_first(payload, payload_keys)
+    if value is None:
+        value = fallback_value
+    return _as_float(value)
+
+
+def _wind_direction_label(direction_deg: Optional[float]) -> Optional[str]:
+    if direction_deg is None:
+        return None
+    labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    index = int(((float(direction_deg) % 360.0) + 22.5) // 45.0) % len(labels)
+    return labels[index]
+
+
+def get_measured_wind_for_session(
+    conn: sqlite3.Connection,
+    spot: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> Dict[str, Any]:
+    site = SPOT_TO_SITE.get(spot)
+    if site is None:
+        return {
+            "status": "unavailable",
+            "reason": f"No measured wind site is configured for {spot}.",
+            "site": None,
+            "records": [],
+            "summary": {
+                "point_count": 0,
+                "avg_wind_speed": None,
+                "max_wind_speed": None,
+                "min_wind_speed": None,
+                "mean_wind_dir": None,
+                "mean_wind_dir_label": None,
+            },
+        }
+
+    rows = conn.execute(
+        """
+        SELECT ts, iso_time, wind_speed, wind_gust, wind_dir, payload
+        FROM observations
+        WHERE site = ?
+          AND ts >= ?
+          AND ts <= ?
+        ORDER BY ts
+        """,
+        (site, int(start_ts_ms), int(end_ts_ms)),
+    ).fetchall()
+
+    records = []
+    for ts, iso_time, wind_speed, wind_gust, wind_dir, payload_raw in rows:
+        speed = _extract_observation_measurement(
+            payload_raw,
+            wind_speed,
+            ["AverageWind", "wind_speed", "windspeed", "WS", "ff", "speed", "WindSpeedAvg"],
+        )
+        gust = _extract_observation_measurement(
+            payload_raw,
+            wind_gust,
+            ["MaxWind", "wind_gust", "gust", "WG", "GUST", "fg"],
+        )
+        direction = _extract_observation_measurement(
+            payload_raw,
+            wind_dir,
+            ["WindDirection", "wind_dir", "winddirection", "WD", "DD", "dir", "direction"],
+        )
+        records.append(
+            {
+                "timestamp": int(ts),
+                "iso_time": iso_time,
+                "measured_wind_speed": speed,
+                "measured_wind_gust": gust,
+                "measured_wind_direction": direction,
+            }
+        )
+    speeds = [float(record["measured_wind_speed"]) for record in records if record["measured_wind_speed"] is not None]
+    gusts = [float(record["measured_wind_gust"]) for record in records if record["measured_wind_gust"] is not None]
+    directions = [
+        float(record["measured_wind_direction"]) % 360.0
+        for record in records
+        if record["measured_wind_direction"] is not None
+    ]
+    avg_dir = None
+    if directions:
+        sin_sum = sum(math.sin(math.radians(value)) for value in directions)
+        cos_sum = sum(math.cos(math.radians(value)) for value in directions)
+        avg_dir = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+    summary = {
+        "point_count": len(records),
+        "avg_wind_speed": None if not speeds else sum(speeds) / len(speeds),
+        "max_wind_speed": max(gusts) if gusts else (None if not speeds else max(speeds)),
+        "min_wind_speed": None if not speeds else min(speeds),
+        "mean_wind_dir": avg_dir,
+        "mean_wind_dir_label": _wind_direction_label(avg_dir),
+    }
+    status = "ok" if records else "unavailable"
+    result = {
+        "status": status,
+        "reason": None if records else "No measured wind observations found for the selected spot and time window.",
+        "site": site,
+        "records": records,
+        "summary": summary,
+    }
+    return result
+
+
+def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any]) -> int:
+    now = _now_ms()
+    measured = experience["measured_wind"]
+    summary = measured.get("summary") or {}
+    cur = conn.execute(
+        """
+        INSERT INTO surf_experiences(
+            user_id, submitted_ts, submitted_iso, rider, spot, date, start_time, end_time,
+            start_ts, end_ts, session_rating, rider_review, rider_weight, wing_size,
+            foil_size, rider_notes, measured_wind_data_json, measured_wind_status,
+            measured_wind_point_count, avg_measured_wind_speed, max_measured_wind_speed,
+            min_measured_wind_speed, avg_measured_wind_dir, mean_measured_direction,
+            mean_measured_direction_label
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(experience["user_id"]),
+            now,
+            _iso_utc_from_ms(now),
+            experience["rider"],
+            experience["spot"],
+            experience["date"],
+            experience["start_time"],
+            experience["end_time"],
+            int(experience["start_ts"]),
+            int(experience["end_ts"]),
+            int(experience["session_rating"]),
+            experience.get("rider_review") or None,
+            experience.get("rider_weight"),
+            int(experience["wing_size"]),
+            int(experience["foil_size"]),
+            experience.get("rider_notes") or None,
+            json.dumps(measured, ensure_ascii=False, sort_keys=True),
+            measured.get("status") or "unavailable",
+            int(summary.get("point_count") or 0),
+            summary.get("avg_wind_speed"),
+            summary.get("max_wind_speed"),
+            summary.get("min_wind_speed"),
+            summary.get("mean_wind_dir"),
+            summary.get("mean_wind_dir"),
+            summary.get("mean_wind_dir_label"),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def refresh_surf_experience_measured_wind(
+    conn: sqlite3.Connection,
+    experience_id: int,
+    user_id: Optional[int] = None,
+) -> bool:
+    if user_id is None:
+        row = conn.execute(
+            """
+            SELECT id, spot, start_ts, end_ts
+            FROM surf_experiences
+            WHERE id = ?
+            """,
+            (int(experience_id),),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, spot, start_ts, end_ts
+            FROM surf_experiences
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (int(experience_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return False
+
+    _, spot, start_ts, end_ts = row
+    measured = get_measured_wind_for_session(conn, spot, int(start_ts), int(end_ts))
+    summary = measured.get("summary") or {}
+    conn.execute(
+        """
+        UPDATE surf_experiences
+        SET measured_wind_data_json = json(?),
+            measured_wind_status = ?,
+            measured_wind_point_count = ?,
+            avg_measured_wind_speed = ?,
+            max_measured_wind_speed = ?,
+            min_measured_wind_speed = ?,
+            avg_measured_wind_dir = ?,
+            mean_measured_direction = ?,
+            mean_measured_direction_label = ?
+        WHERE id = ?
+        """,
+        (
+            json.dumps(measured, ensure_ascii=False, sort_keys=True),
+            measured.get("status") or "unavailable",
+            int(summary.get("point_count") or 0),
+            summary.get("avg_wind_speed"),
+            summary.get("max_wind_speed"),
+            summary.get("min_wind_speed"),
+            summary.get("mean_wind_dir"),
+            summary.get("mean_wind_dir"),
+            summary.get("mean_wind_dir_label"),
+            int(experience_id),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def backfill_surf_experience_measured_summaries(
+    conn: sqlite3.Connection,
+    user_id: Optional[int] = None,
+) -> int:
+    if user_id is None:
+        rows = conn.execute(
+            """
+            SELECT id, spot
+            FROM surf_experiences
+            WHERE avg_measured_wind_speed IS NULL
+               OR max_measured_wind_speed IS NULL
+               OR min_measured_wind_speed IS NULL
+               OR mean_measured_direction IS NULL
+               OR mean_measured_direction_label IS NULL
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, spot
+            FROM surf_experiences
+            WHERE user_id = ?
+              AND (
+                avg_measured_wind_speed IS NULL
+                OR max_measured_wind_speed IS NULL
+                OR min_measured_wind_speed IS NULL
+                OR mean_measured_direction IS NULL
+                OR mean_measured_direction_label IS NULL
+              )
+            """,
+            (int(user_id),),
+        ).fetchall()
+
+    refreshed = 0
+    for experience_id, spot in rows:
+        if spot not in SPOT_TO_SITE:
+            continue
+        if refresh_surf_experience_measured_wind(conn, int(experience_id), user_id=user_id):
+            refreshed += 1
+    return refreshed
+
+
+def delete_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> bool:
+    cur = conn.execute(
+        """
+        DELETE FROM surf_experiences
+        WHERE id = ?
+          AND user_id = ?
+        """,
+        (int(experience_id), int(user_id)),
+    )
+    conn.commit()
+    return int(cur.rowcount) > 0
+
+
+def list_surf_experiences(
+    conn: sqlite3.Connection,
+    user_id: int,
+    sort_key: str = "date",
+    sort_dir: str = "desc",
+) -> List[Dict[str, Any]]:
+    allowed_sort = {
+        "date": "date",
+        "spot": "spot COLLATE NOCASE",
+        "start_time": "start_time",
+        "session_rating": "session_rating",
+        "wing_size": "wing_size",
+        "foil_size": "foil_size",
+        "avg_measured_wind_speed": "avg_measured_wind_speed",
+        "max_measured_wind_speed": "max_measured_wind_speed",
+        "min_measured_wind_speed": "min_measured_wind_speed",
+        "mean_measured_direction": "mean_measured_direction",
+    }
+    order_expr = allowed_sort.get(sort_key, "date")
+    direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
+    rows = conn.execute(
+        f"""
+        SELECT id, submitted_iso, rider, spot, date, start_time, end_time,
+               session_rating, rider_review, wing_size, foil_size, rider_notes,
+               measured_wind_status, measured_wind_point_count,
+               avg_measured_wind_speed, max_measured_wind_speed, min_measured_wind_speed,
+               COALESCE(mean_measured_direction, avg_measured_wind_dir),
+               mean_measured_direction_label
+        FROM surf_experiences
+        WHERE user_id = ?
+        ORDER BY {order_expr} {direction}, start_time {direction}, id {direction}
+        """,
+        (int(user_id),),
+    ).fetchall()
+    return [
+        {
+            "id": int(row[0]),
+            "submitted_iso": row[1],
+            "rider": row[2],
+            "spot": row[3],
+            "date": row[4],
+            "start_time": row[5],
+            "end_time": row[6],
+            "session_rating": int(row[7]),
+            "rider_review": row[8] or "",
+            "wing_size": int(row[9]),
+            "foil_size": int(row[10]),
+            "rider_notes": row[11] or "",
+            "measured_wind_status": row[12],
+            "measured_wind_point_count": int(row[13]),
+            "avg_measured_wind_speed": row[14],
+            "max_measured_wind_speed": row[15],
+            "min_measured_wind_speed": row[16],
+            "mean_measured_direction": row[17],
+            "mean_measured_direction_label": row[18] or _wind_direction_label(row[17]),
+        }
+        for row in rows
+    ]
+
+
+def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT id, submitted_iso, rider, spot, date, start_time, end_time,
+               session_rating, rider_review, rider_weight, wing_size, foil_size,
+               rider_notes, measured_wind_data_json, measured_wind_status,
+               measured_wind_point_count, avg_measured_wind_speed,
+               max_measured_wind_speed, min_measured_wind_speed,
+               COALESCE(mean_measured_direction, avg_measured_wind_dir),
+               mean_measured_direction_label
+        FROM surf_experiences
+        WHERE user_id = ?
+          AND id = ?
+        """,
+        (int(user_id), int(experience_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    measured_raw = row[13] or "{}"
+    try:
+        measured = json.loads(measured_raw)
+    except json.JSONDecodeError:
+        measured = {"status": "unavailable", "records": [], "summary": {}}
+    return {
+        "id": int(row[0]),
+        "submitted_iso": row[1],
+        "rider": row[2],
+        "spot": row[3],
+        "date": row[4],
+        "start_time": row[5],
+        "end_time": row[6],
+        "session_rating": int(row[7]),
+        "rider_review": row[8] or "",
+        "rider_weight": row[9],
+        "wing_size": int(row[10]),
+        "foil_size": int(row[11]),
+        "rider_notes": row[12] or "",
+        "measured_wind": measured,
+        "measured_wind_status": row[14],
+        "measured_wind_point_count": int(row[15]),
+        "avg_measured_wind_speed": row[16],
+        "max_measured_wind_speed": row[17],
+        "min_measured_wind_speed": row[18],
+        "mean_measured_direction": row[19],
+        "mean_measured_direction_label": row[20] or _wind_direction_label(row[19]),
+    }

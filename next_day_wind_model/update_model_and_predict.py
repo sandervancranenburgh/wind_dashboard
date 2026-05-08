@@ -4903,7 +4903,7 @@ def publish_web_dashboard(
 {current_day_direction_spider_row}
 {direction_spider_row}
     </section>"""
-    html = f"""<!doctype html>
+    html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -4998,7 +4998,7 @@ def publish_web_dashboard(
 </html>
 """
     index_path = web_out_dir / "index.html"
-    index_path.write_text(html, encoding="utf-8")
+    index_path.write_text(html_doc, encoding="utf-8")
     copied["index.html"] = str(index_path)
     return copied
 

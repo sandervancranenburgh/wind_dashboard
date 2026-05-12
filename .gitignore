@@ -21,6 +21,9 @@ next_day_wind_model/artifacts/
 next_day_wind_model/web_dashboard/*.csv
 next_day_wind_model/web_dashboard/*.png
 next_day_wind_model/web_dashboard/*.html
+docs/*.csv
+docs/*.png
+docs/index.html
 
 # Archived generated material kept outside the active workflow
 old/artifacts/

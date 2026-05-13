@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}My Submissions{% endblock %}
+{% macro sort_link(label, key) -%}
+  {%- set next_dir = 'asc' if sort_key != key or sort_dir == 'desc' else 'desc' -%}
+  <a class="sort-link" href="{{ url_for('experiences', sort=key, dir=next_dir) }}">
+    {{- label -}}
+    {%- if sort_key == key -%}
+      <span class="sort-arrow" aria-label="{{ 'ascending' if sort_dir == 'asc' else 'descending' }}">{% if sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>
+    {%- endif -%}
+  </a>
+{%- endmacro %}
+{% block content %}
+  <main class="page submissions-page">
+    <div class="form-actions">
+      <h2 style="margin-right:auto;">My submissions</h2>
+      <a class="button primary" href="{{ url_for('new_experience') }}">Submit experience</a>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>{{ sort_link('Date', 'date') }}</th>
+            <th>{{ sort_link('Spot', 'spot') }}</th>
+            <th>{{ sort_link('StartTime', 'start_time') }}</th>
+            <th>{{ sort_link('EndTime', 'end_time') }}</th>
+            <th>{{ sort_link('SessionRating', 'session_rating') }}</th>
+            <th>{{ sort_link('Avg wind', 'avg_measured_wind_speed') }}</th>
+            <th>{{ sort_link('Min avg wind', 'min_measured_wind_speed') }}</th>
+            <th>{{ sort_link('Max avg wind', 'max_measured_wind_speed') }}</th>
+            <th>{{ sort_link('Max gust', 'max_measured_wind_gust') }}</th>
+            <th>{{ sort_link('Mean dir', 'mean_measured_direction') }}</th>
+            <th>{{ sort_link('Avg air temp', 'avg_forecast_temperature') }}</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td><a href="{{ url_for('experience_detail', experience_id=row.id) }}">{{ row.date }}</a></td>
+              <td>{{ row.spot }}</td>
+              <td>{{ row.start_time }}</td>
+              <td>{{ row.end_time }}</td>
+              <td>
+                <span class="rating-display" aria-label="{{ row.session_rating }} out of 5">
+                  <span class="rating-value">{{ '%.1f'|format(row.session_rating) }}</span>
+                  <span class="rating-stars" aria-hidden="true">
+                    {% for value in range(1, 6) %}
+                      <span class="{{ 'filled' if value <= row.session_rating else 'empty' }}">&#9733;</span>
+                    {% endfor %}
+                  </span>
+                </span>
+              </td>
+              <td>{{ ('%.1f'|format(row.avg_measured_wind_speed) ~ ' kts') if row.avg_measured_wind_speed is not none else 'n/a' }}</td>
+              <td>{{ ('%.1f'|format(row.min_measured_wind_speed) ~ ' kts') if row.min_measured_wind_speed is not none else 'n/a' }}</td>
+              <td>{{ ('%.1f'|format(row.max_measured_wind_speed) ~ ' kts') if row.max_measured_wind_speed is not none else 'n/a' }}</td>
+              <td>{{ ('%.1f'|format(row.max_measured_wind_gust) ~ ' kts') if row.max_measured_wind_gust is not none else 'n/a' }}</td>
+              <td>{{ row.mean_measured_direction_display or 'n/a' }}</td>
+              <td>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</td>
+              <td>
+                <div class="table-actions">
+                  <a class="button" href="{{ url_for('edit_experience', experience_id=row.id) }}">Modify</a>
+                  <form method="post" action="{{ url_for('delete_experience', experience_id=row.id) }}" onsubmit="return confirm('Delete this surf experience?');">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="12">No submissions yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+{% endblock %}

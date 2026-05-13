@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Submission Detail{% endblock %}
+{% block content %}
+  <main class="page">
+    <div class="form-actions">
+      <h2 style="margin-right:auto;">Submission detail</h2>
+      <a class="button" href="{{ url_for('experiences') }}">My submissions</a>
+      <a class="button primary" href="{{ url_for('new_experience') }}">Submit experience</a>
+    </div>
+    <dl class="detail-list">
+      <dt>Date</dt><dd>{{ row.date }}</dd>
+      <dt>Spot</dt><dd>{{ row.spot }}</dd>
+      <dt>Time</dt><dd>{{ row.start_time }} to {{ row.end_time }}</dd>
+      <dt>Avg air temperature</dt><dd>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</dd>
+      <dt>SessionRating</dt><dd>{{ row.session_rating }}/5</dd>
+      <dt>Rider</dt><dd>{{ row.rider }}</dd>
+      <dt>RiderWeight</dt><dd>{{ row.rider_weight }} kg</dd>
+      <dt>WingSize</dt><dd>{{ row.wing_size }} m2</dd>
+      <dt>FoilSize</dt><dd>{{ row.foil_size }} cm2</dd>
+      <dt>RiderReview</dt><dd>{{ row.rider_review }}</dd>
+      <dt>RiderNotes</dt><dd>{{ row.rider_notes }}</dd>
+      <dt>Measured wind</dt>
+      <dd>
+        {% if row.measured_wind_status == 'ok' %}
+          {% set measured_summary = row.measured_wind.summary or {} %}
+          <div class="wind-summary">
+            <span>avg speed</span><span class="value">{{ '%.1f'|format(row.avg_measured_wind_speed) if row.avg_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>max speed</span><span class="value">{{ '%.1f'|format(row.max_measured_wind_speed) if row.max_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>min speed</span><span class="value">{{ '%.1f'|format(row.min_measured_wind_speed) if row.min_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>max gust</span><span class="value">{{ '%.1f'|format(measured_summary.get('max_wind_gust')) if measured_summary.get('max_wind_gust') is not none else 'n/a' }}</span>
+            <span>Avg direction</span><span class="value">{{ row.mean_measured_direction_display or 'n/a' }}</span>
+          </div>
+        {% else %}
+          unavailable
+        {% endif %}
+      </dd>
+    </dl>
+    <h2>Measured wind</h2>
+    {% if wind_plot.available %}
+      <figure class="wind-plot">
+        <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured wind speed and gust during the session">
+          <defs>
+            <linearGradient id="sessionWindBg" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stop-color="#7fb6ff" stop-opacity="0.45"></stop>
+              <stop offset="42%" stop-color="#4ecdb2" stop-opacity="0.42"></stop>
+              <stop offset="100%" stop-color="#22b36a" stop-opacity="0.45"></stop>
+            </linearGradient>
+            <clipPath id="sessionWindClip">
+              <rect x="{{ wind_plot.pad_left }}" y="{{ wind_plot.pad_top }}" width="{{ wind_plot.plot_width }}" height="{{ wind_plot.plot_height }}"></rect>
+            </clipPath>
+            <marker id="sessionWindArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+              <path d="M 0 0 L 8 4 L 0 8 z" fill="#cc33cc"></path>
+            </marker>
+          </defs>
+          <rect x="{{ wind_plot.pad_left }}" y="{{ wind_plot.pad_top }}" width="{{ wind_plot.plot_width }}" height="{{ wind_plot.plot_height }}" fill="url(#sessionWindBg)"></rect>
+          {% for tick in wind_plot.y_minor_ticks %}
+            <line x1="{{ wind_plot.pad_left }}" y1="{{ tick.y }}" x2="{{ wind_plot.plot_right }}" y2="{{ tick.y }}" stroke="#ffffff" stroke-opacity="0.28"></line>
+          {% endfor %}
+          {% for tick in wind_plot.y_ticks %}
+            <line x1="{{ wind_plot.pad_left }}" y1="{{ tick.y }}" x2="{{ wind_plot.plot_right }}" y2="{{ tick.y }}" stroke="#ffffff" stroke-opacity="0.55"></line>
+            <text x="6" y="{{ tick.label_y }}" font-size="12" fill="#555">{{ tick.label }}</text>
+          {% endfor %}
+          <text x="6" y="{{ wind_plot.pad_top - 5 }}" font-size="12" fill="#555">kts</text>
+          <line x1="{{ wind_plot.pad_left }}" y1="{{ wind_plot.pad_top }}" x2="{{ wind_plot.pad_left }}" y2="{{ wind_plot.axis_y }}" stroke="#888"></line>
+          <line x1="{{ wind_plot.pad_left }}" y1="{{ wind_plot.axis_y }}" x2="{{ wind_plot.plot_right }}" y2="{{ wind_plot.axis_y }}" stroke="#888"></line>
+          {% for tick in wind_plot.hour_ticks %}
+            <line x1="{{ tick.x }}" y1="{{ wind_plot.pad_top }}" x2="{{ tick.x }}" y2="{{ wind_plot.axis_y }}" stroke="#ffffff" stroke-opacity="0.45"></line>
+            <line x1="{{ tick.x }}" y1="{{ wind_plot.axis_y }}" x2="{{ tick.x }}" y2="{{ wind_plot.axis_y + 5 }}" stroke="#777"></line>
+            <text x="{{ tick.x }}" y="{{ wind_plot.axis_y + 20 }}" font-size="12" fill="#555" text-anchor="middle">{{ tick.label }}</text>
+          {% endfor %}
+          {% if wind_plot.harmonie_points %}
+            <polyline points="{{ wind_plot.harmonie_points }}" fill="none" stroke="#777777" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.9"></polyline>
+          {% endif %}
+          {% if wind_plot.superlocal_points %}
+            <polyline points="{{ wind_plot.superlocal_points }}" fill="none" stroke="#f28e2b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.95"></polyline>
+          {% endif %}
+          {% if wind_plot.gust_points %}
+            <polyline points="{{ wind_plot.gust_points }}" fill="none" stroke="#cc33cc" stroke-width="2.0" stroke-dasharray="7 5" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.68"></polyline>
+          {% endif %}
+          {% if wind_plot.speed_points %}
+            <polyline points="{{ wind_plot.speed_points }}" fill="none" stroke="#cc33cc" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)"></polyline>
+          {% endif %}
+          {% for arrow in wind_plot.direction_arrows %}
+            <line x1="{{ arrow.x1 }}" y1="{{ arrow.y1 }}" x2="{{ arrow.x2 }}" y2="{{ arrow.y2 }}" stroke="#cc33cc" stroke-width="1.7" marker-end="url(#sessionWindArrow)"></line>
+          {% endfor %}
+          {% if wind_plot.direction_arrows %}
+            <text x="{{ wind_plot.pad_left }}" y="{{ wind_plot.arrow_y + 28 }}" font-size="12" fill="#555">measured direction</text>
+          {% endif %}
+        </svg>
+        <figcaption>
+          <span class="legend-line speed"></span> speed
+          <span class="legend-line gust"></span> gust
+          {% if wind_plot.superlocal_points %}
+            <span class="legend-line superlocal"></span> Super local
+          {% endif %}
+          {% if wind_plot.harmonie_points %}
+            <span class="legend-line harmonie"></span> Harmonie
+          {% endif %}
+        </figcaption>
+      </figure>
+    {% else %}
+      <p class="desc">Measured wind data are unavailable for this session.</p>
+    {% endif %}
+    {% if current_day_archive_plot %}
+      <h2>Measured wind full day from archive</h2>
+      <figure class="wind-plot">
+        <img src="{{ current_day_archive_plot.url }}" alt="Archived current-day wind prediction for {{ row.date }}">
+      </figure>
+    {% endif %}
+  </main>
+{% endblock %}

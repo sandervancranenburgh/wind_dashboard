@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Rider Portal{% endblock %}</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111; background: #fff; }
+    a { color: #135f86; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    h1 { margin: 0 0 8px 0; }
+    h2 { margin: 0 0 12px 0; }
+    label { display: block; font-weight: 700; margin: 0 0 6px 0; }
+    input, select, textarea {
+      box-sizing: border-box; width: 100%; border: 1px solid #bbb; border-radius: 6px;
+      padding: 9px 10px; font: inherit; background: #fff;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    button, .button {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      border: 1px solid #999; border-radius: 6px; padding: 8px 12px;
+      color: #111; background: #f7f7f7; font: inherit; cursor: pointer;
+    }
+    button.primary, .button.primary { border-color: #135f86; background: #135f86; color: #fff; }
+    button.linklike { border: 0; background: transparent; padding: 0; color: #135f86; }
+    .site-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+    .account-nav { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; min-width: 240px; }
+    .account-nav form { margin: 0; }
+    .account-nav button.nav-link {
+      border: 0; border-radius: 0; padding: 0; color: #135f86; background: transparent;
+      font: inherit; cursor: pointer;
+    }
+    .account-nav button.nav-link:hover { text-decoration: underline; }
+    .meta { color: #555; margin: 0 0 16px 0; }
+    .overview { color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }
+    .overview-mobile { display: none; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }
+    .portal-card { max-width: 720px; }
+    .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
+    .section-title { margin: 0 0 18px 0; font-size: 24px; line-height: 1.2; color: #111; }
+    .performance-section h3 { margin: 0 0 8px 0; font-size: 19px; }
+    .direction-card { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 18px; }
+    .direction-card + .direction-card { border-top: 1px solid #e6e6e6; margin-top: 18px; padding-top: 18px; }
+    .direction-copy { padding: 4px 8px 4px 2px; }
+    .direction-plot img { max-width: 620px; margin: 0 auto; }
+    img { width: 100%; height: auto; display: block; border-radius: 6px; }
+    .page { max-width: 1120px; }
+    .submissions-page { max-width: min(1500px, calc(100vw - 32px)); }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; max-width: 820px; }
+    .form-row-full { grid-column: 1 / -1; }
+    .form-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+    .unit-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+    .unit { color: #555; white-space: nowrap; }
+    .flash-list { max-width: 900px; margin: 0 0 14px 0; }
+    .flash { border: 1px solid #c9d7c5; background: #f2f8f0; border-radius: 6px; padding: 9px 10px; margin-bottom: 8px; }
+    .flash.error { border-color: #e0b1b1; background: #fff4f4; }
+    dialog { border: 1px solid #bbb; border-radius: 8px; padding: 18px; max-width: 430px; width: calc(100vw - 36px); }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .modal-header h2 { margin: 0; }
+    .modal-form { display: grid; gap: 12px; }
+    .modal-split { border-top: 1px solid #ddd; margin-top: 16px; padding-top: 16px; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border-bottom: 1px solid #ddd; padding: 9px 8px; text-align: left; vertical-align: top; }
+    th { background: #f6f6f6; white-space: nowrap; }
+    tbody tr:hover { background: #f8fbfd; }
+    .table-wrap { overflow-x: auto; border: 1px solid #ddd; border-radius: 8px; }
+    .table-wrap table { width: max-content; min-width: 100%; }
+    .sort-link { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+    .sort-arrow { font-size: 11px; line-height: 1; color: #555; }
+    .table-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .table-actions form { margin: 0; }
+    .rating-display { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+    .rating-value { color: #555; font-variant-numeric: tabular-nums; }
+    .rating-stars { display: inline-flex; gap: 1px; font-size: 16px; line-height: 1; letter-spacing: 0; }
+    .rating-stars .filled { color: #f5b400; }
+    .rating-stars .empty { color: #cfd4da; }
+    .stars { display: inline-flex; flex-direction: row-reverse; justify-content: flex-end; gap: 2px; }
+    .stars input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .stars label { font-size: 27px; line-height: 1; color: #aaa; cursor: pointer; margin: 0; }
+    .stars input:checked ~ label, .stars label:hover, .stars label:hover ~ label { color: #c88a00; }
+    .detail-list { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 8px 14px; max-width: 780px; }
+    .detail-list dt { font-weight: 700; }
+    .detail-list dd { margin: 0; }
+    .wind-summary { display: grid; grid-template-columns: max-content max-content; gap: 3px 18px; align-items: baseline; }
+    .wind-summary .value { font-variant-numeric: tabular-nums; }
+    .wind-plot { margin: 10px 0 0 0; max-width: 900px; }
+    .wind-plot svg { width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+    .wind-plot img { width: 100%; aspect-ratio: 820 / 380; object-fit: contain; border: 1px solid #ddd; border-radius: 8px; background: #fff; display: block; }
+    .wind-plot figcaption { display: flex; gap: 14px; align-items: center; color: #555; margin-top: 8px; }
+    .legend-line { display: inline-block; width: 28px; height: 0; border-top: 3px solid #cc33cc; }
+    .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
+    .legend-line.superlocal { border-top-color: #f28e2b; }
+    .legend-line.harmonie { border-top-color: #777; }
+    pre { white-space: pre-wrap; overflow-x: auto; background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    @media (max-width: 768px) {
+      body { margin: 10px; }
+      h1 { font-size: 24px; margin: 0 0 6px 0; }
+      h2 { font-size: 20px; margin: 0 0 6px 0; }
+      .site-header { display: block; }
+      .account-nav { justify-content: flex-start; min-width: 0; margin-top: 8px; }
+      .section-title { font-size: 21px; margin: 0 0 12px 0; }
+      .performance-section h3 { font-size: 17px; margin: 0 0 6px 0; }
+      .meta { margin: 0 0 10px 0; font-size: 14px; }
+      .overview { font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }
+      .overview-desktop { display: none; }
+      .overview-mobile { display: block; margin: 10px 0 0 0; }
+      .grid { gap: 12px; }
+      .card { padding: 8px; border-radius: 6px; }
+      .desc { font-size: 14px; margin: 2px 0 8px 0; }
+      .direction-card { display: block; }
+      .direction-copy { padding: 0; }
+      .direction-plot img { max-width: none; margin: 0; }
+      img { max-height: 60vh; object-fit: contain; }
+      .form-grid { grid-template-columns: 1fr; }
+      .detail-list { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <h1>Rider portal</h1>
+      <p class="meta">Companion app for the Super local wind forecast dashboard</p>
+      {% block meta %}{% endblock %}
+    </div>
+    <nav class="account-nav" aria-label="Account">
+      <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
+      {% if current_user %}
+        {% if request.endpoint != 'experiences' %}
+          <a href="{{ url_for('experiences') }}">My submissions</a>
+        {% endif %}
+        {% if request.endpoint not in ['experiences', 'new_experience'] %}
+          <a href="{{ url_for('new_experience') }}">Submit experience</a>
+        {% endif %}
+        {% if request.endpoint != 'profile' %}
+          <a href="{{ url_for('profile') }}">Profile</a>
+        {% endif %}
+        <form method="post" action="{{ url_for('logout') }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button class="nav-link" type="submit">Logout</button>
+        </form>
+      {% else %}
+        <button type="button" class="primary" id="open-login">Login</button>
+      {% endif %}
+    </nav>
+  </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flash-list">
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+
+  {% if not current_user %}
+    <dialog id="login-dialog">
+      <div class="modal-header">
+        <h2>Login</h2>
+        <button type="button" id="close-login" aria-label="Close">x</button>
+      </div>
+      <form class="modal-form" method="post" action="{{ url_for('login') }}">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="next" value="{{ request.args.get('next') or request.path }}">
+        <div>
+          <label for="login-username">Username</label>
+          <input id="login-username" name="username" autocomplete="username" required>
+        </div>
+        <div>
+          <label for="login-password">Password</label>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="primary" type="submit">Login</button>
+      </form>
+      <div class="modal-split">
+        <h2>Create account</h2>
+        <form class="modal-form" method="post" action="{{ url_for('register') }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <div>
+            <label for="register-username">Username</label>
+            <input id="register-username" name="username" autocomplete="username" required minlength="3">
+          </div>
+          <div>
+            <label for="register-password">Password</label>
+            <input id="register-password" name="password" type="password" autocomplete="new-password" required minlength="8">
+          </div>
+          <button type="submit">Create account</button>
+        </form>
+      </div>
+    </dialog>
+    <script>
+      const loginDialog = document.getElementById("login-dialog");
+      const openLogin = document.getElementById("open-login");
+      const closeLogin = document.getElementById("close-login");
+      if (openLogin && loginDialog) openLogin.addEventListener("click", () => loginDialog.showModal());
+      if (closeLogin && loginDialog) closeLogin.addEventListener("click", () => loginDialog.close());
+      if (new URLSearchParams(window.location.search).get("login") === "1" && loginDialog) loginDialog.showModal();
+    </script>
+  {% endif %}
+  {% block scripts %}{% endblock %}
+</body>
+</html>

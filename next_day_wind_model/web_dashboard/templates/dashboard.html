@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Super local wind prediction Valkenburgse meer{% endblock %}
+{% block meta %}
+  <p class="meta">Last updated: {{ last_updated }}</p>
+{% endblock %}
+{% block content %}
+  <p class="overview overview-desktop">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
+  </p>
+  <div class="grid">
+    <div class="card">
+      <h2>Current-day prediction</h2>
+      <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
+      <picture>
+        <source media="(max-width: 768px)" srcset="{{ asset_url('current_day_predictions_mobile.png') }}">
+        <img src="{{ asset_url('current_day_predictions.png') }}" alt="Current day prediction">
+      </picture>
+    </div>
+    <div class="card">
+      <h2>Next-day prediction</h2>
+      <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
+      <picture>
+        <source media="(max-width: 768px)" srcset="{{ asset_url('next_day_predictions_mobile.png') }}">
+        <img src="{{ asset_url('next_day_predictions.png') }}" alt="Next day prediction">
+      </picture>
+    </div>
+
+    <section class="card performance-section">
+      <h2 class="section-title">How much better are the super local forecasts?</h2>
+
+      <div class="direction-card">
+        <div class="direction-copy">
+          <h3>Current-day performance by wind direction</h3>
+          <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, SE, NE, SW winds; the largest gain is 2.2 kts for E. For that sector the super-local model overestimates by 0.6 kts on average. The advantage is smallest, or negative, for N, NW, W winds.</p>
+        </div>
+        <div class="direction-plot">
+          <img src="{{ asset_url('current_day_direction_spider.png') }}" alt="Current-day prediction performance by wind direction">
+        </div>
+      </div>
+
+      <div class="direction-card">
+        <div class="direction-copy">
+          <h3>Next-day performance by wind direction</h3>
+          <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for SE, E, S, SW winds. Across all shown wind sectors the champion is better than Harmonie.</p>
+        </div>
+        <div class="direction-plot">
+          <img src="{{ asset_url('model_gate_direction_spider.png') }}" alt="Next-day prediction performance by wind direction">
+        </div>
+      </div>
+    </section>
+
+    <div class="card">
+      <h2>Model-gate evaluation history</h2>
+      <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
+      <img src="{{ asset_url('model_gate_eval_history.png') }}" alt="Model gate evaluation history">
+    </div>
+  </div>
+  <p class="overview overview-mobile">
+    <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
+    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
+    A second model is dedicated to next-day (day-ahead) prediction.
+    Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
+  </p>
+{% endblock %}

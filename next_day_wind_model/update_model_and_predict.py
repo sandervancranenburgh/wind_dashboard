@@ -64,6 +64,8 @@ from train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
 
 
 LSTM_HIGHLIGHT_COLOR = "#d7191c"
+MODEL_GATE_CHAMPION_COLOR = "#ff7f0e"
+SUPERLOCAL_FORECAST_COLOR = MODEL_GATE_CHAMPION_COLOR
 
 
 def parse_args() -> argparse.Namespace:
@@ -1353,8 +1355,10 @@ def build_prediction_table(
     inference_input: dict,
     speed_pred: np.ndarray,
     dir_pred: np.ndarray,
+    local_tz: str = "Europe/Amsterdam",
 ) -> pd.DataFrame:
     target_times = pd.to_datetime(inference_input["target_times"], utc=True)
+    target_times_local = target_times.tz_convert(ZoneInfo(local_tz))
     forecast_speed = inference_input["forecast_next24"].astype(np.float32)
     forecast_min = inference_input["forecast_min_next24"].astype(np.float32)
     forecast_max = inference_input["forecast_max_next24"].astype(np.float32)
@@ -1367,6 +1371,7 @@ def build_prediction_table(
     table = pd.DataFrame(
         {
             "target_time_utc": target_times,
+            "target_time_local": target_times_local,
             "forecast_wind_speed": forecast_speed,
             "forecast_wind_min": lo,
             "forecast_wind_max": hi,
@@ -1376,6 +1381,7 @@ def build_prediction_table(
         }
     ).assign(
         hour_utc=lambda d: d["target_time_utc"].dt.strftime("%H"),
+        hour_local=lambda d: d["target_time_local"].dt.strftime("%H"),
         delta_speed_lstm_minus_forecast=lambda d: d["lstm_pred_wind_speed"] - d["forecast_wind_speed"],
         delta_dir_lstm_minus_forecast=lambda d: ((d["lstm_pred_wind_dir_deg"] - d["forecast_wind_dir_deg"] + 180) % 360)
         - 180,
@@ -1572,7 +1578,11 @@ def _format_plot_meta_text(
         if train_dt is not None
         else "unknown"
     )
-    return f"Last plot update: {pred_txt}\nLast prediction update: {pred_upd_txt}\nLast model training: {train_txt}"
+    return (
+        f"Last plot update: {pred_txt}\n"
+        f"Last prediction update: {pred_upd_txt}\n"
+        f"Champion model trained & promoted: {train_txt}"
+    )
 
 
 def _format_last_plot_update_text(plot_updated_at_utc: datetime | pd.Timestamp | str | None, local_tz: str) -> str:
@@ -1604,15 +1614,21 @@ def save_prediction_plot(
     mobile: bool = False,
 ) -> None:
     table = table.copy()
-    table = table[(table["target_time_utc"].dt.hour >= 8) & (table["target_time_utc"].dt.hour <= 22)].reset_index(
+    if "target_time_local" not in table.columns:
+        table["target_time_local"] = table["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
+    else:
+        table["target_time_local"] = pd.to_datetime(table["target_time_local"], utc=True).dt.tz_convert(
+            ZoneInfo(local_tz)
+        )
+    table = table[(table["target_time_local"].dt.hour >= 8) & (table["target_time_local"].dt.hour <= 22)].reset_index(
         drop=True
     )
     if table.empty:
-        raise ValueError("No rows available in 08:00-22:00 range for plotting.")
+        raise ValueError("No rows available in local 08:00-22:00 range for plotting.")
 
     x = np.arange(len(table))
-    table["hour_label"] = table["target_time_utc"].dt.strftime("%H")
-    first_dt = table["target_time_utc"].iloc[0]
+    table["hour_label"] = table["target_time_local"].dt.strftime("%H")
+    first_dt = table["target_time_local"].iloc[0]
     day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
     y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
@@ -1633,23 +1649,12 @@ def save_prediction_plot(
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
     fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
     lstm_avg = table["lstm_pred_wind_speed"].to_numpy(dtype=float)
-    ax.fill_between(
-        x,
-        fc_low,
-        fc_high,
-        color="gray",
-        alpha=0.25,
-        linewidth=0.8,
-        edgecolor="gray",
-        label="_nolegend_",
-        zorder=1,
-    )
     ax.plot(x, fc_high, color="#666666", linewidth=1.2, linestyle="--", label="Harmonie model - max speed")
     ax.plot(x, fc_avg, color="gray", linewidth=1.5, label="Harmonie model - avg speed")
     ax.plot(
         x,
         lstm_avg,
-        color=LSTM_HIGHLIGHT_COLOR,
+        color=SUPERLOCAL_FORECAST_COLOR,
         linewidth=2.4,
         label="Super local wind prediction - avg speed",
     )
@@ -1711,7 +1716,7 @@ def save_prediction_plot(
     y_base_axes = -0.115 if mobile else -0.14
     arrow_len_axes = 0.058 if mobile else 0.065
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
-        for direction_deg, color in [(fdir, "gray"), (ldir, LSTM_HIGHLIGHT_COLOR)]:
+        for direction_deg, color in [(fdir, "gray"), (ldir, SUPERLOCAL_FORECAST_COLOR)]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
             dy = arrow_len_axes * np.cos(theta)
@@ -2279,7 +2284,7 @@ def save_current_day_plot(
                     ax.plot(
                         sl_x,
                         sl_y,
-                        color=LSTM_HIGHLIGHT_COLOR,
+                        color=SUPERLOCAL_FORECAST_COLOR,
                         linestyle=superlocal_prior_dash,
                         linewidth=superlocal_prior_lw,
                         alpha=float(overlay_alpha),
@@ -2394,7 +2399,7 @@ def save_current_day_plot(
     ax.plot(
         x,
         superlocal_current,
-        color=LSTM_HIGHLIGHT_COLOR,
+        color=SUPERLOCAL_FORECAST_COLOR,
         linewidth=2.6,
         label="_nolegend_",
         zorder=3,
@@ -2424,7 +2429,7 @@ def save_current_day_plot(
             [float(superlocal_current[superlocal_start_idx])],
             s=58 if mobile else 50,
             marker="o",
-            color=LSTM_HIGHLIGHT_COLOR,
+            color=SUPERLOCAL_FORECAST_COLOR,
             edgecolors="white",
             linewidths=0.9,
             zorder=3.8,
@@ -2447,11 +2452,11 @@ def save_current_day_plot(
         "Super local - current forecast": Line2D(
             [0],
             [0],
-            color=LSTM_HIGHLIGHT_COLOR,
+            color=SUPERLOCAL_FORECAST_COLOR,
             linewidth=2.6,
             marker="o",
             markersize=5.0 if mobile else 4.4,
-            markerfacecolor=LSTM_HIGHLIGHT_COLOR,
+            markerfacecolor=SUPERLOCAL_FORECAST_COLOR,
             markeredgecolor="white",
             markeredgewidth=0.7,
         ),
@@ -2486,7 +2491,7 @@ def save_current_day_plot(
         order_map["Super local - prior issued forecasts"] = Line2D(
             [0],
             [0],
-            color=LSTM_HIGHLIGHT_COLOR,
+            color=SUPERLOCAL_FORECAST_COLOR,
             linestyle=(0, (4.8, 1.8)),
             linewidth=2.15 if mobile else 1.9,
             alpha=0.84,
@@ -2518,7 +2523,7 @@ def save_current_day_plot(
     ax.set_xlim(-0.05, len(table) - 1.0 + 0.02)
     ax.set_ylim(y_lower, y_upper)
 
-    superlocal_color = "#d62728"
+    superlocal_color = SUPERLOCAL_FORECAST_COLOR
     measured_color = "#cc33cc"
     harmonie_color = "#666666"
     better_color = "#2ca02c"
@@ -2675,7 +2680,7 @@ def save_current_day_plot(
         adir = row["actual_wind_dir_deg"]
         if pd.isna(ldir):
             ldir = row["lstm_pred_wind_dir_deg_full"]
-        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, LSTM_HIGHLIGHT_COLOR, 4), (adir, "magenta", 6)]:
+        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, SUPERLOCAL_FORECAST_COLOR, 4), (adir, "magenta", 6)]:
             if pd.isna(direction_deg):
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -3843,7 +3848,7 @@ def save_model_gate_eval_history_plot(
         return value
 
     challenger_color = "#1f77b4"
-    champion_color = "#ff7f0e"
+    champion_color = MODEL_GATE_CHAMPION_COLOR
     harmonie_color = "gray"
     plot_meta_text = _format_last_plot_update_text(datetime.now(timezone.utc).isoformat(), local_tz)
     champion_model_id = None
@@ -4476,7 +4481,7 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
         linewidth=2.3,
         marker="o",
         markersize=4,
-        label=f"Champion next-day ({champion_mae:.2f} kts)",
+        label=f"Super local champion model next-day ({champion_mae:.2f} kts)",
     )
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=11)
@@ -4750,7 +4755,7 @@ def save_current_day_direction_performance_spider_plot(direction_csv: Path, plot
         linewidth=2.3,
         marker="o",
         markersize=4,
-        label=f"Super local current-day ({superlocal_mae:.2f} kts)",
+        label=f"Super local champion model current-day ({superlocal_mae:.2f} kts)",
     )
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=11)
@@ -4984,8 +4989,8 @@ def publish_web_dashboard(
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
       </picture>
     </div>
-{gate_eval_card}
 {performance_section}
+{gate_eval_card}
   </div>
   <p class="overview overview-mobile">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
@@ -5018,17 +5023,6 @@ def auto_push_dashboard_changes(
         return {"enabled": True, "pushed": False, "reason": "web_out_dir_outside_repo"}
 
     rel_web_dir_s = str(rel_web_dir)
-    try:
-        status = subprocess.run(
-            ["git", "-C", str(repo_root), "status", "--porcelain", "--", rel_web_dir_s],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        return {"enabled": True, "pushed": False, "reason": f"git_status_failed:{exc.returncode}"}
-    if status.stdout.strip() == "":
-        return {"enabled": True, "pushed": False, "reason": "no_changes"}
 
     # Safety: if the index already contains staged files outside dashboard path, don't auto-commit.
     try:
@@ -5056,7 +5050,7 @@ def auto_push_dashboard_changes(
         }
 
     try:
-        subprocess.run(["git", "-C", str(repo_root), "add", "--", rel_web_dir_s], check=True)
+        subprocess.run(["git", "-C", str(repo_root), "add", "-A", "-f", "--", rel_web_dir_s], check=True)
     except subprocess.CalledProcessError as exc:
         return {"enabled": True, "pushed": False, "reason": f"git_add_failed:{exc.returncode}"}
 
@@ -5070,7 +5064,7 @@ def auto_push_dashboard_changes(
     except subprocess.CalledProcessError as exc:
         return {"enabled": True, "pushed": False, "reason": f"git_staged_web_check_failed:{exc.returncode}"}
     if staged.stdout.strip() == "":
-        return {"enabled": True, "pushed": False, "reason": "nothing_staged"}
+        return {"enabled": True, "pushed": False, "reason": "no_changes"}
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     commit_msg = f"auto: update dashboard artifacts ({stamp})"
@@ -6013,6 +6007,7 @@ def main() -> None:
         x_mean=speed_arrays["x_mean"],
         x_std=speed_arrays["x_std"],
         feature_schema=_next_day_feature_schema_from_scalers(speed_arrays),
+        local_tz=args.local_timezone,
     )
     inference_input_direction = build_next_day_inference_input(
         db_path=db_path,
@@ -6020,6 +6015,7 @@ def main() -> None:
         x_mean=direction_arrays["x_mean"],
         x_std=direction_arrays["x_std"],
         feature_schema=_direction_feature_schema_from_scalers(direction_arrays),
+        local_tz=args.local_timezone,
     )
     speed_inference_calibration_context = _build_speed_calibration_context(
         anchor_dir_deg=float(inference_input_speed["anchor_forecast_dir"]),
@@ -6058,7 +6054,7 @@ def main() -> None:
         device=device,
     )
 
-    table = build_prediction_table(inference_input_speed, speed_pred, direction_pred)
+    table = build_prediction_table(inference_input_speed, speed_pred, direction_pred, local_tz=args.local_timezone)
     next_day_prediction_log_frame = _build_next_day_prediction_log_frame(inference_input_speed, speed_pred)
     is_test_mode = args.test_now_local_hour is not None
     prediction_generated_at_dt = datetime.now(timezone.utc)
@@ -6081,8 +6077,12 @@ def main() -> None:
     table_for_csv = table[
         [
             "target_time_utc",
+            "target_time_local",
             "hour_utc",
+            "hour_local",
             "forecast_wind_speed",
+            "forecast_wind_min",
+            "forecast_wind_max",
             "lstm_pred_wind_speed",
             "delta_speed_lstm_minus_forecast",
             "forecast_wind_dir_deg",
@@ -6091,6 +6091,7 @@ def main() -> None:
         ]
     ].copy()
     table_for_csv["target_time_utc"] = table_for_csv["target_time_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    table_for_csv["target_time_local"] = table_for_csv["target_time_local"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     table_for_csv.to_csv(table_path, index=False)
     dayahead_snapshot_csv = None
     if not args.skip_training and args.test_now_local_hour is None:

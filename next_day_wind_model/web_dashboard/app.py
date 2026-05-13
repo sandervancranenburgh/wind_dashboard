@@ -35,6 +35,8 @@ import db_store
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data"
+ARTIFACTS_DIR = REPO_ROOT / "next_day_wind_model" / "artifacts"
+CURRENT_DAY_PLOT_ARCHIVE_DIR = ARTIFACTS_DIR / "current_day_plot_archive"
 LOCAL_TZ = ZoneInfo(os.environ.get("WIND_DASHBOARD_TZ", "Europe/Amsterdam"))
 COMPANION_APP_BASE_URL = os.environ.get("COMPANION_APP_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 FORECAST_DASHBOARD_BASE_URL = os.environ.get("FORECAST_DASHBOARD_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
@@ -52,13 +54,16 @@ SORT_OPTIONS = {
     "date",
     "spot",
     "start_time",
+    "end_time",
     "session_rating",
     "wing_size",
     "foil_size",
     "avg_measured_wind_speed",
     "max_measured_wind_speed",
     "min_measured_wind_speed",
+    "max_measured_wind_gust",
     "mean_measured_direction",
+    "avg_forecast_temperature",
 }
 
 
@@ -303,12 +308,48 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
     )
 
 
+def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "Rider": row.get("rider") or "",
+        "Spot": row.get("spot") or "Valkenburgse meer",
+        "Date": row.get("date") or datetime.now(LOCAL_TZ).date().isoformat(),
+        "StartTime": row.get("start_time") or "12:00",
+        "EndTime": row.get("end_time") or "14:00",
+        "SessionRating": "" if row.get("session_rating") is None else str(row.get("session_rating")),
+        "RiderReview": row.get("rider_review") or "",
+        "RiderWeight": "" if row.get("rider_weight") is None else str(row.get("rider_weight")),
+        "WingSize": "" if row.get("wing_size") is None else str(row.get("wing_size")),
+        "FoilSize": "" if row.get("foil_size") is None else str(row.get("foil_size")),
+        "RiderNotes": row.get("rider_notes") or "",
+    }
+
+
 def _dashboard_asset_url(filename: str) -> str:
     return url_for("dashboard_asset", filename=filename)
 
 
-def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
-    records = (row.get("measured_wind") or {}).get("records") or []
+def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, str] | None:
+    try:
+        day = datetime.strptime(submission_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    if not CURRENT_DAY_PLOT_ARCHIVE_DIR.exists():
+        return None
+    prefix = day.strftime("%Y%m%d")
+    matches = sorted(CURRENT_DAY_PLOT_ARCHIVE_DIR.glob(f"{prefix}-*_current_day_predictions.png"))
+    if not matches:
+        return None
+    path = matches[-1]
+    return {
+        "filename": path.name,
+        "url": url_for("current_day_archive_asset", filename=path.name),
+    }
+
+
+def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None = None) -> dict[str, Any]:
+    measured = row.get("measured_wind") or {}
+    records = measured.get("plot_records") or measured.get("records") or []
+    prediction_records = (predictions or {}).get("records") or []
     session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])
     if session_start_ms is None or session_end_ms is None or session_end_ms <= session_start_ms:
         session_start_ms = None
@@ -345,12 +386,18 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
         for value in (point["speed"], point["gust"])
         if value is not None
     ]
+    values.extend(
+        float(value)
+        for point in prediction_records
+        for value in (point.get("superlocal_wind_speed"), point.get("harmonie_wind_speed"))
+        if value is not None
+    )
     if not values:
         return {"available": False}
 
     min_value = 0.0
     max_observed = max(values)
-    max_value = max(20.0, math.ceil(max_observed * 1.12 / 5.0) * 5.0)
+    max_value = max(5.0, math.ceil(max_observed / 5.0) * 5.0)
 
     min_ts = session_start_ms if session_start_ms is not None else min(point["timestamp"] for point in points)
     max_ts = session_end_ms if session_end_ms is not None else max(point["timestamp"] for point in points)
@@ -358,12 +405,12 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
         max_ts = min_ts + 3_600_000
 
     width = 820
-    height = 300
+    height = 380
     pad_left = 48
     pad_right = 22
     pad_top = 20
-    axis_y = 218
-    arrow_y = 246
+    axis_y = 292
+    arrow_y = 326
     plot_width = width - pad_left - pad_right
     plot_height = axis_y - pad_top
 
@@ -389,11 +436,30 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
             coords.append(f"{x:.1f},{y:.1f}")
         return " ".join(coords)
 
+    def prediction_polyline(key: str) -> str:
+        coords = []
+        for point in prediction_records:
+            value = point.get(key)
+            if value is None:
+                continue
+            try:
+                timestamp = int(point.get("timestamp"))
+            except (TypeError, ValueError):
+                continue
+            coords.append(f"{to_x(timestamp):.1f},{to_y(float(value)):.1f}")
+        if len(coords) == 1:
+            _, y = coords[0].split(",", 1)
+            return f"{pad_left:.1f},{y} {pad_left + plot_width:.1f},{y}"
+        return " ".join(coords)
+
     start_local = datetime.fromtimestamp(min_ts / 1000, tz=LOCAL_TZ)
     end_local = datetime.fromtimestamp(max_ts / 1000, tz=LOCAL_TZ)
-    tick_dt = start_local.replace(minute=0, second=0, microsecond=0)
+    tick_dt = start_local.replace(second=0, microsecond=0)
+    minute_remainder = tick_dt.minute % 30
+    if minute_remainder:
+        tick_dt += timedelta(minutes=30 - minute_remainder)
     if tick_dt < start_local:
-        tick_dt += timedelta(hours=1)
+        tick_dt += timedelta(minutes=30)
     hour_ticks = []
     while tick_dt <= end_local:
         tick_ts = int(tick_dt.astimezone(timezone.utc).timestamp() * 1000)
@@ -403,7 +469,7 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
                 "label": tick_dt.strftime("%H:%M"),
             }
         )
-        tick_dt += timedelta(hours=1)
+        tick_dt += timedelta(minutes=30)
 
     if not hour_ticks:
         hour_ticks = [
@@ -442,14 +508,17 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
             )
         arrow_dt += timedelta(minutes=15)
 
+    y_tick_values = [value for value in range(0, int(max_value) + 1, 5)]
+    if y_tick_values[-1] < max_value:
+        y_tick_values.append(int(max_value))
     y_ticks = [
-        {"y": f"{to_y(max_value):.1f}", "label_y": f"{to_y(max_value) + 4.0:.1f}", "label": f"{max_value:.0f}"},
-        {
-            "y": f"{to_y(max_value / 2.0):.1f}",
-            "label_y": f"{to_y(max_value / 2.0) + 4.0:.1f}",
-            "label": f"{max_value / 2.0:.0f}",
-        },
-        {"y": f"{to_y(0.0):.1f}", "label_y": f"{to_y(0.0) + 4.0:.1f}", "label": "0"},
+        {"y": f"{to_y(float(value)):.1f}", "label_y": f"{to_y(float(value)) + 4.0:.1f}", "label": f"{value:.0f}"}
+        for value in y_tick_values
+    ]
+    y_minor_ticks = [
+        {"y": f"{to_y(value):.1f}"}
+        for value in [tick + 2.5 for tick in y_tick_values[:-1]]
+        if value < max_value
     ]
 
     return {
@@ -465,10 +534,14 @@ def _measured_wind_plot(row: dict[str, Any]) -> dict[str, Any]:
         "plot_height": plot_height,
         "speed_points": polyline("speed"),
         "gust_points": polyline("gust"),
+        "superlocal_points": prediction_polyline("superlocal_wind_speed"),
+        "harmonie_points": prediction_polyline("harmonie_wind_speed"),
+        "prediction_issued_iso": (predictions or {}).get("issued_iso"),
         "min_value": min_value,
         "max_value": max_value,
         "hour_ticks": hour_ticks,
         "y_ticks": y_ticks,
+        "y_minor_ticks": y_minor_ticks,
         "direction_arrows": arrow_candidates,
     }
 
@@ -507,6 +580,13 @@ def dashboard_asset(filename: str):
     if "/" in filename or not filename.endswith((".png", ".csv")):
         abort(404)
     return send_from_directory(BASE_DIR, filename)
+
+
+@app.route("/current-day-plot-archive/<path:filename>")
+def current_day_archive_asset(filename: str):
+    if "/" in filename or not filename.endswith("_current_day_predictions.png"):
+        abort(404)
+    return send_from_directory(CURRENT_DAY_PLOT_ARCHIVE_DIR, filename)
 
 
 @app.post("/register")
@@ -614,6 +694,44 @@ def new_experience():
     return render_template(
         "submit_experience.html",
         form_values=form_values,
+        form_title="Submit experience",
+        form_action=url_for("new_experience"),
+        submit_label="Submit experience",
+        spot_options=SPOT_OPTIONS,
+        hour_options=HOUR_OPTIONS,
+        wing_size_options=WING_SIZE_OPTIONS,
+        foil_size_options=FOIL_SIZE_OPTIONS,
+    )
+
+
+@app.route("/experiences/<int:experience_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_experience(experience_id: int):
+    conn = get_db()
+    user_id = int(current_user()["id"])
+    row = db_store.get_surf_experience(conn, user_id, experience_id)
+    if row is None:
+        abort(404)
+    form_values = _experience_form_values_from_row(row)
+    if request.method == "POST":
+        _validate_csrf()
+        submitted_values = request.form.to_dict()
+        form_values.update(submitted_values)
+        experience, errors = _validate_experience_form(submitted_values)
+        if not errors:
+            updated = db_store.update_surf_experience(conn, experience_id, user_id, experience)
+            if not updated:
+                abort(404)
+            flash("Submission updated.", "success")
+            return redirect(url_for("experience_detail", experience_id=experience_id))
+        for error in errors:
+            flash(error, "error")
+    return render_template(
+        "submit_experience.html",
+        form_values=form_values,
+        form_title="Modify submission",
+        form_action=url_for("edit_experience", experience_id=experience_id),
+        submit_label="Save changes",
         spot_options=SPOT_OPTIONS,
         hour_options=HOUR_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
@@ -655,10 +773,34 @@ def delete_experience(experience_id: int):
 @app.route("/experiences/<int:experience_id>")
 @login_required
 def experience_detail(experience_id: int):
-    row = db_store.get_surf_experience(get_db(), int(current_user()["id"]), experience_id)
+    conn = get_db()
+    user_id = int(current_user()["id"])
+    row = db_store.get_surf_experience(conn, user_id, experience_id)
     if row is None:
         abort(404)
-    return render_template("submission_detail.html", row=row, wind_plot=_measured_wind_plot(row))
+    measured_summary = (row.get("measured_wind") or {}).get("summary") or {}
+    if (
+        row.get("avg_forecast_temperature") is None
+        or not (row.get("measured_wind") or {}).get("plot_records")
+        or measured_summary.get("max_wind_speed_kind") != "average_wind"
+        or measured_summary.get("max_wind_gust") is None
+    ):
+        db_store.refresh_surf_experience_measured_wind(conn, experience_id, user_id=user_id)
+        row = db_store.get_surf_experience(conn, user_id, experience_id)
+        if row is None:
+            abort(404)
+    session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])
+    predictions = (
+        db_store.get_prediction_lines_for_session(conn, row["spot"], session_start_ms, session_end_ms)
+        if session_start_ms is not None and session_end_ms is not None
+        else {"status": "unavailable", "records": []}
+    )
+    return render_template(
+        "submission_detail.html",
+        row=row,
+        wind_plot=_measured_wind_plot(row, predictions),
+        current_day_archive_plot=_current_day_archive_plot_for_submission(row["date"]),
+    )
 
 
 if __name__ == "__main__":

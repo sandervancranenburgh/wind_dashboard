@@ -12,6 +12,7 @@ LEGACY_DB_FILENAME = "wind_data.db"
 FORECASTS_TABLE = "forecasts"
 PREDICTION_LOG_TABLE = "prediction_log"
 HOUR_MS = 3_600_000
+CURRENT_DAY_PLOT_INTERVAL_MS = 6 * 60 * 1000
 PREDICTION_LOG_EVAL_COLUMNS = {
     "model_error": "REAL",
     "harmonie_error": "REAL",
@@ -28,6 +29,9 @@ SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
     "min_measured_wind_speed": "REAL",
     "mean_measured_direction": "REAL",
     "mean_measured_direction_label": "TEXT",
+    "avg_forecast_temperature": "REAL",
+    "min_forecast_temperature": "REAL",
+    "max_forecast_temperature": "REAL",
 }
 
 
@@ -361,6 +365,9 @@ def init_account_db(conn: sqlite3.Connection) -> None:
             avg_measured_wind_dir REAL,
             mean_measured_direction REAL,
             mean_measured_direction_label TEXT,
+            avg_forecast_temperature REAL,
+            min_forecast_temperature REAL,
+            max_forecast_temperature REAL,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )
         """
@@ -452,11 +459,12 @@ def extract_wind_triplet(d: Dict[str, Any]) -> Tuple[Optional[float], Optional[f
             "ff",
             "speed",
             "WindSpeedAvg",
+            "WindForecastAvr",
             "wind",
         ],
     )
-    gst = _extract_first(d, ["wind_gust", "gust", "WG", "GUST", "fg"])
-    dire = _extract_first(d, ["wind_dir", "winddirection", "WD", "DD", "dir", "direction"])
+    gst = _extract_first(d, ["wind_gust", "gust", "WG", "GUST", "fg", "WindForecastMax"])
+    dire = _extract_first(d, ["wind_dir", "winddirection", "WD", "DD", "dir", "direction", "WindDirection"])
     return _as_float(spd), _as_float(gst), _as_float(dire)
 
 
@@ -1943,6 +1951,197 @@ def _wind_direction_label(direction_deg: Optional[float]) -> Optional[str]:
     return labels[index]
 
 
+def _wind_direction_display(direction_deg: Optional[float], label: Optional[str] = None) -> Optional[str]:
+    if direction_deg is None:
+        return None
+    direction_label = label or _wind_direction_label(direction_deg)
+    if not direction_label:
+        return f"{float(direction_deg):.0f} deg"
+    return f"{direction_label} ({float(direction_deg):.0f} deg)"
+
+
+def get_forecast_temperature_for_session(
+    conn: sqlite3.Connection,
+    spot: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> Dict[str, Any]:
+    site = SPOT_TO_SITE.get(spot)
+    if site is None:
+        return {
+            "status": "unavailable",
+            "reason": f"No forecast site is configured for {spot}.",
+            "site": None,
+            "summary": {
+                "avg_temperature": None,
+                "min_temperature": None,
+                "max_temperature": None,
+            },
+        }
+
+    rows = conn.execute(
+        f"""
+        SELECT target_ts, payload
+        FROM {FORECASTS_TABLE}
+        WHERE site = ?
+          AND target_ts >= ?
+          AND target_ts <= ?
+        ORDER BY target_ts, fetched_ts DESC
+        """,
+        (site, int(start_ts_ms) - HOUR_MS // 2, int(end_ts_ms) + HOUR_MS // 2),
+    ).fetchall()
+
+    temperatures_by_target: Dict[int, float] = {}
+    for target_ts, payload_raw in rows:
+        if int(target_ts) in temperatures_by_target:
+            continue
+        temperature = _extract_observation_measurement(
+            payload_raw,
+            None,
+            ["Temperature", "temperature", "temp", "air_temperature"],
+        )
+        if temperature is not None:
+            temperatures_by_target[int(target_ts)] = float(temperature)
+
+    temperatures = list(temperatures_by_target.values())
+    summary = {
+        "avg_temperature": None if not temperatures else sum(temperatures) / len(temperatures),
+        "min_temperature": None if not temperatures else min(temperatures),
+        "max_temperature": None if not temperatures else max(temperatures),
+    }
+    return {
+        "status": "ok" if temperatures else "unavailable",
+        "reason": None if temperatures else "No forecast temperature found for the selected spot and time window.",
+        "site": site,
+        "summary": summary,
+    }
+
+
+def get_prediction_lines_for_session(
+    conn: sqlite3.Connection,
+    spot: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> Dict[str, Any]:
+    site = SPOT_TO_SITE.get(spot)
+    if site is None:
+        return {
+            "status": "unavailable",
+            "reason": f"No prediction site is configured for {spot}.",
+            "site": None,
+            "issued_ts": None,
+            "issued_iso": None,
+            "records": [],
+        }
+
+    target_from = int(start_ts_ms) - HOUR_MS
+    target_to = int(end_ts_ms) + HOUR_MS
+    issue_row = conn.execute(
+        f"""
+        SELECT issued_ts, issued_iso
+        FROM {PREDICTION_LOG_TABLE}
+        WHERE site = ?
+          AND prediction_kind = 'wind_speed'
+          AND issued_ts <= ?
+          AND target_ts >= ?
+          AND target_ts <= ?
+          AND prediction_value IS NOT NULL
+          AND harmonie_value IS NOT NULL
+        ORDER BY issued_ts DESC
+        LIMIT 1
+        """,
+        (site, int(start_ts_ms), target_from, target_to),
+    ).fetchone()
+    if issue_row is None:
+        return {
+            "status": "unavailable",
+            "reason": "No issued wind-speed prediction found before the session start.",
+            "site": site,
+            "issued_ts": None,
+            "issued_iso": None,
+            "records": [],
+        }
+
+    issued_ts, issued_iso = issue_row
+    rows = conn.execute(
+        f"""
+        SELECT target_ts, target_iso, prediction_value, harmonie_value
+        FROM {PREDICTION_LOG_TABLE}
+        WHERE site = ?
+          AND prediction_kind = 'wind_speed'
+          AND issued_ts = ?
+          AND target_ts >= ?
+          AND target_ts <= ?
+          AND prediction_value IS NOT NULL
+          AND harmonie_value IS NOT NULL
+        ORDER BY target_ts
+        """,
+        (site, int(issued_ts), target_from, target_to),
+    ).fetchall()
+    hourly_records = [
+        {
+            "timestamp": int(target_ts),
+            "iso_time": target_iso,
+            "superlocal_wind_speed": float(prediction_value),
+            "harmonie_wind_speed": float(harmonie_value),
+        }
+        for target_ts, target_iso, prediction_value, harmonie_value in rows
+    ]
+    records = _interpolate_prediction_records_to_plot_grid(hourly_records, int(start_ts_ms), int(end_ts_ms))
+    return {
+        "status": "ok" if records else "unavailable",
+        "reason": None if records else "No prediction targets found for the selected session window.",
+        "site": site,
+        "issued_ts": int(issued_ts),
+        "issued_iso": issued_iso,
+        "records": records,
+    }
+
+
+def _interpolate_prediction_records_to_plot_grid(
+    hourly_records: List[Dict[str, Any]],
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> List[Dict[str, Any]]:
+    if not hourly_records:
+        return []
+    ordered = sorted(hourly_records, key=lambda record: int(record["timestamp"]))
+    dense_records: List[Dict[str, Any]] = []
+    grid_ts = (int(start_ts_ms) // CURRENT_DAY_PLOT_INTERVAL_MS) * CURRENT_DAY_PLOT_INTERVAL_MS
+    if grid_ts < int(start_ts_ms):
+        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
+    idx = 0
+    while grid_ts <= int(end_ts_ms):
+        while idx + 1 < len(ordered) and int(ordered[idx + 1]["timestamp"]) <= grid_ts:
+            idx += 1
+        prev_record = ordered[idx]
+        next_record = ordered[idx + 1] if idx + 1 < len(ordered) else None
+        if int(prev_record["timestamp"]) > grid_ts:
+            grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
+            continue
+
+        def interp_value(key: str) -> float:
+            prev_value = float(prev_record[key])
+            if next_record is None or int(next_record["timestamp"]) == int(prev_record["timestamp"]):
+                return prev_value
+            next_value = float(next_record[key])
+            fraction = (grid_ts - int(prev_record["timestamp"])) / (
+                int(next_record["timestamp"]) - int(prev_record["timestamp"])
+            )
+            return prev_value + (next_value - prev_value) * fraction
+
+        dense_records.append(
+            {
+                "timestamp": int(grid_ts),
+                "iso_time": _iso_utc_from_ms(int(grid_ts)),
+                "superlocal_wind_speed": interp_value("superlocal_wind_speed"),
+                "harmonie_wind_speed": interp_value("harmonie_wind_speed"),
+            }
+        )
+        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
+    return dense_records
+
+
 def get_measured_wind_for_session(
     conn: sqlite3.Connection,
     spot: str,
@@ -1977,9 +2176,20 @@ def get_measured_wind_for_session(
         """,
         (site, int(start_ts_ms), int(end_ts_ms)),
     ).fetchall()
+    prior_row = conn.execute(
+        """
+        SELECT ts, iso_time, wind_speed, wind_gust, wind_dir, payload
+        FROM observations
+        WHERE site = ?
+          AND ts < ?
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        (site, int(start_ts_ms)),
+    ).fetchone()
 
-    records = []
-    for ts, iso_time, wind_speed, wind_gust, wind_dir, payload_raw in rows:
+    def observation_record(row: Any) -> Dict[str, Any]:
+        ts, iso_time, wind_speed, wind_gust, wind_dir, payload_raw = row
         speed = _extract_observation_measurement(
             payload_raw,
             wind_speed,
@@ -1995,15 +2205,17 @@ def get_measured_wind_for_session(
             wind_dir,
             ["WindDirection", "wind_dir", "winddirection", "WD", "DD", "dir", "direction"],
         )
-        records.append(
-            {
-                "timestamp": int(ts),
-                "iso_time": iso_time,
-                "measured_wind_speed": speed,
-                "measured_wind_gust": gust,
-                "measured_wind_direction": direction,
-            }
-        )
+        return {
+            "timestamp": int(ts),
+            "iso_time": iso_time,
+            "measured_wind_speed": speed,
+            "measured_wind_gust": gust,
+            "measured_wind_direction": direction,
+        }
+
+    records = [observation_record(row) for row in rows]
+    plot_source_records = ([observation_record(prior_row)] if prior_row is not None else []) + records
+    plot_records = _forward_fill_observation_records_to_plot_grid(plot_source_records, int(start_ts_ms), int(end_ts_ms))
     speeds = [float(record["measured_wind_speed"]) for record in records if record["measured_wind_speed"] is not None]
     gusts = [float(record["measured_wind_gust"]) for record in records if record["measured_wind_gust"] is not None]
     directions = [
@@ -2020,7 +2232,9 @@ def get_measured_wind_for_session(
     summary = {
         "point_count": len(records),
         "avg_wind_speed": None if not speeds else sum(speeds) / len(speeds),
-        "max_wind_speed": max(gusts) if gusts else (None if not speeds else max(speeds)),
+        "max_wind_speed": None if not speeds else max(speeds),
+        "max_wind_speed_kind": "average_wind",
+        "max_wind_gust": None if not gusts else max(gusts),
         "min_wind_speed": None if not speeds else min(speeds),
         "mean_wind_dir": avg_dir,
         "mean_wind_dir_label": _wind_direction_label(avg_dir),
@@ -2031,15 +2245,55 @@ def get_measured_wind_for_session(
         "reason": None if records else "No measured wind observations found for the selected spot and time window.",
         "site": site,
         "records": records,
+        "plot_records": plot_records,
         "summary": summary,
     }
     return result
+
+
+def _forward_fill_observation_records_to_plot_grid(
+    records: List[Dict[str, Any]],
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+    ordered = sorted(records, key=lambda record: int(record["timestamp"]))
+    dense_records: List[Dict[str, Any]] = []
+    grid_ts = (int(start_ts_ms) // CURRENT_DAY_PLOT_INTERVAL_MS) * CURRENT_DAY_PLOT_INTERVAL_MS
+    if grid_ts < int(start_ts_ms):
+        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
+    idx = 0
+    latest: Dict[str, Any] | None = None
+    while grid_ts <= int(end_ts_ms):
+        while idx < len(ordered) and int(ordered[idx]["timestamp"]) <= grid_ts:
+            latest = ordered[idx]
+            idx += 1
+        if latest is not None:
+            dense_records.append(
+                {
+                    "timestamp": int(grid_ts),
+                    "iso_time": _iso_utc_from_ms(int(grid_ts)),
+                    "measured_wind_speed": latest.get("measured_wind_speed"),
+                    "measured_wind_gust": latest.get("measured_wind_gust"),
+                    "measured_wind_direction": latest.get("measured_wind_direction"),
+                }
+            )
+        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
+    return dense_records
 
 
 def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any]) -> int:
     now = _now_ms()
     measured = experience["measured_wind"]
     summary = measured.get("summary") or {}
+    forecast_temperature = get_forecast_temperature_for_session(
+        conn,
+        experience["spot"],
+        int(experience["start_ts"]),
+        int(experience["end_ts"]),
+    )
+    temperature_summary = forecast_temperature.get("summary") or {}
     cur = conn.execute(
         """
         INSERT INTO surf_experiences(
@@ -2048,9 +2302,10 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             foil_size, rider_notes, measured_wind_data_json, measured_wind_status,
             measured_wind_point_count, avg_measured_wind_speed, max_measured_wind_speed,
             min_measured_wind_speed, avg_measured_wind_dir, mean_measured_direction,
-            mean_measured_direction_label
+            mean_measured_direction_label, avg_forecast_temperature,
+            min_forecast_temperature, max_forecast_temperature
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(experience["user_id"]),
@@ -2078,10 +2333,65 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             summary.get("mean_wind_dir"),
             summary.get("mean_wind_dir"),
             summary.get("mean_wind_dir_label"),
+            temperature_summary.get("avg_temperature"),
+            temperature_summary.get("min_temperature"),
+            temperature_summary.get("max_temperature"),
         ),
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def update_surf_experience(
+    conn: sqlite3.Connection,
+    experience_id: int,
+    user_id: int,
+    experience: Dict[str, Any],
+) -> bool:
+    cur = conn.execute(
+        """
+        UPDATE surf_experiences
+        SET rider = ?,
+            spot = ?,
+            date = ?,
+            start_time = ?,
+            end_time = ?,
+            start_ts = ?,
+            end_ts = ?,
+            session_rating = ?,
+            rider_review = ?,
+            rider_weight = ?,
+            wing_size = ?,
+            foil_size = ?,
+            rider_notes = ?
+        WHERE id = ?
+          AND user_id = ?
+        """,
+        (
+            experience["rider"],
+            experience["spot"],
+            experience["date"],
+            experience["start_time"],
+            experience["end_time"],
+            int(experience["start_ts"]),
+            int(experience["end_ts"]),
+            int(experience["session_rating"]),
+            experience.get("rider_review") or None,
+            experience.get("rider_weight"),
+            int(experience["wing_size"]),
+            int(experience["foil_size"]),
+            experience.get("rider_notes") or None,
+            int(experience_id),
+            int(user_id),
+        ),
+    )
+    if int(cur.rowcount) <= 0:
+        conn.commit()
+        return False
+    refreshed = refresh_surf_experience_measured_wind(conn, int(experience_id), user_id=int(user_id))
+    if not refreshed:
+        conn.commit()
+    return True
 
 
 def refresh_surf_experience_measured_wind(
@@ -2114,6 +2424,8 @@ def refresh_surf_experience_measured_wind(
     _, spot, start_ts, end_ts = row
     measured = get_measured_wind_for_session(conn, spot, int(start_ts), int(end_ts))
     summary = measured.get("summary") or {}
+    forecast_temperature = get_forecast_temperature_for_session(conn, spot, int(start_ts), int(end_ts))
+    temperature_summary = forecast_temperature.get("summary") or {}
     conn.execute(
         """
         UPDATE surf_experiences
@@ -2125,7 +2437,10 @@ def refresh_surf_experience_measured_wind(
             min_measured_wind_speed = ?,
             avg_measured_wind_dir = ?,
             mean_measured_direction = ?,
-            mean_measured_direction_label = ?
+            mean_measured_direction_label = ?,
+            avg_forecast_temperature = ?,
+            min_forecast_temperature = ?,
+            max_forecast_temperature = ?
         WHERE id = ?
         """,
         (
@@ -2138,6 +2453,9 @@ def refresh_surf_experience_measured_wind(
             summary.get("mean_wind_dir"),
             summary.get("mean_wind_dir"),
             summary.get("mean_wind_dir_label"),
+            temperature_summary.get("avg_temperature"),
+            temperature_summary.get("min_temperature"),
+            temperature_summary.get("max_temperature"),
             int(experience_id),
         ),
     )
@@ -2159,6 +2477,9 @@ def backfill_surf_experience_measured_summaries(
                OR min_measured_wind_speed IS NULL
                OR mean_measured_direction IS NULL
                OR mean_measured_direction_label IS NULL
+               OR avg_forecast_temperature IS NULL
+               OR COALESCE(json_extract(measured_wind_data_json, '$.summary.max_wind_speed_kind'), '') != 'average_wind'
+               OR json_extract(measured_wind_data_json, '$.summary.max_wind_gust') IS NULL
             """
         ).fetchall()
     else:
@@ -2173,6 +2494,9 @@ def backfill_surf_experience_measured_summaries(
                 OR min_measured_wind_speed IS NULL
                 OR mean_measured_direction IS NULL
                 OR mean_measured_direction_label IS NULL
+                OR avg_forecast_temperature IS NULL
+                OR COALESCE(json_extract(measured_wind_data_json, '$.summary.max_wind_speed_kind'), '') != 'average_wind'
+                OR json_extract(measured_wind_data_json, '$.summary.max_wind_gust') IS NULL
               )
             """,
             (int(user_id),),
@@ -2210,13 +2534,16 @@ def list_surf_experiences(
         "date": "date",
         "spot": "spot COLLATE NOCASE",
         "start_time": "start_time",
+        "end_time": "end_time",
         "session_rating": "session_rating",
         "wing_size": "wing_size",
         "foil_size": "foil_size",
         "avg_measured_wind_speed": "avg_measured_wind_speed",
         "max_measured_wind_speed": "max_measured_wind_speed",
         "min_measured_wind_speed": "min_measured_wind_speed",
+        "max_measured_wind_gust": "CAST(json_extract(measured_wind_data_json, '$.summary.max_wind_gust') AS REAL)",
         "mean_measured_direction": "mean_measured_direction",
+        "avg_forecast_temperature": "avg_forecast_temperature",
     }
     order_expr = allowed_sort.get(sort_key, "date")
     direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
@@ -2226,38 +2553,46 @@ def list_surf_experiences(
                session_rating, rider_review, wing_size, foil_size, rider_notes,
                measured_wind_status, measured_wind_point_count,
                avg_measured_wind_speed, max_measured_wind_speed, min_measured_wind_speed,
+               CAST(json_extract(measured_wind_data_json, '$.summary.max_wind_gust') AS REAL),
                COALESCE(mean_measured_direction, avg_measured_wind_dir),
-               mean_measured_direction_label
+               mean_measured_direction_label, avg_forecast_temperature
         FROM surf_experiences
         WHERE user_id = ?
         ORDER BY {order_expr} {direction}, start_time {direction}, id {direction}
         """,
         (int(user_id),),
     ).fetchall()
-    return [
-        {
-            "id": int(row[0]),
-            "submitted_iso": row[1],
-            "rider": row[2],
-            "spot": row[3],
-            "date": row[4],
-            "start_time": row[5],
-            "end_time": row[6],
-            "session_rating": int(row[7]),
-            "rider_review": row[8] or "",
-            "wing_size": int(row[9]),
-            "foil_size": int(row[10]),
-            "rider_notes": row[11] or "",
-            "measured_wind_status": row[12],
-            "measured_wind_point_count": int(row[13]),
-            "avg_measured_wind_speed": row[14],
-            "max_measured_wind_speed": row[15],
-            "min_measured_wind_speed": row[16],
-            "mean_measured_direction": row[17],
-            "mean_measured_direction_label": row[18] or _wind_direction_label(row[17]),
-        }
-        for row in rows
-    ]
+    experiences = []
+    for row in rows:
+        mean_direction = row[18]
+        mean_direction_label = row[19] or _wind_direction_label(mean_direction)
+        experiences.append(
+            {
+                "id": int(row[0]),
+                "submitted_iso": row[1],
+                "rider": row[2],
+                "spot": row[3],
+                "date": row[4],
+                "start_time": row[5],
+                "end_time": row[6],
+                "session_rating": int(row[7]),
+                "rider_review": row[8] or "",
+                "wing_size": int(row[9]),
+                "foil_size": int(row[10]),
+                "rider_notes": row[11] or "",
+                "measured_wind_status": row[12],
+                "measured_wind_point_count": int(row[13]),
+                "avg_measured_wind_speed": row[14],
+                "max_measured_wind_speed": row[15],
+                "min_measured_wind_speed": row[16],
+                "max_measured_wind_gust": row[17],
+                "mean_measured_direction": mean_direction,
+                "mean_measured_direction_label": mean_direction_label,
+                "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
+                "avg_forecast_temperature": row[20],
+            }
+        )
+    return experiences
 
 
 def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
@@ -2269,7 +2604,8 @@ def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: i
                measured_wind_point_count, avg_measured_wind_speed,
                max_measured_wind_speed, min_measured_wind_speed,
                COALESCE(mean_measured_direction, avg_measured_wind_dir),
-               mean_measured_direction_label
+               mean_measured_direction_label, avg_forecast_temperature,
+               min_forecast_temperature, max_forecast_temperature
         FROM surf_experiences
         WHERE user_id = ?
           AND id = ?
@@ -2283,6 +2619,8 @@ def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: i
         measured = json.loads(measured_raw)
     except json.JSONDecodeError:
         measured = {"status": "unavailable", "records": [], "summary": {}}
+    mean_direction = row[19]
+    mean_direction_label = row[20] or _wind_direction_label(mean_direction)
     return {
         "id": int(row[0]),
         "submitted_iso": row[1],
@@ -2303,6 +2641,10 @@ def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: i
         "avg_measured_wind_speed": row[16],
         "max_measured_wind_speed": row[17],
         "min_measured_wind_speed": row[18],
-        "mean_measured_direction": row[19],
-        "mean_measured_direction_label": row[20] or _wind_direction_label(row[19]),
+        "mean_measured_direction": mean_direction,
+        "mean_measured_direction_label": mean_direction_label,
+        "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
+        "avg_forecast_temperature": row[21],
+        "min_forecast_temperature": row[22],
+        "max_forecast_temperature": row[23],
     }

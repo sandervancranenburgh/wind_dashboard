@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Profile{% endblock %}
+{% block content %}
+  <main class="page">
+    <h2>Profile</h2>
+    <form method="post" action="{{ url_for('profile') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="form-grid">
+        <div>
+          <label for="RiderName">RiderName</label>
+          <input id="RiderName" name="RiderName" value="{{ profile.rider_name or '' }}" autocomplete="name">
+        </div>
+        <div>
+          <label for="RiderWeight">RiderWeight</label>
+          <div class="unit-field">
+            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ profile.rider_weight or '' }}">
+            <span class="unit">kg</span>
+          </div>
+        </div>
+        <div>
+          <label for="DefaultSpot">DefaultSpot</label>
+          <select id="DefaultSpot" name="DefaultSpot">
+            <option value=""></option>
+            {% for spot in spot_options %}
+              <option value="{{ spot }}" {% if profile.default_spot == spot %}selected{% endif %}>{{ spot }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="primary" type="submit">Save profile</button>
+        <a class="button" href="{{ url_for('experiences') }}">My submissions</a>
+      </div>
+    </form>
+  </main>
+{% endblock %}

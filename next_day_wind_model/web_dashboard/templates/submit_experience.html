@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}{{ form_title }}{% endblock %}
+{% block content %}
+  <main class="page">
+    <h2>{{ form_title }}</h2>
+    <form method="post" action="{{ form_action }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="form-grid">
+        <div>
+          <label for="Rider">Rider *</label>
+          <input id="Rider" name="Rider" value="{{ form_values.Rider }}" required>
+        </div>
+        <div>
+          <label for="Spot">Spot *</label>
+          <select id="Spot" name="Spot" required>
+            {% for spot in spot_options %}
+              <option value="{{ spot }}" {% if form_values.Spot == spot %}selected{% endif %}>{{ spot }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="Date">Date *</label>
+          <input id="Date" name="Date" type="date" value="{{ form_values.Date }}" required>
+        </div>
+        <div>
+          <label for="StartTime">StartTime *</label>
+          <select id="StartTime" name="StartTime" required>
+            {% for value in hour_options %}
+              <option value="{{ value }}" {% if form_values.StartTime == value %}selected{% endif %}>{{ value }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="EndTime">EndTime *</label>
+          <select id="EndTime" name="EndTime" required>
+            {% for value in hour_options %}
+              <option value="{{ value }}" {% if form_values.EndTime == value %}selected{% endif %}>{{ value }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>SessionRating *</label>
+          <div class="stars">
+            {% for value in [5, 4, 3, 2, 1] %}
+              <input id="rating-{{ value }}" type="radio" name="SessionRating" value="{{ value }}" {% if form_values.SessionRating|string == value|string %}checked{% endif %} required>
+              <label for="rating-{{ value }}">&#9733;</label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="form-row-full">
+          <label for="RiderReview">RiderReview</label>
+          <textarea id="RiderReview" name="RiderReview">{{ form_values.RiderReview }}</textarea>
+        </div>
+        <div>
+          <label for="RiderWeight">RiderWeight *</label>
+          <div class="unit-field">
+            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
+            <span class="unit">kg</span>
+          </div>
+        </div>
+        <div>
+          <label for="WingSize">WingSize *</label>
+          <div class="unit-field">
+            <select id="WingSize" name="WingSize" required>
+              {% for value in wing_size_options %}
+                <option value="{{ value }}" {% if form_values.WingSize|string == value|string %}selected{% endif %}>{{ value }}</option>
+              {% endfor %}
+            </select>
+            <span class="unit">m2</span>
+          </div>
+        </div>
+        <div>
+          <label for="FoilSize">FoilSize *</label>
+          <div class="unit-field">
+            <select id="FoilSize" name="FoilSize" required>
+              {% for value in foil_size_options %}
+                <option value="{{ value }}" {% if form_values.FoilSize|string == value|string %}selected{% endif %}>{{ value }}</option>
+              {% endfor %}
+            </select>
+            <span class="unit">cm2</span>
+          </div>
+        </div>
+        <div class="form-row-full">
+          <label for="RiderNotes">RiderNotes</label>
+          <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="primary" type="submit">{{ submit_label }}</button>
+        <a class="button" href="{{ url_for('experiences') }}">My submissions</a>
+      </div>
+    </form>
+  </main>
+{% endblock %}
+{% block scripts %}
+  <script>
+    const startSelect = document.getElementById("StartTime");
+    const endSelect = document.getElementById("EndTime");
+    function hourValue(value) { return Number(value.slice(0, 2)); }
+    function syncEndOptions() {
+      const start = hourValue(startSelect.value);
+      for (const option of endSelect.options) option.disabled = hourValue(option.value) < start;
+      if (hourValue(endSelect.value) < start) {
+        const next = Math.min(start + 2, 23);
+        endSelect.value = `${String(next).padStart(2, "0")}:00`;
+      }
+    }
+    if (startSelect && endSelect) {
+      startSelect.addEventListener("change", syncEndOptions);
+      syncEndOptions();
+    }
+  </script>
+{% endblock %}

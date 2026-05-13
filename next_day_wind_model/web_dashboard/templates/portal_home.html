@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Rider Portal{% endblock %}
+{% block content %}
+  <main class="page">
+    <section class="card portal-card">
+      <h2>Rider portal</h2>
+      <p class="desc">Log in to review your surf sessions, submit a new experience, and manage your rider profile.</p>
+      <div class="form-actions">
+        <a class="button primary" href="{{ url_for('portal_home', login=1, next=url_for('experiences')) }}">Login / Register</a>
+        <a class="button" href="{{ forecast_dashboard_base_url }}">Back to forecast dashboard</a>
+      </div>
+    </section>
+  </main>
+{% endblock %}

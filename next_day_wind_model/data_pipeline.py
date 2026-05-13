@@ -9,6 +9,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,36 @@ class DatasetConfig:
     model: str = "HARMONIE"
     window_hours: int = 72
     target_hours: int = 24
+
+
+FORECAST_METEO_FEATURE_GROUPS: dict[str, list[str]] = {
+    "temperature": ["forecast_temperature"],
+    "pressure": ["forecast_pressure"],
+    "rain": ["forecast_rain"],
+    "rh": ["forecast_rh"],
+    "clouds": ["forecast_clouds"],
+    "cloud_layers": [
+        "forecast_low_cloud_cover",
+        "forecast_medium_cloud_cover",
+        "forecast_high_cloud_cover",
+    ],
+    "cloud_base": ["forecast_cloud_base"],
+    "radiation": ["forecast_global_radiation"],
+    "weather_core": ["forecast_temperature", "forecast_pressure", "forecast_rain"],
+    "all_meteo": [
+        "forecast_temperature",
+        "forecast_pressure",
+        "forecast_rain",
+        "forecast_rh",
+        "forecast_clouds",
+        "forecast_low_cloud_cover",
+        "forecast_medium_cloud_cover",
+        "forecast_high_cloud_cover",
+        "forecast_cloud_base",
+        "forecast_global_radiation",
+    ],
+}
+FORECAST_METEO_COLUMNS = FORECAST_METEO_FEATURE_GROUPS["all_meteo"]
 
 
 def _to_float(value) -> float | None:
@@ -94,6 +125,28 @@ def load_forecast_vintages(conn: sqlite3.Connection, site: str, model: str) -> p
                     wind_dir,
                     ["WindDirection", "wind_dir", "winddirection", "WD", "DD", "dir", "direction"],
                 ),
+                "forecast_temperature": _forecast_value(
+                    payload,
+                    None,
+                    ["Temperature", "temperature", "temp", "air_temperature"],
+                ),
+                "forecast_pressure": _forecast_value(
+                    payload,
+                    None,
+                    ["Pressure", "pressure", "msl_pressure", "mslp"],
+                ),
+                "forecast_rain": _forecast_value(
+                    payload,
+                    None,
+                    ["Rain", "rain", "precipitation", "precipitation_rate", "total_precipitation_rate"],
+                ),
+                "forecast_rh": _forecast_value(payload, None, ["RH", "rh", "relative_humidity"]),
+                "forecast_clouds": _forecast_value(payload, None, ["Clouds", "clouds", "cloud_cover"]),
+                "forecast_low_cloud_cover": _forecast_value(payload, None, ["low_cloud_cover"]),
+                "forecast_medium_cloud_cover": _forecast_value(payload, None, ["medium_cloud_cover"]),
+                "forecast_high_cloud_cover": _forecast_value(payload, None, ["high_cloud_cover"]),
+                "forecast_cloud_base": _forecast_value(payload, None, ["cloud_base"]),
+                "forecast_global_radiation": _forecast_value(payload, None, ["global_radiation"]),
             }
         )
 
@@ -123,6 +176,16 @@ def _collapse_latest_forecast_view(forecast_vintages: pd.DataFrame) -> pd.DataFr
             "forecast_min",
             "forecast_max",
             "forecast_dir",
+            "forecast_temperature",
+            "forecast_pressure",
+            "forecast_rain",
+            "forecast_rh",
+            "forecast_clouds",
+            "forecast_low_cloud_cover",
+            "forecast_medium_cloud_cover",
+            "forecast_high_cloud_cover",
+            "forecast_cloud_base",
+            "forecast_global_radiation",
         ]
     ]
 
@@ -248,6 +311,20 @@ def _speed_v2_feature_cols() -> list[str]:
     ]
 
 
+def _speed_v2_extra_feature_cols(feature_schema: str) -> list[str]:
+    schema = str(feature_schema).strip().lower()
+    prefix = "speed_v2_plus_"
+    if not schema.startswith(prefix):
+        return []
+    group = schema[len(prefix) :]
+    if group not in FORECAST_METEO_FEATURE_GROUPS:
+        raise ValueError(
+            "Unsupported speed_v2 feature group "
+            f"{group!r}. Available groups: {', '.join(sorted(FORECAST_METEO_FEATURE_GROUPS))}"
+        )
+    return FORECAST_METEO_FEATURE_GROUPS[group]
+
+
 def _speed_v3_actual_history_feature_cols() -> list[str]:
     return _speed_v2_feature_cols() + [
         "history_actual_avg",
@@ -305,7 +382,7 @@ def _build_feature_sequence(
     feature_schema: str,
 ) -> tuple[np.ndarray, list[str]] | None:
     schema = str(feature_schema).strip().lower()
-    if schema in {"speed_v2", "speed_v3_actual_history"}:
+    if schema == "speed_v2" or schema.startswith("speed_v2_plus_") or schema == "speed_v3_actual_history":
         history_features = _add_cyclical_forecast_features(history_frame)
         target_features = _add_cyclical_forecast_features(target_frame)
         history_features["is_target"] = 0.0
@@ -315,7 +392,7 @@ def _build_feature_sequence(
             target_features = _add_actual_history_features(target_features, is_target=True)
             feature_cols = _speed_v3_actual_history_feature_cols()
         else:
-            feature_cols = _speed_v2_feature_cols()
+            feature_cols = _speed_v2_feature_cols() + _speed_v2_extra_feature_cols(schema)
         sequence = pd.concat(
             [
                 history_features[feature_cols],
@@ -340,7 +417,25 @@ def _build_feature_sequence(
 
 def _interpolate_missing_features(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    feature_cols = ["forecast_avg", "forecast_min", "forecast_max", "forecast_dir", "actual_avg", "actual_max", "actual_dir"]
+    feature_cols = [
+        "forecast_avg",
+        "forecast_min",
+        "forecast_max",
+        "forecast_dir",
+        "forecast_temperature",
+        "forecast_pressure",
+        "forecast_rain",
+        "forecast_rh",
+        "forecast_clouds",
+        "forecast_low_cloud_cover",
+        "forecast_medium_cloud_cover",
+        "forecast_high_cloud_cover",
+        "forecast_cloud_base",
+        "forecast_global_radiation",
+        "actual_avg",
+        "actual_max",
+        "actual_dir",
+    ]
     for col in feature_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -485,6 +580,8 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
             "forecast_max": pd.to_numeric(group["forecast_max"], errors="coerce").to_numpy(dtype=np.float32),
             "forecast_dir": pd.to_numeric(group["forecast_dir"], errors="coerce").to_numpy(dtype=np.float32),
         }
+        for col in FORECAST_METEO_COLUMNS:
+            target_lookup[int(target_ts)][col] = pd.to_numeric(group[col], errors="coerce").to_numpy(dtype=np.float32)
 
     run_entries: List[Dict[str, object]] = []
     by_run = forecast_vintages.sort_values(["run_ts", "target_ts"])
@@ -503,6 +600,8 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
                 "horizon_hr": pd.to_numeric(group["horizon_hr"], errors="coerce").to_numpy(dtype=np.float32),
             }
         )
+        for col in FORECAST_METEO_COLUMNS:
+            run_entries[-1][col] = pd.to_numeric(group[col], errors="coerce").to_numpy(dtype=np.float32)
     run_entries.sort(key=lambda entry: (int(entry["run_ts"]), int(entry["available_ts"])))
     run_available_ts = np.asarray([int(entry["available_ts"]) for entry in run_entries], dtype=np.int64)
     return {
@@ -554,6 +653,7 @@ def _lookup_latest_target_as_of(
         "forecast_min": float(series["forecast_min"][pos]),
         "forecast_max": float(series["forecast_max"][pos]),
         "forecast_dir": float(series["forecast_dir"][pos]),
+        **{col: float(series[col][pos]) for col in FORECAST_METEO_COLUMNS},
     }
 
 
@@ -619,6 +719,10 @@ def _select_latest_complete_run_frame(
                     "forecast_min": np.asarray(entry["forecast_min"], dtype=np.float32)[indices],
                     "forecast_max": np.asarray(entry["forecast_max"], dtype=np.float32)[indices],
                     "forecast_dir": np.asarray(entry["forecast_dir"], dtype=np.float32)[indices],
+                    **{
+                        col: np.asarray(entry[col], dtype=np.float32)[indices]
+                        for col in FORECAST_METEO_COLUMNS
+                    },
                 },
                 index=target_times,
             )
@@ -886,7 +990,9 @@ def build_all_training_arrays(
 
     return {
         "X_all": X_scaled,
+        "X_all_raw": X_raw,
         "y_all": y_scaled,
+        "y_target_all_raw": y_target_raw,
         "y_actual_all_raw": y_actual_raw,
         "y_forecast_all_raw": y_forecast_raw,
         "target_times_all": target_times_all,
@@ -1044,6 +1150,7 @@ def build_next_day_inference_input(
     x_mean: np.ndarray,
     x_std: np.ndarray,
     feature_schema: str = "legacy",
+    local_tz: str = "Europe/Amsterdam",
 ) -> Dict[str, np.ndarray | str]:
     schema = str(feature_schema).strip().lower()
     conn = sqlite3.connect(str(db_path))
@@ -1053,22 +1160,28 @@ def build_next_day_inference_input(
     finally:
         conn.close()
 
-    # Predict the next calendar day (UTC) after the most recent observation day.
-    reference_day_start = latest_obs.floor("D")
-    target_day_start = reference_day_start + pd.Timedelta(days=1)
-    target_times = pd.date_range(
-        start=target_day_start,
+    # Predict the next local calendar day. Windsurfice displays times in local
+    # civil time, while the DB stores UTC instants for durability.
+    tz = ZoneInfo(local_tz)
+    latest_obs_local = latest_obs.tz_convert(tz)
+    reference_day_start_local = latest_obs_local.floor("D")
+    target_day_start_local = reference_day_start_local + pd.Timedelta(days=1)
+    target_times_local = pd.date_range(
+        start=target_day_start_local,
         periods=cfg.target_hours,
         freq="1h",
-        tz="UTC",
+        tz=tz,
     )
-    anchor_time = target_day_start - pd.Timedelta(hours=1)
-    history_times = pd.date_range(
-        end=anchor_time,
+    anchor_time_local = target_day_start_local - pd.Timedelta(hours=1)
+    history_times_local = pd.date_range(
+        end=anchor_time_local,
         periods=cfg.window_hours,
         freq="1h",
-        tz="UTC",
+        tz=tz,
     )
+    target_times = target_times_local.tz_convert("UTC")
+    anchor_time = anchor_time_local.tz_convert("UTC")
+    history_times = history_times_local.tz_convert("UTC")
     anchor_ts_ms = _target_ms(anchor_time)
 
     context = build_anchor_forecast_context(
@@ -1124,5 +1237,7 @@ def build_next_day_inference_input(
         "target_times": np.array([t.isoformat() for t in target_times]),
         "anchor_time": anchor_time.isoformat(),
         "reference_observation_time": latest_obs.isoformat(),
-        "prediction_day_start": target_day_start.isoformat(),
+        "prediction_day_start": target_times[0].isoformat(),
+        "prediction_day_start_local": target_day_start_local.isoformat(),
+        "local_timezone": local_tz,
     }

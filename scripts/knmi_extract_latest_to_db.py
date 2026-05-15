@@ -60,10 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site-lon", type=float, default=None)
     parser.add_argument("--max-files", type=int, default=10)
     parser.add_argument(
+        "--filename",
+        default=None,
+        help="Process a specific KNMI tar filename, downloading it first if needed.",
+    )
+    parser.add_argument(
         "--tar-path",
         type=Path,
         default=None,
-        help="Use an existing tar file instead of listing/downloading from KNMI.",
+        help="Use an existing local tar file instead of listing/downloading from KNMI.",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -78,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect-shadow", action="store_true", help="Only print latest rows from knmi_forecasts_shadow.")
     parser.add_argument("--inspect-runs", action="store_true", help="Only print recent KNMI runs stored in the DB.")
     parser.add_argument("--diagnose-archive", action="store_true", help="Only print archive depth/training-readiness diagnostics.")
+    parser.add_argument("--archive-diagnostic", action="store_true", help="Alias for --diagnose-archive.")
     parser.add_argument("--inspect-limit", type=int, default=5)
     parser.add_argument("--model", default="HARMONIE", help="Forecast model label for shadow rows.")
     parser.add_argument(
@@ -89,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         "--write-production",
         action="store_true",
         help="DANGEROUS: also write KNMI-derived rows into the production forecasts table.",
+    )
+    parser.add_argument(
+        "--skip-archive-diagnostic",
+        action="store_true",
+        help="Do not print the concise archive diagnostic after a successful write.",
     )
     return parser.parse_args()
 
@@ -115,7 +126,7 @@ def print_latest_rows(db_path: Path, site: str, limit: int) -> None:
     if rows.empty:
         print(f"No harmonie_knmi_features rows found for site={site!r} in {db_path}.")
         return
-        print(rows.to_string(index=False))
+    print(rows.to_string(index=False))
 
 
 def print_latest_shadow_rows(db_path: Path, site: str, limit: int) -> None:
@@ -177,6 +188,11 @@ def select_tar(args: argparse.Namespace) -> tuple[Path, str, str | None, int | N
         run_ts = parse_run_from_tar_filename(tar_path.name).isoformat()
         return tar_path, tar_path.name, run_ts, None
 
+    if args.filename is not None:
+        tar_path = ensure_downloaded_tar(args.filename, args.raw_dir, args.dataset, args.version)
+        run_ts = parse_run_from_tar_filename(args.filename).isoformat()
+        return tar_path, args.filename, run_ts, None
+
     files = list_knmi_files(args.dataset, args.version, max_keys=args.max_files)
     latest = select_latest_tar_file(files)
     tar_path = ensure_downloaded_tar(latest.filename, args.raw_dir, args.dataset, args.version)
@@ -198,7 +214,7 @@ def main() -> None:
     if args.inspect_runs:
         print_recent_runs(db_path, site=site.site, limit=args.inspect_limit)
         return
-    if args.diagnose_archive:
+    if args.diagnose_archive or args.archive_diagnostic:
         print_archive_diagnostic(db_path, site=site.site)
         return
 
@@ -261,6 +277,8 @@ def main() -> None:
         print("No shadow rows found after write.")
     else:
         print(shadow_sample.to_string(index=False))
+    if not args.skip_archive_diagnostic:
+        print_archive_diagnostic(db_path, site=site.site)
 
 
 if __name__ == "__main__":

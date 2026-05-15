@@ -12,6 +12,7 @@ data/**/*.sqlite
 data/**/*.sqlite-shm
 data/**/*.sqlite-wal
 *.log
+logs/
 *.npy
 *.pt
 *.pth

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare latest Windsurfice forecast snapshot with latest KNMI shadow snapshot."""
+"""Compare Windsurfice forecast snapshots with the latest KNMI shadow snapshot."""
 
 from __future__ import annotations
 
@@ -28,18 +28,26 @@ def circular_abs_diff(a: pd.Series, b: pd.Series) -> pd.Series:
     return ((a.astype(float) - b.astype(float) + 180.0) % 360.0 - 180.0).abs()
 
 
-def latest_run_ts(conn: sqlite3.Connection, table: str, site: str, model: str) -> int | None:
+def run_candidates(conn: sqlite3.Connection, table: str, site: str, model: str) -> list[int]:
     if table == "forecasts":
-        row = conn.execute(
-            "SELECT MAX(run_ts) FROM forecasts WHERE site = ? AND model = ?",
+        rows = conn.execute(
+            "SELECT DISTINCT run_ts FROM forecasts WHERE site = ? AND model = ? ORDER BY run_ts",
             (site, model),
-        ).fetchone()
+        ).fetchall()
     else:
-        row = conn.execute(
-            f"SELECT MAX(run_ts) FROM {SHADOW_TABLE_NAME} WHERE site = ? AND model = ?",
+        rows = conn.execute(
+            f"SELECT DISTINCT run_ts FROM {SHADOW_TABLE_NAME} WHERE site = ? AND model = ? ORDER BY run_ts",
             (site, model),
-        ).fetchone()
-    return None if row is None or row[0] is None else int(row[0])
+        ).fetchall()
+    return [int(row[0]) for row in rows if row[0] is not None]
+
+
+def choose_run(candidates: list[int], mode: str, reference_ts: int | None = None) -> int | None:
+    if not candidates:
+        return None
+    if mode == "latest" or reference_ts is None:
+        return max(candidates)
+    return min(candidates, key=lambda value: (abs(int(value) - int(reference_ts)), -int(value)))
 
 
 def load_snapshot(conn: sqlite3.Connection, table: str, site: str, model: str, run_ts: int) -> pd.DataFrame:
@@ -102,12 +110,18 @@ def compare_snapshots(windsurfice: pd.DataFrame, knmi: pd.DataFrame) -> pd.DataF
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare latest Windsurfice forecast snapshot against latest KNMI shadow forecast snapshot.",
+        description="Compare a Windsurfice forecast snapshot against the latest KNMI shadow forecast snapshot.",
     )
     parser.add_argument("--db", type=Path, default=Path("data") / DB_FILENAME)
     parser.add_argument("--site", default="valkenburgsemeer")
     parser.add_argument("--model", default="HARMONIE")
     parser.add_argument("--sample-rows", type=int, default=5)
+    parser.add_argument(
+        "--windsurfice-policy",
+        choices=("latest", "closest-to-knmi-run", "closest-to-knmi-fetch"),
+        default="latest",
+        help="How to select the Windsurfice snapshot for comparison.",
+    )
     return parser.parse_args()
 
 
@@ -116,15 +130,26 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     try:
         create_knmi_forecasts_shadow_table(conn)
-        windsurfice_run_ts = latest_run_ts(conn, "forecasts", args.site, args.model)
-        knmi_run_ts = latest_run_ts(conn, SHADOW_TABLE_NAME, args.site, args.model)
-        if windsurfice_run_ts is None:
+        windsurfice_runs = run_candidates(conn, "forecasts", args.site, args.model)
+        knmi_runs = run_candidates(conn, SHADOW_TABLE_NAME, args.site, args.model)
+        knmi_run_ts = choose_run(knmi_runs, "latest")
+        if not windsurfice_runs:
             raise SystemExit(f"No Windsurfice forecast rows found in forecasts for site={args.site!r}.")
         if knmi_run_ts is None:
             raise SystemExit(f"No KNMI shadow rows found in {SHADOW_TABLE_NAME} for site={args.site!r}.")
 
-        windsurfice = load_snapshot(conn, "forecasts", args.site, args.model, windsurfice_run_ts)
         knmi = load_snapshot(conn, SHADOW_TABLE_NAME, args.site, args.model, knmi_run_ts)
+        reference_ts = None
+        if args.windsurfice_policy == "closest-to-knmi-run":
+            reference_ts = int(knmi_run_ts)
+        elif args.windsurfice_policy == "closest-to-knmi-fetch" and not knmi.empty:
+            reference_ts = int(knmi["fetched_ts"].max())
+        windsurfice_run_ts = choose_run(
+            windsurfice_runs,
+            "latest" if args.windsurfice_policy == "latest" else "closest",
+            reference_ts=reference_ts,
+        )
+        windsurfice = load_snapshot(conn, "forecasts", args.site, args.model, int(windsurfice_run_ts))
     finally:
         conn.close()
 
@@ -136,11 +161,12 @@ def main() -> None:
     speed_abs = comparison.loc[matched, "wind_speed_diff_knots"].abs()
     dir_abs = comparison.loc[matched, "wind_dir_circular_diff"]
 
-    print("\nKNMI shadow versus Windsurfice latest snapshot")
-    print("==============================================")
+    print("\nKNMI shadow versus Windsurfice snapshot comparison")
+    print("=================================================")
     print(f"Database path: {args.db}")
     print(f"Site: {args.site}")
     print(f"Model: {args.model}")
+    print(f"Windsurfice selection policy: {args.windsurfice_policy}")
     print("Unit conversion used: none in comparison; KNMI shadow wind_speed is already 10 m m/s converted to knots.")
     print("\nWindsurfice snapshot metadata:")
     for key, value in snapshot_metadata(windsurfice).items():
@@ -148,6 +174,28 @@ def main() -> None:
     print("\nKNMI shadow snapshot metadata:")
     for key, value in snapshot_metadata(knmi).items():
         print(f"  {key}: {value}")
+
+    wf_meta = snapshot_metadata(windsurfice)
+    if wf_meta["run_ts"] == wf_meta["fetched_min"] == wf_meta["fetched_max"]:
+        print(
+            "\nWindsurfice run timestamp note: selected run_ts equals fetched_ts. "
+            "In this project that usually means Windsurfice lacked authoritative model-run metadata "
+            "and source_fetch.py stored fallback_fetch_time."
+        )
+    if windsurfice_run_ts != knmi_run_ts:
+        delta_hr = abs(int(windsurfice_run_ts) - int(knmi_run_ts)) / 3_600_000.0
+        if args.windsurfice_policy == "latest":
+            print(
+                "\nVintage warning: compared snapshots are not the same forecast vintage "
+                f"(run_ts delta {delta_hr:.2f} h). Latest-vs-latest is useful operationally, "
+                "but can be misleading while the KNMI archive has only one run."
+            )
+        else:
+            print(
+                "\nVintage warning: closest available Windsurfice snapshot still is not the same "
+                f"forecast vintage as KNMI (run_ts delta {delta_hr:.2f} h). Treat this as a "
+                "closest-vintage diagnostic, not an exact same-run comparison."
+            )
     print("\nMatch summary:")
     print(f"  Windsurfice rows: {len(windsurfice)}")
     print(f"  KNMI shadow rows: {len(knmi)}")

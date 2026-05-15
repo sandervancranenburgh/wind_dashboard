@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import sqlite3
 import tarfile
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ DATASET = "harmonie_arome_cy43_p1"
 VERSION = "1.0"
 SOURCE = "knmi_harmonie_p1"
 TABLE_NAME = "harmonie_knmi_features"
+SHADOW_TABLE_NAME = "knmi_forecasts_shadow"
 LEVELS = (10, 50, 100, 200, 300)
 U_WIND_PARAMETER = 33
 V_WIND_PARAMETER = 34
@@ -59,6 +61,26 @@ class KnmiExtractionError(RuntimeError):
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Cannot parse UTC timestamp: {value!r}")
+    return pd.Timestamp(ts)
+
+
+def timestamp_ms(value: Any) -> int:
+    ts = parse_utc_timestamp(value)
+    return int(ts.timestamp() * 1000)
+
+
+def json_scalar(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def parse_run_and_horizon(filename: str) -> tuple[pd.Timestamp, int, pd.Timestamp]:
@@ -533,3 +555,297 @@ def latest_harmonie_knmi_rows(conn: sqlite3.Connection, site: str, limit: int = 
         conn,
         params=(site, int(limit)),
     )
+
+
+def create_knmi_forecasts_shadow_table(conn: sqlite3.Connection) -> None:
+    """Create a non-production forecast mirror for KNMI replacement checks."""
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SHADOW_TABLE_NAME} (
+            site TEXT NOT NULL,
+            model TEXT NOT NULL,
+            source TEXT NOT NULL,
+            dataset TEXT NOT NULL,
+            run_ts INTEGER NOT NULL,
+            run_iso TEXT NOT NULL,
+            fetched_ts INTEGER NOT NULL,
+            fetched_iso TEXT NOT NULL,
+            target_ts INTEGER NOT NULL,
+            target_iso TEXT NOT NULL,
+            horizon_hr INTEGER NOT NULL,
+            wind_speed REAL,
+            wind_gust REAL,
+            wind_dir REAL,
+            payload TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(source, dataset, site, run_ts, target_ts)
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{SHADOW_TABLE_NAME}_site_run ON {SHADOW_TABLE_NAME}(site, run_ts)"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{SHADOW_TABLE_NAME}_site_target ON {SHADOW_TABLE_NAME}(site, target_ts)"
+    )
+    conn.commit()
+
+
+def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONIE") -> pd.DataFrame:
+    """
+    Convert canonical KNMI feature rows into the current forecast-table shape.
+
+    The current Windsurfice-backed `forecasts.wind_speed` values are in the same
+    unit as `WindForecastAvr`, which verification showed corresponds to knots.
+    KNMI 10 m speed is extracted in m/s and converted here to knots so this
+    shadow table can be compared against the existing fetch/logging path.
+    """
+    if frame.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        {
+            "site": frame["site"],
+            "model": model,
+            "source": frame["source"],
+            "dataset": frame["dataset"],
+            "run_iso": frame["run_ts"].map(lambda value: parse_utc_timestamp(value).isoformat().replace("+00:00", "Z")),
+            "fetched_iso": frame["fetched_ts"].map(
+                lambda value: parse_utc_timestamp(value).isoformat().replace("+00:00", "Z")
+            ),
+            "target_iso": frame["target_ts"].map(lambda value: parse_utc_timestamp(value).isoformat().replace("+00:00", "Z")),
+            "horizon_hr": pd.to_numeric(frame["horizon_hr"], errors="coerce").astype("Int64"),
+            "wind_speed": pd.to_numeric(frame["wind_speed_10m_knots"], errors="coerce"),
+            "wind_gust": None,
+            "wind_dir": pd.to_numeric(frame["wind_dir_10m"], errors="coerce"),
+        }
+    )
+    out["run_ts"] = out["run_iso"].map(timestamp_ms)
+    out["fetched_ts"] = out["fetched_iso"].map(timestamp_ms)
+    out["target_ts"] = out["target_iso"].map(timestamp_ms)
+    out["payload"] = frame.apply(
+        lambda row: json.dumps(
+            {
+                "source": row.get("source"),
+                "dataset": row.get("dataset"),
+                "wind_speed_10m_mps": json_scalar(row.get("wind_speed_10m_mps")),
+                "wind_speed_10m_knots": json_scalar(row.get("wind_speed_10m_knots")),
+                "wind_dir_10m": json_scalar(row.get("wind_dir_10m")),
+                "grid_lat": json_scalar(row.get("grid_lat")),
+                "grid_lon": json_scalar(row.get("grid_lon")),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        axis=1,
+    )
+    return out
+
+
+def upsert_knmi_forecasts_shadow(conn: sqlite3.Connection, frame: pd.DataFrame, model: str = "HARMONIE") -> int:
+    create_knmi_forecasts_shadow_table(conn)
+    shadow = feature_frame_to_shadow_forecasts(frame, model=model)
+    if shadow.empty:
+        return 0
+
+    columns = [
+        "site",
+        "model",
+        "source",
+        "dataset",
+        "run_ts",
+        "run_iso",
+        "fetched_ts",
+        "fetched_iso",
+        "target_ts",
+        "target_iso",
+        "horizon_hr",
+        "wind_speed",
+        "wind_gust",
+        "wind_dir",
+        "payload",
+        "created_at",
+    ]
+    created_at = utc_now_iso()
+    rows = []
+    for record in shadow.to_dict(orient="records"):
+        row = []
+        for column in columns:
+            value = created_at if column == "created_at" else record.get(column)
+            if value is not None and pd.isna(value):
+                value = None
+            row.append(value)
+        rows.append(row)
+
+    placeholders = ", ".join("?" for _ in columns)
+    column_sql = ", ".join(columns)
+    update_columns = [
+        column for column in columns if column not in {"source", "dataset", "site", "run_ts", "target_ts"}
+    ]
+    update_sql = ", ".join(f"{column}=excluded.{column}" for column in update_columns)
+    conn.executemany(
+        f"""
+        INSERT INTO {SHADOW_TABLE_NAME} ({column_sql})
+        VALUES ({placeholders})
+        ON CONFLICT(source, dataset, site, run_ts, target_ts)
+        DO UPDATE SET {update_sql}
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def write_knmi_rows_to_production_forecasts(conn: sqlite3.Connection, frame: pd.DataFrame, model: str = "HARMONIE") -> int:
+    """
+    Dangerous compatibility path for explicit manual tests only.
+
+    This writes KNMI-derived forecast rows into the production `forecasts` table.
+    Callers should expose this only behind a clearly named opt-in flag. Normal
+    shadow verification must use `knmi_forecasts_shadow` instead.
+    """
+    shadow = feature_frame_to_shadow_forecasts(frame, model=model)
+    if shadow.empty:
+        return 0
+    rows = [
+        (
+            row.site,
+            row.model,
+            int(row.run_ts),
+            row.run_iso,
+            int(row.fetched_ts),
+            row.fetched_iso,
+            int(row.target_ts),
+            row.target_iso,
+            int(row.horizon_hr),
+            None if pd.isna(row.wind_speed) else float(row.wind_speed),
+            None,
+            None if pd.isna(row.wind_dir) else float(row.wind_dir),
+            row.payload,
+        )
+        for row in shadow.itertuples(index=False)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO forecasts(
+            site, model, run_ts, run_iso, fetched_ts, fetched_iso,
+            target_ts, target_iso, horizon_hr, wind_speed, wind_gust, wind_dir, payload
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,json(?))
+        ON CONFLICT(site, model, run_ts, target_ts) DO UPDATE SET
+            run_iso=excluded.run_iso,
+            fetched_ts=excluded.fetched_ts,
+            fetched_iso=excluded.fetched_iso,
+            target_iso=excluded.target_iso,
+            horizon_hr=excluded.horizon_hr,
+            wind_speed=excluded.wind_speed,
+            wind_gust=excluded.wind_gust,
+            wind_dir=excluded.wind_dir,
+            payload=excluded.payload
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def latest_shadow_rows(conn: sqlite3.Connection, site: str, limit: int = 5) -> pd.DataFrame:
+    create_knmi_forecasts_shadow_table(conn)
+    return pd.read_sql_query(
+        f"""
+        SELECT
+            site,
+            model,
+            source,
+            run_iso,
+            fetched_iso,
+            target_iso,
+            horizon_hr,
+            wind_speed,
+            wind_dir,
+            created_at
+        FROM {SHADOW_TABLE_NAME}
+        WHERE site = ?
+        ORDER BY run_ts DESC, horizon_hr ASC
+        LIMIT ?
+        """,
+        conn,
+        params=(site, int(limit)),
+    )
+
+
+def recent_knmi_runs(conn: sqlite3.Connection, site: str, limit: int = 10) -> pd.DataFrame:
+    create_harmonie_knmi_features_table(conn)
+    return pd.read_sql_query(
+        f"""
+        SELECT
+            site,
+            run_ts,
+            MIN(fetched_ts) AS min_fetched_ts,
+            MAX(fetched_ts) AS max_fetched_ts,
+            MIN(target_ts) AS min_target_ts,
+            MAX(target_ts) AS max_target_ts,
+            COUNT(DISTINCT horizon_hr) AS horizon_count,
+            COUNT(*) AS row_count
+        FROM {TABLE_NAME}
+        WHERE site = ?
+        GROUP BY site, run_ts
+        ORDER BY run_ts DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(site, int(limit)),
+    )
+
+
+def knmi_archive_diagnostic(conn: sqlite3.Connection, site: str, now_ts: str | None = None) -> dict[str, Any]:
+    create_harmonie_knmi_features_table(conn)
+    now_iso = now_ts or utc_now_iso()
+    now_ms = timestamp_ms(now_iso)
+    summary = pd.read_sql_query(
+        f"""
+        SELECT
+            COUNT(DISTINCT run_ts) AS distinct_run_ts,
+            COUNT(DISTINCT substr(target_ts, 1, 10)) AS distinct_target_dates,
+            MIN(run_ts) AS min_run_ts,
+            MAX(run_ts) AS max_run_ts,
+            MIN(target_ts) AS min_target_ts,
+            MAX(target_ts) AS max_target_ts,
+            COUNT(*) AS row_count,
+            SUM(CASE WHEN strftime('%s', target_ts) * 1000 <= ? THEN 1 ELSE 0 END) AS past_target_rows
+        FROM {TABLE_NAME}
+        WHERE site = ?
+        """,
+        conn,
+        params=(now_ms, site),
+    )
+    row = summary.iloc[0].to_dict() if not summary.empty else {}
+    joinable_exact = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {TABLE_NAME} AS k
+        JOIN observations AS o
+          ON o.site = k.site
+         AND o.ts = CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000
+        WHERE k.site = ?
+        """,
+        (site,),
+    ).fetchone()[0]
+    joinable_30min = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {TABLE_NAME} AS k
+        WHERE k.site = ?
+          AND EXISTS (
+              SELECT 1
+              FROM observations AS o
+              WHERE o.site = k.site
+                AND ABS(o.ts - CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000) <= 30 * 60 * 1000
+          )
+        """,
+        (site,),
+    ).fetchone()[0]
+    row["rows_joinable_to_observations_exact"] = int(joinable_exact or 0)
+    row["rows_joinable_to_observations_30min"] = int(joinable_30min or 0)
+    row["diagnostic_now_ts"] = now_iso
+    return row

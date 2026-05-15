@@ -21,14 +21,20 @@ from next_day_wind_model.knmi_harmonie import (
     KnmiExtractionError,
     SitePoint,
     create_harmonie_knmi_features_table,
+    create_knmi_forecasts_shadow_table,
     ensure_downloaded_tar,
     extract_tar_features,
+    knmi_archive_diagnostic,
     latest_harmonie_knmi_rows,
+    latest_shadow_rows,
     list_knmi_files,
     parse_run_from_tar_filename,
+    recent_knmi_runs,
     select_latest_tar_file,
+    upsert_knmi_forecasts_shadow,
     upsert_harmonie_knmi_features,
     utc_now_iso,
+    write_knmi_rows_to_production_forecasts,
 )
 
 
@@ -67,9 +73,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inspect",
         action="store_true",
-        help="Only print latest rows from harmonie_knmi_features.",
+        help="Only print latest canonical rows from harmonie_knmi_features.",
     )
+    parser.add_argument("--inspect-shadow", action="store_true", help="Only print latest rows from knmi_forecasts_shadow.")
+    parser.add_argument("--inspect-runs", action="store_true", help="Only print recent KNMI runs stored in the DB.")
+    parser.add_argument("--diagnose-archive", action="store_true", help="Only print archive depth/training-readiness diagnostics.")
     parser.add_argument("--inspect-limit", type=int, default=5)
+    parser.add_argument("--model", default="HARMONIE", help="Forecast model label for shadow rows.")
+    parser.add_argument(
+        "--skip-shadow",
+        action="store_true",
+        help="Write only harmonie_knmi_features and skip the compatibility shadow table.",
+    )
+    parser.add_argument(
+        "--write-production",
+        action="store_true",
+        help="DANGEROUS: also write KNMI-derived rows into the production forecasts table.",
+    )
     return parser.parse_args()
 
 
@@ -95,7 +115,60 @@ def print_latest_rows(db_path: Path, site: str, limit: int) -> None:
     if rows.empty:
         print(f"No harmonie_knmi_features rows found for site={site!r} in {db_path}.")
         return
+        print(rows.to_string(index=False))
+
+
+def print_latest_shadow_rows(db_path: Path, site: str, limit: int) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = latest_shadow_rows(conn, site=site, limit=limit)
+    finally:
+        conn.close()
+    if rows.empty:
+        print(f"No knmi_forecasts_shadow rows found for site={site!r} in {db_path}.")
+        return
     print(rows.to_string(index=False))
+
+
+def print_recent_runs(db_path: Path, site: str, limit: int) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = recent_knmi_runs(conn, site=site, limit=limit)
+    finally:
+        conn.close()
+    if rows.empty:
+        print(f"No KNMI runs found for site={site!r} in {db_path}.")
+        return
+    print(rows.to_string(index=False))
+
+
+def print_archive_diagnostic(db_path: Path, site: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        diagnostic = knmi_archive_diagnostic(conn, site=site)
+    finally:
+        conn.close()
+    print("\nKNMI archive diagnostic")
+    print("=======================")
+    for key in (
+        "distinct_run_ts",
+        "distinct_target_dates",
+        "min_run_ts",
+        "max_run_ts",
+        "min_target_ts",
+        "max_target_ts",
+        "row_count",
+        "past_target_rows",
+        "rows_joinable_to_observations_exact",
+        "rows_joinable_to_observations_30min",
+        "diagnostic_now_ts",
+    ):
+        print(f"{key}: {diagnostic.get(key)}")
+    if int(diagnostic.get("distinct_run_ts") or 0) <= 1:
+        print(
+            "Only one KNMI run is archived. This is sufficient for extraction verification, "
+            "but not for model training/evaluation."
+        )
 
 
 def select_tar(args: argparse.Namespace) -> tuple[Path, str, str | None, int | None]:
@@ -119,6 +192,15 @@ def main() -> None:
     if args.inspect:
         print_latest_rows(db_path, site=site.site, limit=args.inspect_limit)
         return
+    if args.inspect_shadow:
+        print_latest_shadow_rows(db_path, site=site.site, limit=args.inspect_limit)
+        return
+    if args.inspect_runs:
+        print_recent_runs(db_path, site=site.site, limit=args.inspect_limit)
+        return
+    if args.diagnose_archive:
+        print_archive_diagnostic(db_path, site=site.site)
+        return
 
     fetched_ts = utc_now_iso()
     try:
@@ -138,8 +220,16 @@ def main() -> None:
     conn = sqlite3.connect(db_path)
     try:
         create_harmonie_knmi_features_table(conn)
+        create_knmi_forecasts_shadow_table(conn)
         rows_written = upsert_harmonie_knmi_features(conn, result.frame)
+        shadow_rows_written = 0 if args.skip_shadow else upsert_knmi_forecasts_shadow(conn, result.frame, model=args.model)
+        production_rows_written = (
+            write_knmi_rows_to_production_forecasts(conn, result.frame, model=args.model)
+            if args.write_production
+            else 0
+        )
         sample = latest_harmonie_knmi_rows(conn, site=site.site, limit=5)
+        shadow_sample = latest_shadow_rows(conn, site=site.site, limit=5)
     finally:
         conn.close()
 
@@ -151,7 +241,10 @@ def main() -> None:
         print(f"Selected file size: {selected_size}")
     print(f"Tar path: {tar_path}")
     print(f"Horizons extracted: {len(result.frame)}")
-    print(f"Rows written: {rows_written}")
+    print(f"Canonical feature rows written: {rows_written}")
+    print(f"Shadow forecast rows written: {shadow_rows_written}")
+    if args.write_production:
+        print(f"Production forecast rows written: {production_rows_written}")
     print(f"Database path: {db_path}")
     print(f"Site: {site.site} ({site.lat}, {site.lon})")
     if result.errors:
@@ -163,6 +256,11 @@ def main() -> None:
         print("No rows found after write.")
     else:
         print(sample.to_string(index=False))
+    print("\nLatest knmi_forecasts_shadow rows:")
+    if shadow_sample.empty:
+        print("No shadow rows found after write.")
+    else:
+        print(shadow_sample.to_string(index=False))
 
 
 if __name__ == "__main__":

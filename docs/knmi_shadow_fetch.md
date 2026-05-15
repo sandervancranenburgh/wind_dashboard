@@ -48,6 +48,42 @@ python3 scripts/knmi_extract_latest_to_db.py \
 The worker is idempotent: uniqueness keys include source, dataset, run, target,
 and site, so repeated runs update existing rows rather than duplicating them.
 
+## Raw data cleanup
+
+KNMI HARMONIE P1 tar files are large, around 900 MB per run. The SQLite database
+is the long-term forecast archive; the raw tar directory is only a download
+staging area. GRIB members are extracted into a temporary directory and should
+not persist after processing.
+
+By default, after successful extraction and successful writes to
+`harmonie_knmi_features` and `knmi_forecasts_shadow`, the worker deletes the
+processed tar file:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py
+```
+
+For debugging, keep the processed tar:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --keep-raw
+```
+
+To retain only the latest N matching raw HARMONIE P1 tar files in `--raw-dir`:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --raw-retention-runs 2
+```
+
+When `--raw-retention-runs N` is supplied, retention controls which
+`HARM43_V1_P1_*.tar` files remain. When combined with `--keep-raw`, the current
+processed tar is retained even if it is older than the latest N retained runs.
+Cleanup only runs after successful database writes and only deletes regular
+files whose names match the expected KNMI HARMONIE P1 tar pattern. Use
+`--cleanup-dry-run` to print cleanup actions without deleting files. Cleanup
+does not delete SQLite databases, processed CSVs, model artifacts, dashboard
+outputs, or production Windsurfice data.
+
 ## Shell wrapper
 
 ```bash
@@ -60,6 +96,8 @@ The wrapper:
 - activates `.venv` if present;
 - requires `KNMI_API_KEY`;
 - does not print the API key;
+- uses the operational default raw cleanup policy, deleting the processed tar
+  after a successful DB write;
 - appends logs to `logs/knmi_shadow_fetch.log`.
 
 Example hourly cron fallback:

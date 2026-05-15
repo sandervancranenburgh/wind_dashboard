@@ -20,6 +20,7 @@ from next_day_wind_model.knmi_harmonie import (
     KnmiApiError,
     KnmiExtractionError,
     SitePoint,
+    cleanup_raw_harmonie_tars,
     create_harmonie_knmi_features_table,
     create_knmi_forecasts_shadow_table,
     ensure_downloaded_tar,
@@ -100,6 +101,26 @@ def parse_args() -> argparse.Namespace:
         "--skip-archive-diagnostic",
         action="store_true",
         help="Do not print the concise archive diagnostic after a successful write.",
+    )
+    parser.add_argument(
+        "--keep-raw",
+        action="store_true",
+        help="Keep the processed raw tar after a successful DB write. By default it is deleted.",
+    )
+    parser.add_argument(
+        "--raw-retention-runs",
+        type=int,
+        default=None,
+        help=(
+            "After a successful DB write, keep only the latest N HARM43_V1_P1_*.tar files "
+            "in --raw-dir and delete older matching tar files. With --keep-raw, the currently "
+            "processed tar is also retained even if it is older than the latest N."
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-dry-run",
+        action="store_true",
+        help="Print raw tar cleanup actions after successful extraction without deleting files.",
     )
     return parser.parse_args()
 
@@ -200,8 +221,61 @@ def select_tar(args: argparse.Namespace) -> tuple[Path, str, str | None, int | N
     return tar_path, latest.filename, run_ts, latest.size
 
 
+def print_cleanup_summary(args: argparse.Namespace, tar_path: Path) -> None:
+    result = cleanup_raw_harmonie_tars(
+        args.raw_dir,
+        processed_tar=tar_path,
+        keep_processed=args.keep_raw,
+        retention_runs=args.raw_retention_runs,
+        dry_run=args.cleanup_dry_run,
+    )
+
+    print("\nRaw tar cleanup")
+    print("===============")
+    processed_deleted = any(path.resolve() == tar_path.resolve() for path in result.deleted)
+    processed_would_delete = any(path.resolve() == tar_path.resolve() for path in result.would_delete)
+    if args.keep_raw:
+        print(f"Keeping raw tar because --keep-raw was specified: {tar_path}")
+    elif args.cleanup_dry_run and processed_would_delete:
+        print(f"Would delete raw tar after successful extraction: {tar_path}")
+    elif processed_deleted:
+        print(f"Deleted raw tar after successful extraction: {tar_path}")
+    elif args.raw_retention_runs is not None:
+        print(f"Retained processed raw tar under --raw-retention-runs policy: {tar_path}")
+    else:
+        print(f"No processed raw tar deleted. It was not found as a matching HARMONIE P1 tar in {args.raw_dir}.")
+
+    if args.raw_retention_runs is not None:
+        print(f"Raw retention runs: {args.raw_retention_runs}")
+        retained = [path for path in result.retained if path.exists() or args.cleanup_dry_run]
+        if retained:
+            print("Retained matching tar files:")
+            for path in retained:
+                print(f"- {path}")
+        else:
+            print("Retained matching tar files: none")
+
+    retention_deleted = [
+        path for path in result.deleted if not path.resolve() == tar_path.resolve()
+    ]
+    if retention_deleted:
+        print("Deleted older matching tar files:")
+        for path in retention_deleted:
+            print(f"- {path}")
+    if args.cleanup_dry_run and result.would_delete:
+        print("Dry-run deletion candidates:")
+        for path in result.would_delete:
+            print(f"- {path}")
+    if result.warnings:
+        print("Cleanup warnings:")
+        for warning in result.warnings:
+            print(f"- {warning}")
+
+
 def main() -> None:
     args = parse_args()
+    if args.raw_retention_runs is not None and args.raw_retention_runs < 0:
+        raise SystemExit("--raw-retention-runs must be zero or greater.")
     site = site_point_from_args(args)
     db_path = db_path_from_args(args)
 
@@ -248,6 +322,8 @@ def main() -> None:
         shadow_sample = latest_shadow_rows(conn, site=site.site, limit=5)
     finally:
         conn.close()
+
+    print_cleanup_summary(args, tar_path)
 
     print("\nKNMI HARMONIE feature extraction")
     print("================================")

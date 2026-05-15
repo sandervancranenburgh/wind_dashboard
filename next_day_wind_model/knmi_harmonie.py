@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import json
+import re
 import sqlite3
 import tarfile
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ LEVELS = (10, 50, 100, 200, 300)
 U_WIND_PARAMETER = 33
 V_WIND_PARAMETER = 34
 KNOTS_PER_MPS = 1.9438444924406
+HARMONIE_P1_TAR_PATTERN = re.compile(r"^HARM43_V1_P1_(\d{10})\.tar$")
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,14 @@ class KnmiFileInfo:
 class ExtractionResult:
     frame: pd.DataFrame
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RawTarCleanupResult:
+    retained: tuple[Path, ...]
+    deleted: tuple[Path, ...]
+    would_delete: tuple[Path, ...]
+    warnings: tuple[str, ...]
 
 
 class KnmiApiError(RuntimeError):
@@ -104,12 +114,94 @@ def parse_run_and_horizon(filename: str) -> tuple[pd.Timestamp, int, pd.Timestam
 
 def parse_run_from_tar_filename(filename: str) -> pd.Timestamp:
     """Parse run timestamp from names like HARM43_V1_P1_2026051504.tar."""
-    stem = Path(filename).name.removesuffix(".tar")
-    run_str = stem.split("_")[-1]
+    name = Path(filename).name
+    match = HARMONIE_P1_TAR_PATTERN.match(name)
+    if not match:
+        raise ValueError(f"Not a KNMI HARMONIE P1 tar filename: {filename}")
+    run_str = match.group(1)
     try:
         return pd.to_datetime(run_str, format="%Y%m%d%H", utc=True)
     except Exception as exc:
         raise ValueError(f"Cannot parse KNMI run timestamp from tar filename: {filename}") from exc
+
+
+def is_harmonie_p1_tar_filename(filename: str) -> bool:
+    return HARMONIE_P1_TAR_PATTERN.match(Path(filename).name) is not None
+
+
+def harmonie_p1_tar_files(raw_dir: Path) -> list[Path]:
+    if not raw_dir.exists():
+        return []
+    candidates: list[Path] = []
+    for path in raw_dir.iterdir():
+        if path.is_file() and is_harmonie_p1_tar_filename(path.name):
+            candidates.append(path)
+    return sorted(candidates, key=lambda path: parse_run_from_tar_filename(path.name))
+
+
+def cleanup_raw_harmonie_tars(
+    raw_dir: Path,
+    *,
+    processed_tar: Path | None = None,
+    keep_processed: bool = False,
+    retention_runs: int | None = None,
+    dry_run: bool = False,
+) -> RawTarCleanupResult:
+    """
+    Delete raw KNMI HARMONIE P1 tar files after successful archival.
+
+    This helper deliberately only deletes regular files with names matching
+    HARM43_V1_P1_*.tar. It never recurses and never deletes directories.
+    """
+    if retention_runs is not None and retention_runs < 0:
+        raise ValueError("retention_runs must be zero or greater.")
+
+    processed = processed_tar.resolve() if processed_tar is not None else None
+    matching_tars = harmonie_p1_tar_files(raw_dir)
+    keep_paths: set[Path] = set()
+
+    if retention_runs is not None:
+        latest = list(reversed(matching_tars))[:retention_runs]
+        keep_paths.update(path.resolve() for path in latest)
+
+    if keep_processed and processed is not None:
+        keep_paths.add(processed)
+
+    delete_paths: list[Path] = []
+    if processed is not None and not keep_processed and retention_runs is None:
+        for path in matching_tars:
+            if path.resolve() == processed:
+                delete_paths.append(path)
+                break
+
+    if retention_runs is not None:
+        for path in matching_tars:
+            resolved = path.resolve()
+            if resolved not in keep_paths and path not in delete_paths:
+                delete_paths.append(path)
+
+    retained = tuple(path for path in matching_tars if path.resolve() in keep_paths)
+    deleted: list[Path] = []
+    warnings: list[str] = []
+
+    for path in delete_paths:
+        if not path.is_file() or not is_harmonie_p1_tar_filename(path.name):
+            warnings.append(f"Skipped non-matching raw cleanup candidate: {path}")
+            continue
+        if dry_run:
+            continue
+        try:
+            path.unlink()
+            deleted.append(path)
+        except OSError as exc:
+            warnings.append(f"Could not delete {path}: {exc}")
+
+    return RawTarCleanupResult(
+        retained=retained,
+        deleted=tuple(deleted),
+        would_delete=tuple(delete_paths) if dry_run else tuple(),
+        warnings=tuple(warnings),
+    )
 
 
 def mps_to_knots(value: float | None) -> float | None:
@@ -186,7 +278,7 @@ def list_knmi_files(
 
 
 def select_latest_tar_file(files: Iterable[KnmiFileInfo]) -> KnmiFileInfo:
-    tar_files = [item for item in files if item.filename.endswith(".tar")]
+    tar_files = [item for item in files if is_harmonie_p1_tar_filename(item.filename)]
     if not tar_files:
         raise KnmiApiError("No KNMI HARMONIE tar files returned by the API.")
     return tar_files[0]

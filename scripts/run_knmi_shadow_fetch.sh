@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LOG_DIR="${REPO_ROOT}/logs"
+LOG_FILE="${LOG_DIR}/knmi_shadow_fetch.log"
+
+mkdir -p "${LOG_DIR}"
+cd "${REPO_ROOT}"
+
+{
+  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI shadow fetch start"
+
+  if [ -z "${KNMI_API_KEY:-}" ]; then
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: KNMI_API_KEY is not set"
+    exit 2
+  fi
+
+  if [ -f "${REPO_ROOT}/.venv/bin/activate" ]; then
+    # Matches the virtualenv convention documented in next_day_wind_model/README.md.
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.venv/bin/activate"
+  fi
+
+  # Operational default: archive the forecast into SQLite, then delete the
+  # large raw tar after a successful write. Use --keep-raw manually for debugging.
+  python3 scripts/knmi_extract_latest_to_db.py
+
+  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI shadow fetch end"
+} >> "${LOG_FILE}" 2>&1

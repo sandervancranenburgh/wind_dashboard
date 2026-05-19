@@ -66,6 +66,7 @@ from train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
 LSTM_HIGHLIGHT_COLOR = "#d7191c"
 MODEL_GATE_CHAMPION_COLOR = "#ff7f0e"
 SUPERLOCAL_FORECAST_COLOR = MODEL_GATE_CHAMPION_COLOR
+SUFFICIENT_WIND_THRESHOLD_KTS = 10.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,7 +181,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out-dir",
         default="next_day_wind_model/artifacts",
-        help="Directory where model, metadata, table and plot are saved.",
+        help="Directory where generated metadata, tables, plots, snapshots, and diagnostics are saved.",
+    )
+    parser.add_argument(
+        "--model-artifact-dir",
+        default=None,
+        help=(
+            "Directory for trained model artifacts (.pt) and required scaler files (.npy). "
+            "Defaults to --out-dir for backward compatibility."
+        ),
     )
     parser.add_argument(
         "--web-out-dir",
@@ -1414,6 +1423,16 @@ def _apply_speed_background(ax: plt.Axes, y_top: float, x_left: float, x_right: 
     )
 
 
+def _draw_sufficient_wind_threshold(ax: plt.Axes) -> None:
+    ax.axhline(
+        SUFFICIENT_WIND_THRESHOLD_KTS,
+        color="#1f5f5b",
+        linewidth=1.8,
+        alpha=0.82,
+        zorder=1.15,
+    )
+
+
 def _load_observations_raw(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
     query = """
     SELECT ts, wind_speed, wind_dir, payload
@@ -1632,7 +1651,14 @@ def save_prediction_plot(
     day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
     y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
-    y_max = float(max(table["forecast_wind_max"].max(), table["forecast_wind_speed"].max(), table["lstm_pred_wind_speed"].max()))
+    y_max = float(
+        max(
+            table["forecast_wind_max"].max(),
+            table["forecast_wind_speed"].max(),
+            table["lstm_pred_wind_speed"].max(),
+            SUFFICIENT_WIND_THRESHOLD_KTS,
+        )
+    )
     pad = max((y_max - y_min) * 0.08, 0.8)
 
     fig_size = (8.4, 8.8) if mobile else (14, 7.2)
@@ -1644,6 +1670,7 @@ def save_prediction_plot(
     meta_y = 1.14 if mobile else 1.13
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_max + pad, x_left=0.0, x_right=len(table) - 1.0)
+    _draw_sufficient_wind_threshold(ax)
     marker_size = 3.0
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
@@ -2167,7 +2194,7 @@ def save_current_day_plot(
         ]
     )
     y_min = float(speed_series.min()) if not speed_series.empty else 0.0
-    y_max = float(speed_series.max()) if not speed_series.empty else 10.0
+    y_max = max(float(speed_series.max()) if not speed_series.empty else 0.0, SUFFICIENT_WIND_THRESHOLD_KTS)
     pad = max((y_max - y_min) * 0.08, 0.8)
     y_lower = 0.0
     y_upper = y_max + pad
@@ -2184,6 +2211,7 @@ def save_current_day_plot(
     metric_box_y = 1.29 if mobile else 1.24
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
+    _draw_sufficient_wind_threshold(ax)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
     fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
@@ -2824,6 +2852,19 @@ def _load_active_champion_states(
         "next_day_direction": _champion_artifact_state(direction_model_path, device, local_tz, intraday=False),
         "intraday_speed": _champion_artifact_state(intraday_model_path, device, local_tz, intraday=True),
     }
+
+
+def _require_skip_training_artifacts(paths: list[Path], model_artifact_dir: Path) -> None:
+    missing = [path for path in paths if not path.exists()]
+    if not missing:
+        return
+    missing_lines = "\n".join(f"- {path}" for path in missing)
+    raise FileNotFoundError(
+        "Missing required model artifact(s) for --skip-training mode.\n"
+        f"Model artifact directory searched: {model_artifact_dir}\n"
+        f"Missing file(s):\n{missing_lines}\n"
+        "Train models first, or pass --model-artifact-dir pointing to an existing model artifact directory."
+    )
 
 
 def _champion_state_refreshed(before_state: dict | None, after_state: dict | None) -> bool | None:
@@ -5104,7 +5145,14 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    model_artifact_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else out_dir
+    model_artifact_dir.mkdir(parents=True, exist_ok=True)
     db_path = Path(args.db).resolve()
+
+    print(f"Output artifact directory: {out_dir.resolve()}")
+    print(f"Model artifact directory: {model_artifact_dir.resolve()}")
+    if args.model_artifact_dir is None:
+        print("Model artifact directory defaults to output artifact directory for backward compatibility.")
 
     cfg = DatasetConfig(
         site=args.site,
@@ -5140,21 +5188,21 @@ def main() -> None:
             ),
         )
 
-    speed_model_path = out_dir / "next_day_lstm_speed_residual.pt"
-    direction_model_path = out_dir / "next_day_lstm_direction_residual.pt"
-    intraday_model_path = out_dir / "intraday_speed_residual.pt"
-    intraday_challenger_model_path = out_dir / "intraday_speed_residual_challenger.pt"
+    speed_model_path = model_artifact_dir / "next_day_lstm_speed_residual.pt"
+    direction_model_path = model_artifact_dir / "next_day_lstm_direction_residual.pt"
+    intraday_model_path = model_artifact_dir / "intraday_speed_residual.pt"
+    intraday_challenger_model_path = model_artifact_dir / "intraday_speed_residual_challenger.pt"
     speed_scalers_path = {
-        "x_mean": out_dir / "x_mean_speed.npy",
-        "x_std": out_dir / "x_std_speed.npy",
-        "y_mean": out_dir / "y_mean_speed.npy",
-        "y_std": out_dir / "y_std_speed.npy",
+        "x_mean": model_artifact_dir / "x_mean_speed.npy",
+        "x_std": model_artifact_dir / "x_std_speed.npy",
+        "y_mean": model_artifact_dir / "y_mean_speed.npy",
+        "y_std": model_artifact_dir / "y_std_speed.npy",
     }
     direction_scalers_path = {
-        "x_mean": out_dir / "x_mean_direction.npy",
-        "x_std": out_dir / "x_std_direction.npy",
-        "y_mean": out_dir / "y_mean_direction.npy",
-        "y_std": out_dir / "y_std_direction.npy",
+        "x_mean": model_artifact_dir / "x_mean_direction.npy",
+        "x_std": model_artifact_dir / "x_std_direction.npy",
+        "y_mean": model_artifact_dir / "y_mean_direction.npy",
+        "y_std": model_artifact_dir / "y_std_direction.npy",
     }
     intraday_hparams = {}
     intraday_model_last_trained_at_utc: str | None = None
@@ -5176,15 +5224,16 @@ def main() -> None:
     )
 
     if args.skip_training:
-        for p in [
-            speed_model_path,
-            direction_model_path,
-            intraday_model_path,
-            *speed_scalers_path.values(),
-            *direction_scalers_path.values(),
-        ]:
-            if not p.exists():
-                raise FileNotFoundError(f"Missing artifact for --skip-training mode: {p}")
+        _require_skip_training_artifacts(
+            [
+                speed_model_path,
+                direction_model_path,
+                intraday_model_path,
+                *speed_scalers_path.values(),
+                *direction_scalers_path.values(),
+            ],
+            model_artifact_dir=model_artifact_dir,
+        )
         speed_model, speed_ckpt = _load_model(speed_model_path, device)
         direction_model, direction_ckpt = _load_model(direction_model_path, device)
         intraday_bundle, intraday_ckpt = load_intraday_model(intraday_model_path, device)
@@ -6497,6 +6546,9 @@ def main() -> None:
     metadata = {
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
         "db_path": str(db_path),
+        "output_artifact_dir": str(out_dir.resolve()),
+        "model_artifact_dir": str(model_artifact_dir.resolve()),
+        "model_artifact_dir_defaulted_to_out_dir": args.model_artifact_dir is None,
         "site": args.site,
         "forecast_model": args.model,
         "skip_training": bool(args.skip_training),

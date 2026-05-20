@@ -53,6 +53,8 @@ SPEED_BANDS_KT = [
 DEFAULT_SITE_POINTS = {
     "valkenburgsemeer": SitePoint(site="valkenburgsemeer", lat=52.168, lon=4.437),
 }
+GUST_U_WIND_PARAMETER = 162
+GUST_V_WIND_PARAMETER = 163
 MAX_WIND_CANDIDATE_PARAMETERS = (162, 163)
 
 
@@ -880,9 +882,10 @@ def wind_field_storage_diagnostics(
             """,
             (site, model),
         ).fetchone()
+        status = "present" if shadow_gust_count[1] else "unpopulated"
         print(
-            "KNMI shadow max/gust equivalent: unresolved; knmi_forecasts_shadow.wind_gust exists "
-            f"but has {shadow_gust_count[1]}/{shadow_gust_count[0]} non-null rows."
+            f"KNMI shadow max/gust equivalent: {status}; knmi_forecasts_shadow.wind_gust has "
+            f"{shadow_gust_count[1]}/{shadow_gust_count[0]} non-null rows."
         )
     canonical_gust_like = [
         column
@@ -1105,10 +1108,12 @@ def validate_max_wind_from_raw(
             )
             if windsurfice_max is None:
                 continue
+            raw_values: dict[int, tuple[float, str]] = {}
             for parameter in MAX_WIND_CANDIDATE_PARAMETERS:
                 raw_value, metadata = candidate_parameter_value(grib_path, parameter, site_point)
                 if raw_value is None:
                     continue
+                raw_values[parameter] = (float(raw_value), metadata)
                 for unit_assumption, candidate_value in (
                     ("raw already knots", raw_value),
                     ("m/s converted to knots", raw_value * KNOTS_PER_MPS),
@@ -1118,6 +1123,31 @@ def validate_max_wind_from_raw(
                             "source": source_label,
                             "grib_path": str(grib_path),
                             "candidate_parameter": parameter,
+                            "metadata": metadata,
+                            "unit_assumption": unit_assumption,
+                            "run_ts": iso_z(run_dt),
+                            "target_ts": iso_z(target_dt),
+                            "horizon_hr": int(horizon_hr),
+                            "candidate_value_kt": float(candidate_value),
+                            "windsurfice_wind_gust_kt": float(windsurfice_max),
+                            "vintage_delta_minutes": vintage_delta,
+                        }
+                    )
+            if all(parameter in raw_values for parameter in MAX_WIND_CANDIDATE_PARAMETERS):
+                u_value, u_metadata = raw_values[GUST_U_WIND_PARAMETER]
+                v_value, v_metadata = raw_values[GUST_V_WIND_PARAMETER]
+                magnitude = (u_value**2 + v_value**2) ** 0.5
+                metadata = f"vector magnitude of 162/163; {u_metadata}; {v_metadata}"
+                for unit_assumption, candidate_value in (
+                    ("raw already knots", magnitude),
+                    ("m/s converted to knots", magnitude * KNOTS_PER_MPS),
+                    ("knots converted to m/s", magnitude / KNOTS_PER_MPS),
+                ):
+                    records.append(
+                        {
+                            "source": source_label,
+                            "grib_path": str(grib_path),
+                            "candidate_parameter": "162+163",
                             "metadata": metadata,
                             "unit_assumption": unit_assumption,
                             "run_ts": iso_z(run_dt),
@@ -1167,6 +1197,55 @@ def print_max_wind_validation(summary: pd.DataFrame, message: str) -> dict[str, 
     return result
 
 
+def persisted_max_wind_summary(closest_vintage: pd.DataFrame) -> pd.DataFrame:
+    if closest_vintage.empty:
+        return pd.DataFrame()
+    required = {"knmi_wind_gust_kt", "windsurfice_wind_gust_kt", "matched"}
+    if not required.issubset(closest_vintage.columns):
+        return pd.DataFrame()
+    matched = closest_vintage[
+        closest_vintage["matched"]
+        & closest_vintage["knmi_wind_gust_kt"].notna()
+        & closest_vintage["windsurfice_wind_gust_kt"].notna()
+    ].copy()
+    if matched.empty:
+        return pd.DataFrame()
+    diff = matched["knmi_wind_gust_kt"].astype(float) - matched["windsurfice_wind_gust_kt"].astype(float)
+    abs_diff = diff.abs()
+    return pd.DataFrame(
+        [
+            {
+                "candidate_field": "knmi_forecasts_shadow.wind_gust",
+                "matched_rows": int(len(matched)),
+                "mae_kt": abs_diff.mean(),
+                "median_abs_error_kt": abs_diff.median(),
+                "p95_abs_error_kt": abs_diff.quantile(0.95),
+                "max_abs_error_kt": abs_diff.max(),
+                "correlation": matched["knmi_wind_gust_kt"].astype(float).corr(
+                    matched["windsurfice_wind_gust_kt"].astype(float)
+                )
+                if len(matched) > 1
+                else pd.NA,
+            }
+        ]
+    )
+
+
+def print_persisted_max_wind_validation(summary: pd.DataFrame) -> dict[str, object]:
+    print("\nPersisted KNMI max/gust validation")
+    print("==================================")
+    if summary.empty:
+        print("No persisted KNMI wind_gust rows are available in closest-vintage matches.")
+        return {"status": "unresolved", "message": "No persisted KNMI wind_gust rows available."}
+    print(summary.round(3).to_string(index=False))
+    best = summary.iloc[0]
+    if int(best["matched_rows"]) >= 20 and float(best["mae_kt"]) <= 2.0:
+        print("Persisted KNMI wind_gust validates against Windsurfice WindForecastMax for the available matched rows.")
+        return {"status": "validated", "message": "Persisted KNMI wind_gust validates against Windsurfice."}
+    print("Persisted KNMI wind_gust is present, but the available evidence is not strong enough yet.")
+    return {"status": "partially validated", "message": "Persisted KNMI wind_gust needs more evidence."}
+
+
 def print_final_interpretation(
     coverage: pd.DataFrame,
     closest_vintage: pd.DataFrame,
@@ -1189,10 +1268,16 @@ def print_final_interpretation(
         "Observation joins: exact joins unavailable, 30-minute joins available "
         f"({coverage_map.get('knmi_distinct_targets_observation_within_30_min')} distinct KNMI targets)."
     )
-    print(
-        "Recommendation: continue the KNMI shadow fetch; do not replace Windsurfice until max/gust is resolved "
-        "and more days are accumulated."
-    )
+    if max_wind_result.get("status") == "validated":
+        print(
+            "Recommendation: continue the KNMI shadow fetch; do not replace Windsurfice until this gust mapping "
+            "has been confirmed over more archived days."
+        )
+    else:
+        print(
+            "Recommendation: continue the KNMI shadow fetch; do not replace Windsurfice until max/gust is resolved "
+            "and more days are accumulated."
+        )
 
 
 def write_outputs(
@@ -1332,6 +1417,7 @@ def main() -> None:
         closest_vintage = pd.DataFrame()
         unmatched_closest = pd.DataFrame()
         max_wind_summary = pd.DataFrame()
+        persisted_max_wind = pd.DataFrame()
         max_wind_result: dict[str, object] = {
             "status": "unresolved",
             "message": "No KNMI max/gust equivalent is currently persisted in the shadow archive.",
@@ -1359,8 +1445,10 @@ def main() -> None:
             print_metrics("Closest-vintage", closest_vintage, len(windsurfice))
             print_breakdowns("Closest-vintage", closest_vintage)
             unmatched_closest = print_unmatched_diagnostics(closest_vintage)
+            persisted_max_wind = persisted_max_wind_summary(closest_vintage)
 
         if args.validate_max_wind:
+            persisted_result = print_persisted_max_wind_validation(persisted_max_wind)
             max_wind_summary, max_wind_message = validate_max_wind_from_raw(
                 conn,
                 windsurfice,
@@ -1369,7 +1457,8 @@ def main() -> None:
                 raw_grib=args.raw_grib,
                 raw_tar=args.raw_tar,
             )
-            max_wind_result = print_max_wind_validation(max_wind_summary, max_wind_message)
+            raw_result = print_max_wind_validation(max_wind_summary, max_wind_message)
+            max_wind_result = persisted_result if persisted_result.get("status") == "validated" else raw_result
         else:
             max_wind_result = print_max_wind_validation(
                 pd.DataFrame(),

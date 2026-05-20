@@ -29,6 +29,8 @@ SHADOW_TABLE_NAME = "knmi_forecasts_shadow"
 LEVELS = (10, 50, 100, 200, 300)
 U_WIND_PARAMETER = 33
 V_WIND_PARAMETER = 34
+GUST_U_WIND_PARAMETER = 162
+GUST_V_WIND_PARAMETER = 163
 KNOTS_PER_MPS = 1.9438444924406
 HARMONIE_P1_TAR_PATTERN = re.compile(r"^HARM43_V1_P1_(\d{10})\.tar$")
 
@@ -431,6 +433,24 @@ def extract_one_grib(
         grid_lat = lat
         grid_lon = lon
 
+    try:
+        gust_u_ds = open_grib_parameter(grib_path, parameter=GUST_U_WIND_PARAMETER, level=10)
+        gust_v_ds = open_grib_parameter(grib_path, parameter=GUST_V_WIND_PARAMETER, level=10)
+        try:
+            gust_u, _, _ = nearest_value(gust_u_ds, site)
+            gust_v, _, _ = nearest_value(gust_v_ds, site)
+        finally:
+            gust_u_ds.close()
+            gust_v_ds.close()
+        gust_speed = math.sqrt(gust_u**2 + gust_v**2)
+        row["wind_gust_10m_mps"] = gust_speed
+        row["wind_gust_10m_knots"] = mps_to_knots(gust_speed)
+    except Exception:
+        # KNMI parameter 162/163 availability should not decide whether the
+        # average wind archive can be populated. Leave gust null if absent.
+        row["wind_gust_10m_mps"] = None
+        row["wind_gust_10m_knots"] = None
+
     row["grid_lat"] = grid_lat
     row["grid_lon"] = grid_lon
     add_derived_features(row)
@@ -529,6 +549,8 @@ def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
             v_10m_mps REAL,
             wind_speed_10m_mps REAL,
             wind_speed_10m_knots REAL,
+            wind_gust_10m_mps REAL,
+            wind_gust_10m_knots REAL,
             wind_dir_10m REAL,
             wind_dir_sin_10m REAL,
             wind_dir_cos_10m REAL,
@@ -572,6 +594,13 @@ def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_columns = _table_columns(conn, TABLE_NAME)
+    for column, column_type in (
+        ("wind_gust_10m_mps", "REAL"),
+        ("wind_gust_10m_knots", "REAL"),
+    ):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {column} {column_type}")
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_site_run ON {TABLE_NAME}(site, run_ts)"
     )
@@ -635,6 +664,8 @@ def latest_harmonie_knmi_rows(conn: sqlite3.Connection, site: str, limit: int = 
             horizon_hr,
             wind_speed_10m_mps,
             wind_speed_10m_knots,
+            wind_gust_10m_mps,
+            wind_gust_10m_knots,
             wind_dir_10m,
             grid_lat,
             grid_lon,
@@ -694,6 +725,11 @@ def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONI
     """
     if frame.empty:
         return pd.DataFrame()
+    wind_gust = (
+        pd.to_numeric(frame["wind_gust_10m_knots"], errors="coerce")
+        if "wind_gust_10m_knots" in frame.columns
+        else None
+    )
 
     out = pd.DataFrame(
         {
@@ -708,7 +744,7 @@ def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONI
             "target_iso": frame["target_ts"].map(lambda value: parse_utc_timestamp(value).isoformat().replace("+00:00", "Z")),
             "horizon_hr": pd.to_numeric(frame["horizon_hr"], errors="coerce").astype("Int64"),
             "wind_speed": pd.to_numeric(frame["wind_speed_10m_knots"], errors="coerce"),
-            "wind_gust": None,
+            "wind_gust": wind_gust,
             "wind_dir": pd.to_numeric(frame["wind_dir_10m"], errors="coerce"),
         }
     )
@@ -722,6 +758,8 @@ def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONI
                 "dataset": row.get("dataset"),
                 "wind_speed_10m_mps": json_scalar(row.get("wind_speed_10m_mps")),
                 "wind_speed_10m_knots": json_scalar(row.get("wind_speed_10m_knots")),
+                "wind_gust_10m_mps": json_scalar(row.get("wind_gust_10m_mps")),
+                "wind_gust_10m_knots": json_scalar(row.get("wind_gust_10m_knots")),
                 "wind_dir_10m": json_scalar(row.get("wind_dir_10m")),
                 "grid_lat": json_scalar(row.get("grid_lat")),
                 "grid_lon": json_scalar(row.get("grid_lon")),
@@ -811,7 +849,7 @@ def write_knmi_rows_to_production_forecasts(conn: sqlite3.Connection, frame: pd.
             row.target_iso,
             int(row.horizon_hr),
             None if pd.isna(row.wind_speed) else float(row.wind_speed),
-            None,
+            None if pd.isna(row.wind_gust) else float(row.wind_gust),
             None if pd.isna(row.wind_dir) else float(row.wind_dir),
             row.payload,
         )

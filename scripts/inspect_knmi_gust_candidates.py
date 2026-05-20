@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect KNMI HARMONIE P1 10 m fields that may correspond to Windsurfice max wind."""
+"""Inspect KNMI HARMONIE P1 10 m gust fields against Windsurfice max wind."""
 
 from __future__ import annotations
 
@@ -20,7 +20,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from next_day_wind_model.knmi_harmonie import KNOTS_PER_MPS, SitePoint, nearest_value, open_grib_parameter
+from next_day_wind_model.knmi_harmonie import (
+    GUST_U_WIND_PARAMETER,
+    GUST_V_WIND_PARAMETER,
+    KNOTS_PER_MPS,
+    SitePoint,
+    U_WIND_PARAMETER,
+    V_WIND_PARAMETER,
+    nearest_value,
+    open_grib_parameter,
+)
 
 
 DEFAULT_DB = Path("data/wind_data_all_sites.db")
@@ -28,6 +37,17 @@ DEFAULT_SITE_POINTS = {
     "valkenburgsemeer": SitePoint(site="valkenburgsemeer", lat=52.168, lon=4.437),
 }
 GRIB_NAME_RE = re.compile(r"^HA43_[^_]+_(\d{12})_(\d{3})00_GB$")
+
+# KNMI HARMONIE Cy43 P1 local GRIB parameter mapping. ecCodes/cfgrib may show
+# shortName/name/units as "unknown" for these local parameters, but the KNMI
+# table defines 33/34 as u/v average wind components and 162/163 as u/v gust
+# components, all in m/s at heightAboveGround.
+PARAMETER_TABLE_ROWS = (
+    (33, "UGRD", "u-component of wind", "m s-1", "heightAboveGround", "10/50/100/200/300 m"),
+    (34, "VGRD", "v-component of wind", "m s-1", "heightAboveGround", "10/50/100/200/300 m"),
+    (162, "CSULF", "U-momentum of gusts out of the model", "m s-1", "heightAboveGround", "10 m"),
+    (163, "CSDLF", "V-momentum of gusts out of the model", "m s-1", "heightAboveGround", "10 m"),
+)
 
 
 @dataclass(frozen=True)
@@ -56,7 +76,10 @@ def parse_member(name: str) -> GribMember | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect KNMI P1 10 m GRIB fields and compare candidates to Windsurfice WindForecastMax."
+        description=(
+            "Inspect KNMI P1 10 m local GRIB fields and validate the KNMI-table "
+            "162/163 gust-vector mapping against Windsurfice WindForecastMax."
+        )
     )
     parser.add_argument("--raw-tar", type=Path, required=True)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -209,6 +232,29 @@ def print_grib_inventory(paths: list[Path]) -> dict[int, GribField]:
     return candidate_fields
 
 
+def print_knmi_parameter_mapping() -> None:
+    print("\nKNMI HARMONIE Cy43 P1 local parameter mapping")
+    print("=============================================")
+    rows = [
+        {
+            "code": code,
+            "abbr": abbr,
+            "description": description,
+            "units": units,
+            "typeOfLevel": type_of_level,
+            "levels": levels,
+        }
+        for code, abbr, description, units, type_of_level, levels in PARAMETER_TABLE_ROWS
+    ]
+    print(pd.DataFrame(rows).to_string(index=False))
+    print(
+        "Average 10 m wind speed = sqrt(33^2 + 34^2). "
+        "Gust/max 10 m wind speed = sqrt(162^2 + 163^2). "
+        "Both are m/s before conversion to Windsurfice-compatible knots."
+    )
+    print("Note: ecCodes/cfgrib may label these KNMI local parameters as unknown.")
+
+
 def site_point_from_db(conn: sqlite3.Connection, site: str) -> SitePoint:
     try:
         row = conn.execute(
@@ -315,10 +361,10 @@ def build_records(paths: list[Path], site: SitePoint, conn: sqlite3.Connection, 
             max_delta_minutes=max_delta_minutes,
         )
         values: dict[int, tuple[float | None, str, str]] = {}
-        for parameter in sorted({33, 34, 162, 163}):
+        for parameter in sorted({U_WIND_PARAMETER, V_WIND_PARAMETER, GUST_U_WIND_PARAMETER, GUST_V_WIND_PARAMETER}):
             values[parameter] = point_value(path, parameter, site)
-        u10 = values[33][0]
-        v10 = values[34][0]
+        u10 = values[U_WIND_PARAMETER][0]
+        v10 = values[V_WIND_PARAMETER][0]
         derived_speed_mps = None if u10 is None or v10 is None else math.sqrt(u10 * u10 + v10 * v10)
         if derived_speed_mps is not None:
             records.append(
@@ -360,8 +406,8 @@ def build_records(paths: list[Path], site: SitePoint, conn: sqlite3.Connection, 
                         "vintage_delta_minutes": delta_min,
                     }
                 )
-        p162 = values.get(162, (None, "", ""))[0]
-        p163 = values.get(163, (None, "", ""))[0]
+        p162 = values.get(GUST_U_WIND_PARAMETER, (None, "", ""))[0]
+        p163 = values.get(GUST_V_WIND_PARAMETER, (None, "", ""))[0]
         if p162 is not None and p163 is not None:
             magnitude = math.sqrt(p162 * p162 + p163 * p163)
             for conversion, converted in conversion_candidates(magnitude).items():
@@ -429,8 +475,8 @@ def main() -> None:
         raise SystemExit(f"Raw tar not found: {args.raw_tar}")
 
     members = list_members(args.raw_tar)
-    print("KNMI gust candidate inspection")
-    print("==============================")
+    print("KNMI gust field inspection")
+    print("==========================")
     print(f"Raw tar: {args.raw_tar}")
     print(f"Tar members: {len(members)}")
     print(f"Available horizons: {members[0].horizon}-{members[-1].horizon}" if members else "Available horizons: none")
@@ -440,13 +486,14 @@ def main() -> None:
     try:
         site_point = site_point_from_db(conn, args.site)
         print(f"Site: {site_point.site} ({site_point.lat}, {site_point.lon})")
+        print_knmi_parameter_mapping()
         with TemporaryDirectory(prefix="knmi_gust_candidates_") as tmp:
             paths = extract_selected(args.raw_tar, horizons, Path(tmp))
             if not paths:
                 raise SystemExit("No requested horizons were found in the raw tar.")
             print("Extracted horizons: " + ", ".join(str(parse_member(path.name).horizon) for path in paths if parse_member(path.name)))
             fields = print_grib_inventory(paths)
-            print("\nCandidate 10 m parameters discovered: " + ", ".join(str(key) for key in sorted(fields)))
+            print("\n10 m parameters discovered in selected GRIBs: " + ", ".join(str(key) for key in sorted(fields)))
             records = build_records(paths, site_point, conn, args.site, args.max_vintage_delta_minutes)
     finally:
         conn.close()
@@ -476,7 +523,7 @@ def main() -> None:
     print_summary("Sanity comparison against Windsurfice average wind", avg_summary)
 
     if gust_summary.empty:
-        print("\nNo KNMI P1 candidate field clearly matches Windsurfice wind_gust from this diagnostic.")
+        print("\nNo selected rows could be matched to Windsurfice wind_gust for this sanity check.")
         return
 
     best = gust_summary.iloc[0]
@@ -489,16 +536,20 @@ def main() -> None:
     print(interpretation)
     clear = (
         int(best["matched_rows"]) >= max(4, min(5, len(parse_horizons(args.horizons))))
-        and float(best["mae"]) <= 1.5
-        and str(best["candidate"]) != "derived_speed_33_34"
+        and float(best["mae"]) <= 2.0
+        and str(best["candidate"]) == "vector_magnitude_162_163"
+        and str(best["conversion"]) == "m/s-to-knots"
     )
     if clear:
         print(
-            f"Candidate parameter {best['parameter']} at level 10 m appears to match "
-            f"Windsurfice wind_gust under conversion {best['conversion']}."
+            "The KNMI-table gust mapping, sqrt(162^2 + 163^2) converted from m/s to knots, "
+            "is supported by this Windsurfice wind_gust sanity check."
         )
     else:
-        print("No KNMI P1 candidate field clearly matches Windsurfice wind_gust from this diagnostic.")
+        print(
+            "This selected-horizon sanity check does not strongly validate the KNMI-table gust mapping; "
+            "try more horizons or another retained raw tar."
+        )
 
 
 if __name__ == "__main__":

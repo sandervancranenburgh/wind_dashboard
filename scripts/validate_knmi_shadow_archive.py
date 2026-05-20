@@ -56,6 +56,12 @@ DEFAULT_SITE_POINTS = {
 GUST_U_WIND_PARAMETER = 162
 GUST_V_WIND_PARAMETER = 163
 MAX_WIND_CANDIDATE_PARAMETERS = (162, 163)
+KNMI_LOCAL_PARAMETER_NOTE = (
+    "KNMI HARMONIE Cy43 P1 local parameter table: 33/34 are 10 m u/v average "
+    "wind components in m/s; 162/163 are 10 m u/v gust components in m/s "
+    "(CSULF/CSDLF, TRI 2). ecCodes may label these local parameters as "
+    "unknown, but the table defines the units and meaning."
+)
 
 
 @dataclass(frozen=True)
@@ -850,6 +856,7 @@ def wind_field_storage_diagnostics(
         )
     print("Minimum forecast wind speed: no dedicated forecasts table column is present.")
     print("Direction: forecasts.wind_dir, populated from payload WindDirection.")
+    print("KNMI local parameter mapping: " + KNMI_LOCAL_PARAMETER_NOTE)
 
     payload_keys: set[str] = set()
     for (payload_raw,) in conn.execute(
@@ -1137,7 +1144,7 @@ def validate_max_wind_from_raw(
                 u_value, u_metadata = raw_values[GUST_U_WIND_PARAMETER]
                 v_value, v_metadata = raw_values[GUST_V_WIND_PARAMETER]
                 magnitude = (u_value**2 + v_value**2) ** 0.5
-                metadata = f"vector magnitude of 162/163; {u_metadata}; {v_metadata}"
+                metadata = f"KNMI-table gust vector magnitude of 162/163 in m/s; {u_metadata}; {v_metadata}"
                 for unit_assumption, candidate_value in (
                     ("raw already knots", magnitude),
                     ("m/s converted to knots", magnitude * KNOTS_PER_MPS),
@@ -1179,6 +1186,12 @@ def validate_max_wind_from_raw(
 def print_max_wind_validation(summary: pd.DataFrame, message: str) -> dict[str, object]:
     print("\nKNMI max/gust validation")
     print("========================")
+    print(
+        "ecCodes may label KNMI local parameters 162/163 as unknown, but the "
+        "KNMI HARMONIE Cy43 P1 parameter table identifies them as 10 m u/v "
+        "gust components in m/s. This section validates that table mapping "
+        "against Windsurfice wind_gust."
+    )
     print(message)
     result = {"status": "unresolved", "message": message}
     if summary.empty:
@@ -1186,14 +1199,19 @@ def print_max_wind_validation(summary: pd.DataFrame, message: str) -> dict[str, 
         return result
     print(summary.round(3).to_string(index=False))
     best = summary.iloc[0]
-    if int(best["matched_rows"]) >= 10 and float(best["mae_kt"]) <= 2.0:
-        result["status"] = "candidate"
+    best_is_table_mapping = (
+        str(best["candidate_field"]) == "indicatorOfParameter=162+163"
+        and str(best["unit_assumption"]) == "m/s converted to knots"
+    )
+    if best_is_table_mapping and int(best["matched_rows"]) >= 10 and float(best["mae_kt"]) <= 2.0:
+        result["status"] = "validated"
         print(
-            f"Best candidate is {best['candidate_field']} ({best['unit_assumption']}) with "
-            f"MAE {best['mae_kt']:.3f} kt. Treat as a candidate until confirmed over more runs."
+            f"The KNMI-table gust vector mapping is supported by {best['candidate_field']} "
+            f"({best['unit_assumption']}) with MAE {best['mae_kt']:.3f} kt. "
+            "Continue confirming over more archived runs before operational replacement."
         )
     else:
-        print("No candidate clearly matches Windsurfice WindForecastMax yet.")
+        print("The KNMI-table gust vector mapping was not clearly validated in this raw sample.")
     return result
 
 

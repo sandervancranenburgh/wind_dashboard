@@ -8,10 +8,38 @@ without changing the production Windsurfice fetch, dashboard, or model path.
 `scripts/knmi_extract_latest_to_db.py` writes:
 
 - `harmonie_knmi_features`: canonical KNMI feature rows, including 10/50/100/200/300 m wind features;
-- `knmi_forecasts_shadow`: a compatibility table shaped like the production `forecasts` table, using KNMI 10 m wind speed converted from m/s to knots.
+- `knmi_forecasts_shadow`: a compatibility table shaped like the production `forecasts` table, using KNMI 10 m average wind and gust speed converted from m/s to knots.
 
 It does not write to production `forecasts` unless `--write-production` is
 explicitly passed. That flag is intended only for manual controlled tests.
+
+## HARMONIE P1 local GRIB parameter mapping
+
+The KNMI HARMONIE Cy43 P1 GRIB code table defines the local wind parameters
+used by the extractor:
+
+- `33` / `UGRD`: u-component of wind, `m s-1`, heightAboveGround levels
+  10/50/100/200/300 m.
+- `34` / `VGRD`: v-component of wind, `m s-1`, heightAboveGround levels
+  10/50/100/200/300 m.
+- `162` / `CSULF`: U-momentum of gusts out of the model, `m s-1`,
+  heightAboveGround 10 m, TRI 2.
+- `163` / `CSDLF`: V-momentum of gusts out of the model, `m s-1`,
+  heightAboveGround 10 m, TRI 2.
+
+The canonical 10 m average wind speed is computed as
+`sqrt(param33_10m^2 + param34_10m^2)`. The canonical 10 m gust/max wind speed
+is computed as `sqrt(param162_10m^2 + param163_10m^2)`. Both are in m/s before
+being converted to knots for Windsurfice-compatible shadow columns.
+
+ecCodes/cfgrib may display these KNMI local parameters with `unknown`
+shortName/name/units; use the KNMI HARMONIE Cy43 P1 parameter table as the
+source of truth for the mapping. The implementation has also been validated
+empirically against Windsurfice: average wind speed/direction match closely in
+closest-vintage comparisons, and the 162/163 gust vector matched
+`forecasts.wind_gust` with high correlation and low error for the tested run.
+Continue accumulating shadow history before replacing Windsurfice
+operationally.
 
 ## Timestamp semantics
 

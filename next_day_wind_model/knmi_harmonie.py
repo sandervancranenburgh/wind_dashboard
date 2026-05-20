@@ -34,6 +34,18 @@ GUST_V_WIND_PARAMETER = 163
 KNOTS_PER_MPS = 1.9438444924406
 HARMONIE_P1_TAR_PATTERN = re.compile(r"^HARM43_V1_P1_(\d{10})\.tar$")
 
+# KNMI HARMONIE Cy43 P1 local GRIB parameter mapping. ecCodes/cfgrib may
+# display shortName/name/units as "unknown" for these local parameters, but the
+# KNMI P1 code table defines them as:
+#
+# 33  UGRD   u-component of wind                  m s-1  heightAboveGround 10/50/100/200/300 m
+# 34  VGRD   v-component of wind                  m s-1  heightAboveGround 10/50/100/200/300 m
+# 162 CSULF  U-momentum of gusts out of the model m s-1  heightAboveGround 10 m
+# 163 CSDLF  V-momentum of gusts out of the model m s-1  heightAboveGround 10 m
+#
+# Windsurfice-compatible speed columns are stored in knots, so scalar speeds are
+# computed from the u/v components in m/s and converted with KNOTS_PER_MPS.
+
 
 @dataclass(frozen=True)
 class SitePoint:
@@ -434,6 +446,8 @@ def extract_one_grib(
         grid_lon = lon
 
     try:
+        # Parameters 162/163 are the KNMI-table 10 m gust u/v components in
+        # m/s; their vector magnitude is the Windsurfice WindForecastMax analog.
         gust_u_ds = open_grib_parameter(grib_path, parameter=GUST_U_WIND_PARAMETER, level=10)
         gust_v_ds = open_grib_parameter(grib_path, parameter=GUST_V_WIND_PARAMETER, level=10)
         try:
@@ -446,8 +460,8 @@ def extract_one_grib(
         row["wind_gust_10m_mps"] = gust_speed
         row["wind_gust_10m_knots"] = mps_to_knots(gust_speed)
     except Exception:
-        # KNMI parameter 162/163 availability should not decide whether the
-        # average wind archive can be populated. Leave gust null if absent.
+        # Gust availability should not decide whether the average wind archive
+        # can be populated. Leave gust null if the local fields are absent.
         row["wind_gust_10m_mps"] = None
         row["wind_gust_10m_knots"] = None
 

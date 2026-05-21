@@ -14,6 +14,14 @@ cd "${REPO_ROOT}"
 {
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI shadow fallback fetch start"
 
+  if [ -f "${HOME}/.bashrc" ]; then
+    # Load exported KNMI_API_KEY for cron/non-interactive wrapper runs.
+    set +u
+    # shellcheck disable=SC1090
+    source "${HOME}/.bashrc"
+    set -u
+  fi
+
   if [ -z "${KNMI_API_KEY:-}" ]; then
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: KNMI_API_KEY is not set"
     exit 2

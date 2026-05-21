@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         help="Process up to N latest API files that are missing or incomplete in the archive.",
     )
     parser.add_argument("--max-acceptable-lag-hours", type=float, default=2.0)
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Print a concise operational health check and skip log/timezone audit details.",
+    )
     return parser.parse_args()
 
 
@@ -561,6 +566,33 @@ def print_report(report: dict[str, Any], zone_name: str, max_lag: float) -> None
     print(f"potential issues outside/around scanned paths: {len(tz_audit['potential_issues'])}")
 
 
+def print_health_check(api_runs: list[dict[str, Any]], archive: dict[str, Any], comparison: list[dict[str, Any]]) -> None:
+    latest_api = api_runs[0] if api_runs else None
+    latest_comparison = comparison[0] if comparison else None
+    lag = latest_comparison["lag_from_api_latest_to_db_latest_hours"] if latest_comparison else None
+
+    print("KNMI notification health check")
+    print("==============================")
+    if latest_api:
+        print(f"latest_api_file: {latest_api['filename']}")
+        print(f"latest_api_run_ts: {latest_api['run_ts_utc']}")
+        print(f"latest_api_created: {latest_api['created_utc']}")
+    else:
+        print("latest_api_file: none")
+    print(f"latest_archived_db_run_ts: {archive['max_run_ts_utc']}")
+    print(f"api_to_db_lag_hours: {lag}")
+    print(f"latest_api_run_archived: {latest_comparison['archived'] if latest_comparison else None}")
+    print("\nLatest DB runs")
+    print("--------------")
+    for row in archive["latest_runs"][:5]:
+        missing = row["missing_horizons"]
+        missing_text = "none" if not missing else ",".join(map(str, missing))
+        print(
+            f"{row['run_ts_utc']} rows={row['row_count']} "
+            f"horizon_range={row['min_horizon']}-{row['max_horizon']} missing={missing_text}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     if args.latest_api_count < 1:
@@ -583,6 +615,11 @@ def main() -> None:
         archive["max_run_ts_local"] = iso_local(archive["max_run_ts_utc"], zone)
         comparison = api_db_comparison(api_runs, archive)
 
+    api_run_rows = serializable_api_runs(api_runs, zone)
+    if args.health_check:
+        print_health_check(api_run_rows, archive, comparison)
+        return
+
     listener_log = parse_listener_log(args.log_file)
     fallback_log = parse_fallback_log(args.fallback_log)
     unparsed_payloads = [line for line in listener_log.get("unparsed_payload_lines", [])]
@@ -598,7 +635,7 @@ def main() -> None:
         "dataset": args.dataset,
         "version": args.version,
         "timezone": args.timezone,
-        "api_runs": serializable_api_runs(api_runs, zone),
+        "api_runs": api_run_rows,
         "archive": archive,
         "api_db_comparison": comparison,
         "lag_summary": {

@@ -13,6 +13,14 @@ cd "${REPO_ROOT}"
 {
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI notification listener start"
 
+  if [ -f "${HOME}/.bashrc" ]; then
+    # Load exported API keys for tmux/non-interactive wrapper runs.
+    set +u
+    # shellcheck disable=SC1090
+    source "${HOME}/.bashrc"
+    set -u
+  fi
+
   if [ -z "${KNMI_API_KEY:-}" ]; then
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR: KNMI_API_KEY is not set"
     exit 2
@@ -31,7 +39,7 @@ cd "${REPO_ROOT}"
     source "${VENV}/bin/activate"
   fi
 
-  python3 scripts/knmi_notification_listener.py
+  python3 scripts/knmi_notification_listener.py --log-level INFO
 
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI notification listener end"
 } >> "${LOG_FILE}" 2>&1

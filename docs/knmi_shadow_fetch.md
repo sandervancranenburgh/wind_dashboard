@@ -171,8 +171,10 @@ The latest-vs-latest comparison can be misleading while only one KNMI run is
 archived. A single run is enough for extraction verification, but not enough for
 model evaluation or training.
 
-## Future Notification Service
+## Notification Service
 
-Do not implement the listener here. A future Notification Service/MQTT listener
-should call the same worker with `--filename <notified-tar-filename>` so manual,
-cron fallback, and notification-triggered ingestion all share one code path.
+The KNMI Notification Service listener is implemented in
+`scripts/knmi_notification_listener.py` and documented in
+`docs/knmi_notification_service.md`. It calls the same worker with
+`--filename <notified-tar-filename>` semantics, so manual, cron fallback, and
+notification-triggered ingestion all share one shadow-only code path.

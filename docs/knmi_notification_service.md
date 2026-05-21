@@ -50,6 +50,65 @@ tail -f logs/knmi_notification_listener.log
 
 The wrapper checks that `KNMI_API_KEY`, `KNMI_NOTIFICATION_API_KEY`, and `KNMI_NOTIFICATION_CLIENT_ID` are set, then runs the listener from the repository root.
 
+## Operational Setup After Validation
+
+The direct tmux command has been validated end-to-end:
+
+```bash
+python scripts/knmi_notification_listener.py --log-level INFO
+```
+
+That run confirmed MQTT connection, persistent session replay, QoS 1 subscription, event receipt, filename parsing, file-specific processing, SQLite writes, and a complete 61-horizon archive. For ongoing operation, prefer the wrapper so stdout/stderr are appended to `logs/knmi_notification_listener.log`.
+
+Stop any existing direct listener first:
+
+```bash
+pkill -f "scripts/knmi_notification_listener.py"
+```
+
+Start the wrapper in tmux:
+
+```bash
+tmux new -s knmi_notify
+cd ~/Documents/repos/wind_fetcher2_dev
+source ~/.bashrc
+source /home/sandervancranenburgh/Documents/python_envs/env/bin/activate
+bash scripts/run_knmi_notification_listener.sh
+```
+
+Detach from tmux with `Ctrl+B`, then `D`.
+
+Monitor the running listener:
+
+```bash
+ps aux | grep knmi_notification_listener | grep -v grep
+tail -f ~/Documents/repos/wind_fetcher2_dev/logs/knmi_notification_listener.log
+```
+
+Run the health check:
+
+```bash
+python scripts/diagnose_knmi_notification_lag.py \
+  --db data/wind_data_all_sites.db \
+  --site valkenburgsemeer \
+  --latest-api-count 12 \
+  --health-check
+```
+
+Confirm latest archive horizon counts directly:
+
+```bash
+sqlite3 data/wind_data_all_sites.db "
+SELECT run_ts, COUNT(*) AS n, MIN(horizon_hr), MAX(horizon_hr)
+FROM harmonie_knmi_features
+GROUP BY run_ts
+ORDER BY run_ts DESC
+LIMIT 10;
+"
+```
+
+The setup is healthy when the latest KNMI API run equals the latest archived DB run and the latest DB runs have 61 horizons each.
+
 ## Fallback Polling
 
 Use the fallback job if the listener was down or may have missed events. It processes recent files idempotently through the existing extractor:
@@ -72,6 +131,20 @@ Example crontab line for a 30 minute fallback cadence:
 
 ```cron
 */30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev && scripts/run_knmi_shadow_fetch_fallback.sh
+```
+
+Do not edit crontab blindly. While the notification/fallback code exists only on the dev branch, use the dev clone. After this branch is merged to production `main`, switch the cron line to the production clone.
+
+Before merge:
+
+```cron
+*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev/logs/knmi_shadow_fetch_fallback.log 2>&1
+```
+
+After merge to main:
+
+```cron
+*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/logs/knmi_shadow_fetch_fallback.log 2>&1
 ```
 
 ## Optional Systemd User Service
@@ -108,6 +181,16 @@ python3 scripts/diagnose_knmi_notification_lag.py \
   --db data/wind_data_all_sites.db \
   --site valkenburgsemeer \
   --latest-api-count 12
+```
+
+For a concise operational check:
+
+```bash
+python3 scripts/diagnose_knmi_notification_lag.py \
+  --db data/wind_data_all_sites.db \
+  --site valkenburgsemeer \
+  --latest-api-count 12 \
+  --health-check
 ```
 
 The key comparison is the latest API `run_ts` versus the archive `max_run_ts`. Both are UTC internally. The diagnostic also prints Europe/Amsterdam display times using the IANA timezone, so summer time is shown as CEST/UTC+2 without manual offsets.

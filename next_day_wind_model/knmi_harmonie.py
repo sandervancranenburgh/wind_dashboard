@@ -57,6 +57,7 @@ class SitePoint:
 @dataclass(frozen=True)
 class KnmiFileInfo:
     filename: str
+    created: str | None = None
     last_modified: str | None = None
     size: int | None = None
 
@@ -284,6 +285,7 @@ def list_knmi_files(
         out.append(
             KnmiFileInfo(
                 filename=str(filename),
+                created=item.get("created") or item.get("createdAt"),
                 last_modified=item.get("lastModified"),
                 size=int(item["size"]) if item.get("size") is not None else None,
             )
@@ -942,8 +944,16 @@ def recent_knmi_runs(conn: sqlite3.Connection, site: str, limit: int = 10) -> pd
     )
 
 
-def knmi_archive_diagnostic(conn: sqlite3.Connection, site: str, now_ts: str | None = None) -> dict[str, Any]:
-    create_harmonie_knmi_features_table(conn)
+def knmi_archive_diagnostic(
+    conn: sqlite3.Connection,
+    site: str,
+    now_ts: str | None = None,
+    *,
+    ensure_table: bool = True,
+    include_observation_joinability: bool = True,
+) -> dict[str, Any]:
+    if ensure_table:
+        create_harmonie_knmi_features_table(conn)
     now_iso = now_ts or utc_now_iso()
     now_ms = timestamp_ms(now_iso)
     summary = pd.read_sql_query(
@@ -964,32 +974,36 @@ def knmi_archive_diagnostic(conn: sqlite3.Connection, site: str, now_ts: str | N
         params=(now_ms, site),
     )
     row = summary.iloc[0].to_dict() if not summary.empty else {}
-    joinable_exact = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {TABLE_NAME} AS k
-        JOIN observations AS o
-          ON o.site = k.site
-         AND o.ts = CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000
-        WHERE k.site = ?
-        """,
-        (site,),
-    ).fetchone()[0]
-    joinable_30min = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {TABLE_NAME} AS k
-        WHERE k.site = ?
-          AND EXISTS (
-              SELECT 1
-              FROM observations AS o
-              WHERE o.site = k.site
-                AND ABS(o.ts - CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000) <= 30 * 60 * 1000
-          )
-        """,
-        (site,),
-    ).fetchone()[0]
-    row["rows_joinable_to_observations_exact"] = int(joinable_exact or 0)
-    row["rows_joinable_to_observations_30min"] = int(joinable_30min or 0)
+    if include_observation_joinability:
+        joinable_exact = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {TABLE_NAME} AS k
+            JOIN observations AS o
+              ON o.site = k.site
+             AND o.ts = CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000
+            WHERE k.site = ?
+            """,
+            (site,),
+        ).fetchone()[0]
+        joinable_30min = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {TABLE_NAME} AS k
+            WHERE k.site = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM observations AS o
+                  WHERE o.site = k.site
+                    AND ABS(o.ts - CAST(strftime('%s', k.target_ts) AS INTEGER) * 1000) <= 30 * 60 * 1000
+              )
+            """,
+            (site,),
+        ).fetchone()[0]
+        row["rows_joinable_to_observations_exact"] = int(joinable_exact or 0)
+        row["rows_joinable_to_observations_30min"] = int(joinable_30min or 0)
+    else:
+        row["rows_joinable_to_observations_exact"] = None
+        row["rows_joinable_to_observations_30min"] = None
     row["diagnostic_now_ts"] = now_iso
     return row

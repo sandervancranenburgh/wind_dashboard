@@ -62,8 +62,8 @@ def require_env(name: str) -> str:
     return value
 
 
-def safe_payload_text(payload: bytes, limit: int = 1000) -> str:
-    text = payload.decode("utf-8", errors="replace")
+def safe_payload_text(payload: bytes | str, limit: int = 1000) -> str:
+    text = payload if isinstance(payload, str) else payload.decode("utf-8", errors="replace")
     if len(text) > limit:
         return text[:limit] + "...<truncated>"
     return text
@@ -82,7 +82,7 @@ def values_for_filename_keys(value: Any) -> list[str]:
     return found
 
 
-def extract_filename_from_payload(payload: bytes) -> str | None:
+def extract_filename_from_event_payload(payload: bytes | str) -> str | None:
     text = safe_payload_text(payload)
     try:
         parsed = json.loads(text)
@@ -102,6 +102,10 @@ def extract_filename_from_payload(payload: bytes) -> str | None:
     if parsed is None:
         logging.info("KNMI notification payload was not JSON and did not contain a HARMONIE P1 filename: %s", text)
     return None
+
+
+def extract_filename_from_payload(payload: bytes | str) -> str | None:
+    return extract_filename_from_event_payload(payload)
 
 
 def import_mqtt() -> Any:
@@ -151,9 +155,19 @@ def make_client(mqtt: Any, client_id: str, api_key: str, topic: str, filenames: 
         logging.warning("Disconnected from KNMI Notification Service: %s", args)
 
     def on_message(client: Any, userdata: Any, message: Any) -> None:
-        filename = extract_filename_from_payload(message.payload)
+        payload_preview = safe_payload_text(message.payload, limit=500)
+        logging.info(
+            "Received KNMI notification event topic=%s qos=%s retain=%s payload=%s",
+            getattr(message, "topic", None),
+            getattr(message, "qos", None),
+            getattr(message, "retain", None),
+            payload_preview,
+        )
+        filename = extract_filename_from_event_payload(message.payload)
         if filename is None:
+            logging.info("Ignored KNMI notification without matching HARMONIE P1 tar filename.")
             return
+        logging.info("Parsed KNMI HARMONIE P1 filename from notification: %s", filename)
         with seen_lock:
             if filename in seen:
                 logging.info("Ignoring duplicate notification for %s", filename)
@@ -197,12 +211,14 @@ def process_filename(filename: str, args: argparse.Namespace) -> bool:
     diagnostic = result.archive_diagnostic or {}
     logging.info(
         "KNMI notification processed filename=%s run_ts=%s rows_written=%s shadow_rows_written=%s "
-        "distinct_knmi_runs=%s latest_run_horizon_count=%s",
+        "distinct_knmi_runs=%s row_count=%s max_run_ts=%s latest_run_horizon_count=%s",
         result.filename,
         result.run_ts,
         result.rows_written,
         result.shadow_rows_written,
         diagnostic.get("distinct_run_ts"),
+        diagnostic.get("row_count"),
+        diagnostic.get("max_run_ts"),
         result.latest_run_horizon_count,
     )
     return True

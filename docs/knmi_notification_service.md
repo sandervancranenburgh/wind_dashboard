@@ -62,6 +62,12 @@ tail -f logs/knmi_shadow_fetch_fallback.log
 
 The wrapper reads `KNMI_FALLBACK_LATEST_COUNT` and defaults to `3`.
 
+Catch up a wider window manually:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --latest-count 6
+```
+
 Example crontab line for a 30 minute fallback cadence:
 
 ```cron
@@ -92,3 +98,45 @@ WantedBy=default.target
 ```
 
 Prefer an environment file with restricted permissions for real secrets.
+
+## Troubleshooting Lag
+
+Use the lag diagnostic first. By default it only lists KNMI Open Data API files, reads SQLite, parses logs, and tests the notification payload parser. It does not download or process files unless `--process-missing-latest` is set.
+
+```bash
+python3 scripts/diagnose_knmi_notification_lag.py \
+  --db data/wind_data_all_sites.db \
+  --site valkenburgsemeer \
+  --latest-api-count 12
+```
+
+The key comparison is the latest API `run_ts` versus the archive `max_run_ts`. Both are UTC internally. The diagnostic also prints Europe/Amsterdam display times using the IANA timezone, so summer time is shown as CEST/UTC+2 without manual offsets.
+
+For a quick DB-only archive summary:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --archive-diagnostic
+```
+
+Observation joinability counts are slower and opt-in:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --archive-diagnostic --include-observation-joinability
+```
+
+Interpretation:
+
+- Latest API run equals latest DB run, with 61 rows: KNMI is caught up.
+- API has newer files than DB, and listener log has no event/parsed filename: likely listener was not running, not logging to the wrapper file, or missed notification replay.
+- API has newer files than DB, listener parsed/queued the filename, but processing failed: inspect the listener error and run fallback.
+- API has newer files than DB, listener received payloads but parsed no filename: payload format changed; use the logged payload preview to update parser handling.
+- API itself has no newer file: KNMI has not published the next tar yet. Compare API `created` time to `run_ts`; HARMONIE files can be created well after the model run hour.
+
+Fallback catch-up options:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --latest-count 6
+python3 scripts/diagnose_knmi_notification_lag.py --process-missing-latest 6
+```
+
+The diagnostic catch-up mode processes only the latest missing or incomplete API files, using the same idempotent shadow worker as the listener.

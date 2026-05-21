@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -33,6 +34,7 @@ from next_day_wind_model.knmi_harmonie import (
     latest_shadow_rows,
     list_knmi_files,
     parse_run_from_tar_filename,
+    parse_utc_timestamp,
     recent_knmi_runs,
     select_latest_tar_file,
     upsert_knmi_forecasts_shadow,
@@ -115,6 +117,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnose-archive", action="store_true", help="Only print archive depth/training-readiness diagnostics.")
     parser.add_argument("--archive-diagnostic", action="store_true", help="Alias for --diagnose-archive.")
     parser.add_argument("--inspect-limit", type=int, default=5)
+    parser.add_argument("--timezone", default="Europe/Amsterdam", help="Timezone for local diagnostic display.")
+    parser.add_argument(
+        "--include-observation-joinability",
+        action="store_true",
+        help="Include slower observation joinability counts in archive diagnostics.",
+    )
     parser.add_argument("--model", default="HARMONIE", help="Forecast model label for shadow rows.")
     parser.add_argument(
         "--skip-shadow",
@@ -220,10 +228,34 @@ def print_recent_runs(db_path: Path, site: str, limit: int) -> None:
     print(rows.to_string(index=False))
 
 
-def print_archive_diagnostic(db_path: Path, site: str) -> None:
+def local_iso(value: Any, timezone_name: str) -> str | None:
+    if value is None:
+        return None
+    return parse_utc_timestamp(value).tz_convert(ZoneInfo(timezone_name)).isoformat()
+
+
+def lag_hours(later: Any, earlier: Any) -> float | None:
+    if later is None or earlier is None:
+        return None
+    delta = parse_utc_timestamp(later) - parse_utc_timestamp(earlier)
+    return round(delta.total_seconds() / 3600, 3)
+
+
+def print_archive_diagnostic(
+    db_path: Path,
+    site: str,
+    timezone_name: str = "Europe/Amsterdam",
+    *,
+    include_observation_joinability: bool = False,
+) -> None:
     conn = connect_sqlite_with_timeout(db_path)
     try:
-        diagnostic = knmi_archive_diagnostic(conn, site=site)
+        diagnostic = knmi_archive_diagnostic(
+            conn,
+            site=site,
+            ensure_table=False,
+            include_observation_joinability=include_observation_joinability,
+        )
     finally:
         conn.close()
     print("\nKNMI archive diagnostic")
@@ -241,7 +273,19 @@ def print_archive_diagnostic(db_path: Path, site: str) -> None:
         "rows_joinable_to_observations_30min",
         "diagnostic_now_ts",
     ):
-        print(f"{key}: {diagnostic.get(key)}")
+        value = diagnostic.get(key)
+        if key.startswith("rows_joinable") and value is None:
+            value = "not calculated (use --include-observation-joinability)"
+        print(f"{key}: {value}")
+    print(f"max_run_ts_local_{timezone_name}: {local_iso(diagnostic.get('max_run_ts'), timezone_name)}")
+    print(
+        f"diagnostic_now_ts_local_{timezone_name}: "
+        f"{local_iso(diagnostic.get('diagnostic_now_ts'), timezone_name)}"
+    )
+    print(
+        "latest_archived_run_age_hours: "
+        f"{lag_hours(diagnostic.get('diagnostic_now_ts'), diagnostic.get('max_run_ts'))}"
+    )
     if int(diagnostic.get("distinct_run_ts") or 0) <= 1:
         print(
             "Only one KNMI run is archived. This is sufficient for extraction verification, "
@@ -355,6 +399,7 @@ def process_knmi_file_to_db(
     skip_shadow: bool = False,
     write_production: bool = False,
     skip_archive_diagnostic: bool = False,
+    include_observation_joinability: bool = False,
     db_retries: int = 5,
 ) -> KnmiProcessResult:
     """Download/extract one KNMI HARMONIE P1 tar and write shadow rows to SQLite."""
@@ -397,7 +442,15 @@ def process_knmi_file_to_db(
             )
             sample = latest_harmonie_knmi_rows(conn, site=site_point.site, limit=5)
             shadow_sample = latest_shadow_rows(conn, site=site_point.site, limit=5)
-            diagnostic = None if skip_archive_diagnostic else knmi_archive_diagnostic(conn, site=site_point.site)
+            diagnostic = (
+                None
+                if skip_archive_diagnostic
+                else knmi_archive_diagnostic(
+                    conn,
+                    site=site_point.site,
+                    include_observation_joinability=include_observation_joinability,
+                )
+            )
             recent_runs = recent_knmi_runs(conn, site=site_point.site, limit=1)
             latest_run_horizon_count = None
             if not recent_runs.empty:
@@ -493,7 +546,22 @@ def print_process_result(args: argparse.Namespace, result: KnmiProcessResult) ->
             "rows_joinable_to_observations_30min",
             "diagnostic_now_ts",
         ):
-            print(f"{key}: {result.archive_diagnostic.get(key)}")
+            value = result.archive_diagnostic.get(key)
+            if key.startswith("rows_joinable") and value is None:
+                value = "not calculated (use --include-observation-joinability)"
+            print(f"{key}: {value}")
+        print(
+            f"max_run_ts_local_{args.timezone}: "
+            f"{local_iso(result.archive_diagnostic.get('max_run_ts'), args.timezone)}"
+        )
+        print(
+            f"diagnostic_now_ts_local_{args.timezone}: "
+            f"{local_iso(result.archive_diagnostic.get('diagnostic_now_ts'), args.timezone)}"
+        )
+        print(
+            "latest_archived_run_age_hours: "
+            f"{lag_hours(result.archive_diagnostic.get('diagnostic_now_ts'), result.archive_diagnostic.get('max_run_ts'))}"
+        )
         if int(result.archive_diagnostic.get("distinct_run_ts") or 0) <= 1:
             print(
                 "Only one KNMI run is archived. This is sufficient for extraction verification, "
@@ -518,7 +586,12 @@ def main() -> None:
         print_recent_runs(db_path, site=site.site, limit=args.inspect_limit)
         return
     if args.diagnose_archive or args.archive_diagnostic:
-        print_archive_diagnostic(db_path, site=site.site)
+        print_archive_diagnostic(
+            db_path,
+            site=site.site,
+            timezone_name=args.timezone,
+            include_observation_joinability=args.include_observation_joinability,
+        )
         return
 
     if args.latest_count is not None and (args.filename is not None or args.tar_path is not None):
@@ -559,6 +632,7 @@ def main() -> None:
                 skip_shadow=args.skip_shadow,
                 write_production=args.write_production,
                 skip_archive_diagnostic=args.skip_archive_diagnostic,
+                include_observation_joinability=args.include_observation_joinability,
             )
             print_process_result(args, result)
     except (KnmiApiError, KnmiExtractionError, FileNotFoundError, ValueError, sqlite3.OperationalError) as exc:

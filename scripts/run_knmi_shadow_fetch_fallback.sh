@@ -8,6 +8,11 @@ LOG_FILE="${LOG_DIR}/knmi_shadow_fetch_fallback.log"
 VENV="/home/sandervancranenburgh/Documents/python_envs/env"
 LATEST_COUNT="${KNMI_FALLBACK_LATEST_COUNT:-3}"
 
+
+if [ -f "$HOME/.wind_fetcher_env" ]; then
+  . "$HOME/.wind_fetcher_env"
+fi
+
 mkdir -p "${LOG_DIR}"
 cd "${REPO_ROOT}"
 

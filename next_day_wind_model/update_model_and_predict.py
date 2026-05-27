@@ -3888,12 +3888,80 @@ def save_model_gate_eval_history_plot(
             return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
         return value
 
+    def _repair_legacy_microsecond_detail_times(
+        times: pd.Series,
+        reference_utc: pd.Timestamp,
+    ) -> pd.Series:
+        """Repair legacy detail timestamps written with mixed microsecond/nanosecond units."""
+        valid_times = times.dropna()
+        if valid_times.empty or pd.isna(reference_utc):
+            return times
+
+        raw_us = valid_times.astype("int64").to_numpy(dtype=np.int64)
+        int64_info = np.iinfo(np.int64)
+        if raw_us.min() < int64_info.min // 1000 or raw_us.max() > int64_info.max // 1000:
+            return times
+
+        # Pandas 3 exposes these parsed UTC datetimes as epoch microseconds.
+        # First recover the corrupted numeric timestamp in ns-like units.
+        bad_ns = raw_us * 1000
+        hour_ns = 3_600_000_000_000
+        lower_ns = (reference_utc - pd.Timedelta(days=45)).value
+        upper_ns = (reference_utc + pd.Timedelta(days=2)).value
+        missing = int64_info.min
+        repaired_ns = np.full(raw_us.shape, missing, dtype=np.int64)
+
+        for horizon_hour in range(1, 25):
+            horizon_ns = horizon_hour * hour_ns
+
+            # Legacy bug: bad_ns = anchor_epoch_microseconds + horizon_nanoseconds.
+            # Direct inverse: anchor_us = bad_ns - horizon_ns; good_ns = anchor_us * 1000 + horizon_ns.
+            anchor_us = bad_ns - horizon_ns
+            can_scale = (
+                (anchor_us >= (int64_info.min - horizon_ns) // 1000)
+                & (anchor_us <= (int64_info.max - horizon_ns) // 1000)
+            )
+            candidate_ns = np.full(raw_us.shape, missing, dtype=np.int64)
+            candidate_ns[can_scale] = anchor_us[can_scale] * 1000 + horizon_ns
+            mask = (
+                (repaired_ns == missing)
+                & can_scale
+                & (candidate_ns >= lower_ns)
+                & (candidate_ns <= upper_ns)
+            )
+            repaired_ns[mask] = candidate_ns[mask]
+
+        repaired_mask = np.not_equal(repaired_ns, missing)
+        if not repaired_mask.any():
+            return times
+
+        repaired = pd.Series(pd.NaT, index=valid_times.index, dtype="datetime64[ns, UTC]")
+        repaired.loc[repaired_mask] = pd.to_datetime(
+            repaired_ns[repaired_mask],
+            errors="coerce",
+            utc=True,
+        )
+        repaired_valid = repaired.dropna()
+        if repaired_valid.empty or len(repaired_valid) != int(repaired_mask.sum()):
+            return times
+        if repaired_valid.min() < reference_utc - pd.Timedelta(days=45):
+            return times
+        if repaired_valid.max() > reference_utc + pd.Timedelta(days=2):
+            return times
+        if not repaired_valid.sort_values().is_monotonic_increasing:
+            return times
+
+        out = times.copy()
+        out.loc[valid_times.index] = repaired
+        return out
+
     challenger_color = "#1f77b4"
     champion_color = MODEL_GATE_CHAMPION_COLOR
     harmonie_color = "gray"
     plot_meta_text = _format_last_plot_update_text(datetime.now(timezone.utc).isoformat(), local_tz)
     champion_model_id = None
     challenger_model_id = None
+    latest_history_run_utc = None
     harmonie_label = "Harmonie prediction"
     if history_csv.exists():
         hist_for_id = pd.read_csv(history_csv)
@@ -3902,6 +3970,7 @@ def save_model_gate_eval_history_plot(
                 hist_for_id["run_utc"] = _parse_iso_series_utc(hist_for_id["run_utc"])
                 hist_for_id = hist_for_id.dropna(subset=["run_utc"]).sort_values("run_utc")
             if not hist_for_id.empty:
+                latest_history_run_utc = hist_for_id["run_utc"].iloc[-1]
                 last_row = hist_for_id.iloc[-1]
                 champion_model_id = str(last_row.get("speed_model_id_champion", "")).strip() or None
                 challenger_model_id = str(last_row.get("speed_model_id_challenger", "")).strip() or None
@@ -3944,6 +4013,25 @@ def save_model_gate_eval_history_plot(
                 except Exception:
                     direction_col = None
             det = det.dropna(subset=["target_time_utc", "actual_wind_speed"])
+            if latest_history_run_utc is not None and not det.empty:
+                latest_detail_target_utc = det["target_time_utc"].dropna().max()
+                if (
+                    pd.notna(latest_detail_target_utc)
+                    and latest_detail_target_utc < latest_history_run_utc - pd.Timedelta(days=28)
+                ):
+                    repaired_target_time_utc = _repair_legacy_microsecond_detail_times(
+                        det["target_time_utc"],
+                        latest_history_run_utc,
+                    )
+                    repaired_latest = repaired_target_time_utc.dropna().max()
+                    if (
+                        pd.notna(repaired_latest)
+                        and repaired_latest >= latest_history_run_utc - pd.Timedelta(days=28)
+                    ):
+                        det = det.copy()
+                        det["target_time_utc"] = repaired_target_time_utc
+                    else:
+                        det = pd.DataFrame()
             if not det.empty:
                 det = det.sort_values("target_time_utc").reset_index(drop=True)
                 display_window_days = 14
@@ -3966,17 +4054,40 @@ def save_model_gate_eval_history_plot(
                 mae_chall = float(np.nanmean(full_chall_abs_err))
                 mae_champ = float(np.nanmean(full_champ_abs_err))
 
-                x_end_utc = det["target_time_utc"].max()
+                x_end_utc = det["target_time_utc"].dropna().max()
+                if pd.isna(x_end_utc):
+                    return
                 cutoff_utc = x_end_utc - pd.Timedelta(days=display_window_days)
                 det_view = det[det["target_time_utc"] >= cutoff_utc].copy()
                 if det_view.empty:
                     return
-                x_local = det_view["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
                 x_end_local = x_end_utc.tz_convert(ZoneInfo(local_tz))
                 x_start_local = x_end_local - pd.Timedelta(days=display_window_days)
                 det_view["forecast_abs_err"] = np.abs(det_view["forecast_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["champion_abs_err"] = np.abs(det_view["champion_wind_speed"] - det_view["actual_wind_speed"])
                 det_view["challenger_abs_err"] = np.abs(det_view["challenger_wind_speed"] - det_view["actual_wind_speed"])
+
+                plot_cols = [
+                    "actual_wind_speed",
+                    "forecast_wind_speed",
+                    "challenger_wind_speed",
+                    "champion_wind_speed",
+                    "forecast_abs_err",
+                    "challenger_abs_err",
+                    "champion_abs_err",
+                ]
+                det_plot = (
+                    det_view.set_index("target_time_utc")
+                    .sort_index()[plot_cols]
+                    .resample("1h")
+                    .mean(numeric_only=True)
+                    .dropna(how="all")
+                    .reset_index()
+                )
+                det_plot = det_plot.dropna(subset=["target_time_utc", "actual_wind_speed"])
+                if det_plot.empty:
+                    return
+                x_local = det_plot["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
 
                 fig, (ax_top, ax_bottom) = plt.subplots(
                     2,
@@ -3986,24 +4097,24 @@ def save_model_gate_eval_history_plot(
                     gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.40},
                 )
 
-                ax_top.plot(x_local, det_view["actual_wind_speed"], color="magenta", linewidth=1.5, label="_nolegend_")
+                ax_top.plot(x_local, det_plot["actual_wind_speed"], color="magenta", linewidth=1.5, label="_nolegend_")
                 ax_top.plot(
                     x_local,
-                    det_view["forecast_wind_speed"],
+                    det_plot["forecast_wind_speed"],
                     color=harmonie_color,
                     linewidth=1.4,
                     label="_nolegend_",
                 )
                 ax_top.plot(
                     x_local,
-                    det_view["challenger_wind_speed"],
+                    det_plot["challenger_wind_speed"],
                     color=challenger_color,
                     linewidth=1.5,
                     label="_nolegend_",
                 )
                 ax_top.plot(
                     x_local,
-                    det_view["champion_wind_speed"],
+                    det_plot["champion_wind_speed"],
                     color=champion_color,
                     linewidth=1.5,
                     label="_nolegend_",
@@ -4026,10 +4137,10 @@ def save_model_gate_eval_history_plot(
                 )
                 ymax = np.nanmax(
                     [
-                        det_view["actual_wind_speed"].max(skipna=True),
-                        det_view["forecast_wind_speed"].max(skipna=True),
-                        det_view["challenger_wind_speed"].max(skipna=True),
-                        det_view["champion_wind_speed"].max(skipna=True),
+                        det_plot["actual_wind_speed"].max(skipna=True),
+                        det_plot["forecast_wind_speed"].max(skipna=True),
+                        det_plot["challenger_wind_speed"].max(skipna=True),
+                        det_plot["champion_wind_speed"].max(skipna=True),
                         1.0,
                     ]
                 )
@@ -4113,21 +4224,21 @@ def save_model_gate_eval_history_plot(
 
                 ax_bottom.plot(
                     x_local,
-                    det_view["forecast_abs_err"],
+                    det_plot["forecast_abs_err"],
                     color=harmonie_color,
                     linewidth=1.3,
                     label=f"Harmonie ({mae_forecast:.2f} kts)",
                 )
                 ax_bottom.plot(
                     x_local,
-                    det_view["challenger_abs_err"],
+                    det_plot["challenger_abs_err"],
                     color=challenger_color,
                     linewidth=1.4,
                     label=f"Challenger ({mae_chall:.2f} kts)",
                 )
                 ax_bottom.plot(
                     x_local,
-                    det_view["champion_abs_err"],
+                    det_plot["champion_abs_err"],
                     color=champion_color,
                     linewidth=1.4,
                     label=f"Champion ({mae_champ:.2f} kts)",
@@ -4166,9 +4277,9 @@ def save_model_gate_eval_history_plot(
                 ax_bottom.set_xlim(x_start_local, x_end_local)
                 mae_top = np.nanmax(
                     [
-                        det_view["forecast_abs_err"].max(skipna=True),
-                        det_view["challenger_abs_err"].max(skipna=True),
-                        det_view["champion_abs_err"].max(skipna=True),
+                        det_plot["forecast_abs_err"].max(skipna=True),
+                        det_plot["challenger_abs_err"].max(skipna=True),
+                        det_plot["champion_abs_err"].max(skipna=True),
                         mae_forecast,
                         mae_chall,
                         mae_champ,
@@ -4178,7 +4289,7 @@ def save_model_gate_eval_history_plot(
                 ax_bottom.set_ylim(0.0, max(3.5, float(mae_top) * 1.08))
                 date_locator = mdates.DayLocator(interval=3)
                 ax_bottom.xaxis.set_major_locator(date_locator)
-                ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+                ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d %b", tz=ZoneInfo(local_tz)))
                 ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
 
                 if direction_col is not None and direction_col in det_view.columns and det_view[direction_col].notna().any():
@@ -4296,6 +4407,8 @@ def save_model_gate_eval_history_plot(
                 bottom_legend.patch.set_edgecolor("none")
                 ax_bottom.add_artist(bottom_legend)
 
+                for ax in (ax_top, ax_bottom):
+                    ax.set_xlim(x_start_local, x_end_local)
                 fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.19)
                 fig.savefig(plot_png, dpi=150)
                 plt.close(fig)
@@ -4310,12 +4423,20 @@ def save_model_gate_eval_history_plot(
     for col in ["speed_mae_forecast", "speed_mae_champion", "speed_mae_challenger", "speed_eval_samples"]:
         hist[col] = pd.to_numeric(hist.get(col), errors="coerce")
     if "run_local_time" in hist.columns:
-        run_dt = pd.to_datetime(hist["run_local_time"], errors="coerce")
+        run_dt = pd.to_datetime(hist["run_local_time"], errors="coerce", utc=True).dt.tz_convert(ZoneInfo(local_tz))
     else:
         run_dt = _parse_iso_series_utc(hist.get("run_utc")).dt.tz_convert(ZoneInfo(local_tz))
     hist["run_dt"] = run_dt
     hist = hist.dropna(subset=["run_dt"]).sort_values("run_dt")
     if hist.empty:
+        return
+    display_window_days = 14
+    x_end_local = hist["run_dt"].dropna().max()
+    if pd.isna(x_end_local):
+        return
+    x_start_local = x_end_local - pd.Timedelta(days=display_window_days)
+    hist_view = hist[hist["run_dt"] >= x_start_local].copy()
+    if hist_view.empty:
         return
     fig, (ax_top, ax_bottom) = plt.subplots(
         2,
@@ -4339,8 +4460,8 @@ def save_model_gate_eval_history_plot(
         ["true", "1", "yes"]
     )
     ax_top.plot(
-        hist["run_dt"],
-        hist["speed_eval_samples"],
+        hist_view["run_dt"],
+        hist_view["speed_eval_samples"],
         color="#444444",
         linewidth=1.4,
         marker="o",
@@ -4348,9 +4469,10 @@ def save_model_gate_eval_history_plot(
         label="Holdout samples",
     )
     if promoted_speed.any():
+        promoted_view = promoted_speed.reindex(hist_view.index, fill_value=False)
         ax_top.scatter(
-            hist.loc[promoted_speed, "run_dt"],
-            hist.loc[promoted_speed, "speed_eval_samples"],
+            hist_view.loc[promoted_view, "run_dt"],
+            hist_view.loc[promoted_view, "speed_eval_samples"],
             color="#2ca02c",
             s=34,
             zorder=3,
@@ -4372,12 +4494,12 @@ def save_model_gate_eval_history_plot(
         color="black",
         clip_on=False,
     )
-    samples_top = np.nanmax([hist["speed_eval_samples"].max(skipna=True), 1.0])
+    samples_top = np.nanmax([hist_view["speed_eval_samples"].max(skipna=True), 1.0])
     ax_top.set_ylim(0.0, max(10.0, float(samples_top) * 1.08))
 
     ax_bottom.plot(
-        hist["run_dt"],
-        hist["speed_mae_champion"],
+        hist_view["run_dt"],
+        hist_view["speed_mae_champion"],
         color=champion_color,
         linewidth=1.4,
         marker="o",
@@ -4385,8 +4507,8 @@ def save_model_gate_eval_history_plot(
         label=champ_mae_label,
     )
     ax_bottom.plot(
-        hist["run_dt"],
-        hist["speed_mae_forecast"],
+        hist_view["run_dt"],
+        hist_view["speed_mae_forecast"],
         color=harmonie_color,
         linewidth=1.3,
         marker="o",
@@ -4394,8 +4516,8 @@ def save_model_gate_eval_history_plot(
         label=forecast_mae_label,
     )
     ax_bottom.plot(
-        hist["run_dt"],
-        hist["speed_mae_challenger"],
+        hist_view["run_dt"],
+        hist_view["speed_mae_challenger"],
         color=challenger_color,
         linewidth=1.4,
         marker="o",
@@ -4410,9 +4532,9 @@ def save_model_gate_eval_history_plot(
     ax_bottom.margins(x=0, y=0)
     ymax = np.nanmax(
         [
-            hist["speed_mae_forecast"].max(skipna=True),
-            hist["speed_mae_champion"].max(skipna=True),
-            hist["speed_mae_challenger"].max(skipna=True),
+            hist_view["speed_mae_forecast"].max(skipna=True),
+            hist_view["speed_mae_champion"].max(skipna=True),
+            hist_view["speed_mae_challenger"].max(skipna=True),
             1.0,
         ]
     )
@@ -4421,6 +4543,8 @@ def save_model_gate_eval_history_plot(
     ax_bottom.xaxis.set_major_locator(date_locator)
     ax_bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
     ax_bottom.tick_params(axis="x", labelrotation=20, labelsize=10, pad=6)
+    for ax in (ax_top, ax_bottom):
+        ax.set_xlim(x_start_local, x_end_local)
     fig.subplots_adjust(left=0.07, right=0.98, top=0.89, bottom=0.10)
     fig.savefig(plot_png, dpi=150)
     plt.close(fig)
@@ -4823,6 +4947,149 @@ def save_current_day_direction_performance_spider_plot(direction_csv: Path, plot
     plt.close(fig)
 
 
+def _json_ready_scalar(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, (np.floating, float)):
+        return None if not np.isfinite(float(value)) else float(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
+
+
+def _frame_to_json_records(frame: pd.DataFrame) -> list[dict]:
+    records: list[dict] = []
+    for row in frame.to_dict(orient="records"):
+        clean: dict = {}
+        for key, value in row.items():
+            clean[key] = _json_ready_scalar(value)
+        records.append(clean)
+    return records
+
+
+def _write_interactive_plot_assets(
+    web_out_dir: Path,
+    local_tz: str,
+    current_day_csv: Path,
+    next_day_csv: Path,
+    current_day_prior_prediction_tables: list[pd.DataFrame] | None = None,
+    prediction_generated_at_utc: str | None = None,
+    prediction_updated_at_utc: str | None = None,
+    model_trained_at_utc: str | None = None,
+) -> dict:
+    assets: dict[str, str] = {}
+
+    script_src = REPO_ROOT / "next_day_wind_model" / "web_dashboard" / "dashboard_interactive.js"
+    script_dst = web_out_dir / "dashboard_interactive.js"
+    if script_src.exists():
+        try:
+            if script_src.resolve() != script_dst.resolve():
+                shutil.copy2(script_src, script_dst)
+        except FileNotFoundError:
+            shutil.copy2(script_src, script_dst)
+    if script_dst.exists():
+        assets["dashboard_interactive_js"] = script_dst.name
+
+    if current_day_csv.exists():
+        frame = pd.read_csv(current_day_csv)
+        if "time_local" in frame.columns:
+            frame["time_local"] = pd.to_datetime(frame["time_local"], errors="coerce", utc=True)
+            frame = frame.dropna(subset=["time_local"]).copy()
+            frame["time_local"] = frame["time_local"].dt.tz_convert(ZoneInfo(local_tz)).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+            if "is_future" in frame.columns:
+                frame["is_future"] = (
+                    frame["is_future"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .isin(["true", "1", "yes"])
+                )
+
+            active_anchor_local = None
+            current_issue_anchor_local = None
+            pred_dt = _parse_iso_utc(prediction_generated_at_utc)
+            if pred_dt is not None:
+                current_issue_anchor_local = (
+                    pd.Timestamp(pred_dt).tz_convert(ZoneInfo(local_tz)).floor("h").strftime("%Y-%m-%dT%H:%M:%S%z")
+                )
+            if "is_future" in frame.columns:
+                future_rows = frame[frame["is_future"]]
+                if not future_rows.empty:
+                    first_future = pd.to_datetime(future_rows["time_local"], errors="coerce", utc=True).dropna().min()
+                    if pd.notna(first_future):
+                        active_anchor_local = (
+                            first_future.tz_convert(ZoneInfo(local_tz)) - pd.Timedelta(hours=1)
+                        ).strftime("%Y-%m-%dT%H:%M:%S%z")
+            if active_anchor_local is None:
+                active_anchor_local = current_issue_anchor_local
+            plot_meta_text = _format_plot_meta_text(
+                prediction_generated_at_utc or "",
+                prediction_updated_at_utc,
+                model_trained_at_utc,
+                local_tz,
+            )
+
+            prior_payload_rows: list[dict] = []
+            for idx, prior_frame_raw in enumerate(current_day_prior_prediction_tables or []):
+                if prior_frame_raw is None or prior_frame_raw.empty or "time_local" not in prior_frame_raw.columns:
+                    continue
+                prior_frame = prior_frame_raw.copy()
+                prior_frame["time_local"] = pd.to_datetime(prior_frame["time_local"], errors="coerce", utc=True)
+                prior_frame = prior_frame.dropna(subset=["time_local"]).copy()
+                if prior_frame.empty:
+                    continue
+                prior_frame["time_local"] = prior_frame["time_local"].dt.tz_convert(ZoneInfo(local_tz)).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+                if "issued_at_local" in prior_frame.columns:
+                    prior_frame["issued_at_local"] = (
+                        pd.to_datetime(prior_frame["issued_at_local"], errors="coerce", utc=True)
+                        .dt.tz_convert(ZoneInfo(local_tz))
+                        .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    )
+                elif "issued_at_utc" in prior_frame.columns:
+                    prior_frame["issued_at_local"] = (
+                        pd.to_datetime(prior_frame["issued_at_utc"], errors="coerce", utc=True)
+                        .dt.tz_convert(ZoneInfo(local_tz))
+                        .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    )
+                prior_frame["snapshot_index"] = idx
+                prior_payload_rows.extend(_frame_to_json_records(prior_frame))
+
+            payload = {
+                "plot_kind": "current_day",
+                "timezone": local_tz,
+                "metadata": {
+                    "active_anchor_local": active_anchor_local,
+                    "current_issue_anchor_local": current_issue_anchor_local,
+                    "plot_meta_text": plot_meta_text,
+                },
+                "rows": _frame_to_json_records(frame),
+                "prior_rows": prior_payload_rows,
+            }
+            json_path = web_out_dir / "current_day_interactive_data.json"
+            json_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+            assets["current_day_json"] = json_path.name
+
+    if next_day_csv.exists():
+        frame = pd.read_csv(next_day_csv)
+        if "target_time_local" in frame.columns:
+            frame["target_time_local"] = pd.to_datetime(frame["target_time_local"], errors="coerce", utc=True)
+            frame = frame.dropna(subset=["target_time_local"]).copy()
+            frame["target_time_local"] = frame["target_time_local"].dt.tz_convert(ZoneInfo(local_tz)).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+            payload = {
+                "plot_kind": "next_day",
+                "timezone": local_tz,
+                "metadata": {},
+                "rows": _frame_to_json_records(frame),
+            }
+            json_path = web_out_dir / "next_day_interactive_data.json"
+            json_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+            assets["next_day_json"] = json_path.name
+
+    return assets
+
+
 def publish_web_dashboard(
     web_out_dir: Path,
     local_tz: str,
@@ -4842,6 +5109,10 @@ def publish_web_dashboard(
     direction_spider_csv: Path | None,
     current_day_direction_spider_png: Path | None,
     current_day_direction_spider_csv: Path | None,
+    current_day_prior_prediction_tables: list[pd.DataFrame] | None = None,
+    prediction_generated_at_utc: str | None = None,
+    prediction_updated_at_utc: str | None = None,
+    model_trained_at_utc: str | None = None,
     companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -4873,6 +5144,30 @@ def publish_web_dashboard(
         shutil.copy2(src, dst)
         copied[dst_name] = str(dst)
 
+    for existing_name in ["model_gate_eval_history.png", "model_gate_eval_history.csv"]:
+        existing_path = web_out_dir / existing_name
+        if existing_name not in copied and existing_path.exists():
+            copied[existing_name] = str(existing_path)
+
+    interactive_assets = _write_interactive_plot_assets(
+        web_out_dir=web_out_dir,
+        local_tz=local_tz,
+        current_day_csv=current_day_csv,
+        next_day_csv=next_day_csv,
+        current_day_prior_prediction_tables=current_day_prior_prediction_tables,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_trained_at_utc,
+    )
+    if "dashboard_interactive_js" in interactive_assets:
+        copied[interactive_assets["dashboard_interactive_js"]] = str(
+            web_out_dir / interactive_assets["dashboard_interactive_js"]
+        )
+    if "current_day_json" in interactive_assets:
+        copied[interactive_assets["current_day_json"]] = str(web_out_dir / interactive_assets["current_day_json"])
+    if "next_day_json" in interactive_assets:
+        copied[interactive_assets["next_day_json"]] = str(web_out_dir / interactive_assets["next_day_json"])
+
     generated_local = datetime.now(ZoneInfo(local_tz))
     generated_local_str = generated_local.strftime("%d %B %Y %H:%M:%S %Z")
     cache_bust = int(datetime.now(timezone.utc).timestamp())
@@ -4901,6 +5196,21 @@ def publish_web_dashboard(
         f"daily_mae_history_mobile.png?v={cache_bust}"
         if "daily_mae_history_mobile.png" in copied
         else f"daily_mae_history.png?v={cache_bust}"
+    )
+    interactive_js_src = (
+        f"dashboard_interactive.js?v={cache_bust}"
+        if "dashboard_interactive.js" in copied
+        else ""
+    )
+    current_day_json_src = (
+        f"current_day_interactive_data.json?v={cache_bust}"
+        if "current_day_interactive_data.json" in copied
+        else ""
+    )
+    next_day_json_src = (
+        f"next_day_interactive_data.json?v={cache_bust}"
+        if "next_day_interactive_data.json" in copied
+        else ""
     )
     gate_eval_card = ""
     if "model_gate_eval_history.png" in copied:
@@ -4976,6 +5286,18 @@ def publish_web_dashboard(
     .direction-copy {{ padding: 4px 8px 4px 2px; }}
     .direction-plot img {{ max-width: 620px; margin: 0 auto; }}
     img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
+    .interactive-block {{ display: none; margin: 8px 0 8px 0; }}
+    .interactive-block.is-ready {{ display: block; }}
+    .interactive-block.is-ready + .interactive-fallback-note {{ display: none; }}
+    .interactive-plot {{ width: 100%; min-height: 520px; }}
+    .interactive-controls {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 6px 0; }}
+    .interactive-control-label {{ font-size: 13px; color: #444; font-weight: 600; }}
+    .interactive-control {{ border: 1px solid #aaa; border-radius: 4px; background: #fff; color: #111; font-size: 13px; padding: 5px 8px; }}
+    .interactive-control.is-active {{ border-color: #555; background: #e9e9e9; font-weight: 600; }}
+    .interactive-point-details {{ margin-top: 6px; border: 1px solid #ddd; border-radius: 6px; background: #f7f7f7; color: #222; font-size: 12px; line-height: 1.35; padding: 6px 8px; min-height: 38px; max-height: 56px; overflow: auto; }}
+    .js-plotly-plot .modebar {{ opacity: 0.3; transition: opacity 0.15s ease-in-out; }}
+    .js-plotly-plot:hover .modebar {{ opacity: 0.9; }}
+    .interactive-fallback-note {{ margin: 4px 0 8px 0; color: #666; font-size: 13px; }}
     @media (max-width: 768px) {{
       body {{ margin: 10px; }}
       .page-header {{ display: block; }}
@@ -4995,6 +5317,7 @@ def publish_web_dashboard(
       .direction-copy {{ padding: 0; }}
       .direction-plot img {{ max-width: none; margin: 0; }}
       img {{ max-height: 60vh; object-fit: contain; }}
+      .interactive-plot {{ min-height: 390px; }}
     }}
   </style>
 </head>
@@ -5017,7 +5340,21 @@ def publish_web_dashboard(
     <div class="card">
       <h2>Current-day prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
-      <picture>
+            <div
+                class="interactive-block"
+                data-interactive-wind-block="true"
+                data-plot-id="current-day-interactive-plot"
+                data-controls-id="current-day-interactive-controls"
+                data-details-id="current-day-interactive-details"
+                data-fallback-id="current-day-fallback"
+                data-json-url="{current_day_json_src}"
+            >
+                <div class="interactive-controls" id="current-day-interactive-controls"></div>
+                <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
+                <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
+            </div>
+            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
+            <picture id="current-day-fallback">
         <source media="(max-width: 768px)" srcset="{current_day_mobile_src}">
         <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
       </picture>
@@ -5025,7 +5362,21 @@ def publish_web_dashboard(
     <div class="card">
       <h2>Next-day prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
-      <picture>
+            <div
+                class="interactive-block"
+                data-interactive-wind-block="true"
+                data-plot-id="next-day-interactive-plot"
+                data-controls-id="next-day-interactive-controls"
+                data-details-id="next-day-interactive-details"
+                data-fallback-id="next-day-fallback"
+                data-json-url="{next_day_json_src}"
+            >
+                <div class="interactive-controls" id="next-day-interactive-controls"></div>
+                <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
+                <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
+            </div>
+            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
+            <picture id="next-day-fallback">
         <source media="(max-width: 768px)" srcset="{next_day_mobile_src}">
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
       </picture>
@@ -5040,6 +5391,15 @@ def publish_web_dashboard(
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
   </p>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+    {f'<script src="{interactive_js_src}" defer></script>' if interactive_js_src else ''}
+    <script>
+        window.addEventListener("DOMContentLoaded", function () {{
+            if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {{
+                window.WindDashboardInteractive.initInteractiveWindDashboard();
+            }}
+        }});
+    </script>
 </body>
 </html>
 """
@@ -5815,14 +6175,14 @@ def main() -> None:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             gate_eval_details_csv = details_dir / f"{stamp}_model_gate_eval_speed.csv"
 
-            anchor_ns = speed_eval_anchor_times_utc.astype("int64").to_numpy()
-            target_ns = (
-                np.repeat(anchor_ns, horizon)
-                + np.tile(np.arange(1, horizon + 1, dtype=np.int64), n_eval) * 3_600_000_000_000
+            target_times_utc = pd.to_datetime(
+                np.asarray(speed_arrays_full["target_times_all"][speed_eval_start:]).reshape(-1),
+                errors="coerce",
+                utc=True,
             )
             raw_eval = pd.DataFrame(
                 {
-                    "target_time_utc": pd.to_datetime(target_ns, utc=True),
+                    "target_time_utc": target_times_utc,
                     "actual_wind_speed": speed_actual_eval.reshape(-1).astype(float),
                     "forecast_wind_speed": speed_forecast_eval.reshape(-1).astype(float),
                     "forecast_wind_dir_deg": speed_forecast_dir_eval.reshape(-1).astype(float),
@@ -5830,6 +6190,7 @@ def main() -> None:
                     "champion_wind_speed": champion_speed_eval_pred.reshape(-1).astype(float),
                 }
             )
+            raw_eval = raw_eval.dropna(subset=["target_time_utc"])
             agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
             direction_by_target = raw_eval.groupby("target_time_utc")["forecast_wind_dir_deg"].agg(
                 _circular_mean_deg
@@ -6442,10 +6803,22 @@ def main() -> None:
             daily_mae_png_mobile_src = daily_mae_png_mobile_refresh
         if gate_eval_history_csv_src is None and gate_eval_history_csv.exists():
             gate_eval_history_csv_src = gate_eval_history_csv
+        if gate_eval_history_csv_src is None:
+            artifact_history_csv = model_artifact_dir / "model_gate_eval_history.csv"
+            if artifact_history_csv.exists():
+                gate_eval_history_csv_src = artifact_history_csv
+        if gate_eval_history_png_src is None and gate_eval_history_png.exists():
+            gate_eval_history_png_src = gate_eval_history_png
         if gate_eval_details_csv_src is None:
             details_dir = out_dir / "model_gate_eval_details"
             if details_dir.exists():
                 detail_files = sorted(details_dir.glob("*_model_gate_eval_speed.csv"))
+                if detail_files:
+                    gate_eval_details_csv_src = detail_files[-1]
+        if gate_eval_details_csv_src is None:
+            artifact_details_dir = model_artifact_dir / "model_gate_eval_details"
+            if artifact_details_dir.exists():
+                detail_files = sorted(artifact_details_dir.glob("*_model_gate_eval_speed.csv"))
                 if detail_files:
                     gate_eval_details_csv_src = detail_files[-1]
         if gate_eval_direction_csv_src is None:
@@ -6495,6 +6868,10 @@ def main() -> None:
             direction_spider_csv=gate_eval_direction_csv_src,
             current_day_direction_spider_png=current_day_direction_spider_png_src,
             current_day_direction_spider_csv=current_day_direction_csv_src,
+            current_day_prior_prediction_tables=current_day_prior_prediction_tables,
+            prediction_generated_at_utc=prediction_generated_at_utc,
+            prediction_updated_at_utc=prediction_updated_at_utc,
+            model_trained_at_utc=model_last_trained_at_utc,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:

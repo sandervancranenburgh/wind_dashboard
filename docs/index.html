@@ -25,6 +25,18 @@
     .direction-copy { padding: 4px 8px 4px 2px; }
     .direction-plot img { max-width: 620px; margin: 0 auto; }
     img { width: 100%; height: auto; display: block; border-radius: 6px; }
+    .interactive-block { display: none; margin: 8px 0 8px 0; }
+    .interactive-block.is-ready { display: block; }
+    .interactive-block.is-ready + .interactive-fallback-note { display: none; }
+    .interactive-plot { width: 100%; min-height: 520px; }
+    .interactive-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 6px 0; }
+    .interactive-control-label { font-size: 13px; color: #444; font-weight: 600; }
+    .interactive-control { border: 1px solid #aaa; border-radius: 4px; background: #fff; color: #111; font-size: 13px; padding: 5px 8px; }
+    .interactive-control.is-active { border-color: #555; background: #e9e9e9; font-weight: 600; }
+    .interactive-point-details { margin-top: 6px; border: 1px solid #ddd; border-radius: 6px; background: #f7f7f7; color: #222; font-size: 12px; line-height: 1.35; padding: 6px 8px; min-height: 38px; max-height: 56px; overflow: auto; }
+    .js-plotly-plot .modebar { opacity: 0.3; transition: opacity 0.15s ease-in-out; }
+    .js-plotly-plot:hover .modebar { opacity: 0.9; }
+    .interactive-fallback-note { margin: 4px 0 8px 0; color: #666; font-size: 13px; }
     @media (max-width: 768px) {
       body { margin: 10px; }
       .page-header { display: block; }
@@ -44,6 +56,7 @@
       .direction-copy { padding: 0; }
       .direction-plot img { max-width: none; margin: 0; }
       img { max-height: 60vh; object-fit: contain; }
+      .interactive-plot { min-height: 390px; }
     }
   </style>
 </head>
@@ -51,7 +64,7 @@
   <header class="page-header">
     <div>
       <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
-      <p class="meta">Last updated: 27 May 2026 15:51:45 CEST</p>
+      <p class="meta">Last updated: 27 May 2026 15:57:52 CEST</p>
     </div>
 
     <nav class="dashboard-actions" aria-label="Rider portal">
@@ -71,17 +84,45 @@
     <div class="card">
       <h2>Current-day prediction</h2>
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
-      <picture>
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1779889905">
-        <img src="current_day_predictions.png?v=1779889905" alt="Current day prediction">
+            <div
+                class="interactive-block"
+                data-interactive-wind-block="true"
+                data-plot-id="current-day-interactive-plot"
+                data-controls-id="current-day-interactive-controls"
+                data-details-id="current-day-interactive-details"
+                data-fallback-id="current-day-fallback"
+                data-json-url="current_day_interactive_data.json?v=1779890272"
+            >
+                <div class="interactive-controls" id="current-day-interactive-controls"></div>
+                <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
+                <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
+            </div>
+            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
+            <picture id="current-day-fallback">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1779890272">
+        <img src="current_day_predictions.png?v=1779890272" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
       <h2>Next-day prediction</h2>
       <p class="desc">Day-ahead forecast for tomorrow: Harmonie baseline versus the super-local model for wind speed and direction.</p>
-      <picture>
-        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1779889905">
-        <img src="next_day_predictions.png?v=1779889905" alt="Next day prediction">
+            <div
+                class="interactive-block"
+                data-interactive-wind-block="true"
+                data-plot-id="next-day-interactive-plot"
+                data-controls-id="next-day-interactive-controls"
+                data-details-id="next-day-interactive-details"
+                data-fallback-id="next-day-fallback"
+                data-json-url="next_day_interactive_data.json?v=1779890272"
+            >
+                <div class="interactive-controls" id="next-day-interactive-controls"></div>
+                <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
+                <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
+            </div>
+            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
+            <picture id="next-day-fallback">
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1779890272">
+        <img src="next_day_predictions.png?v=1779890272" alt="Next day prediction">
       </picture>
     </div>
 
@@ -94,7 +135,7 @@
         <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, SE, NE, S winds; the largest gain is 1.9 kts for E. For that sector the super-local model overestimates by 0.3 kts on average. The advantage is smallest, or negative, for NW, N winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="current_day_direction_spider.png?v=1779889905" alt="Current-day prediction performance by wind direction">
+        <img src="current_day_direction_spider.png?v=1779890272" alt="Current-day prediction performance by wind direction">
       </div>
     </div>
 
@@ -104,7 +145,7 @@
         <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for SE, E, NE, S winds. The advantage is smallest for SW, W winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="model_gate_direction_spider.png?v=1779889905" alt="Next-day prediction performance by wind direction">
+        <img src="model_gate_direction_spider.png?v=1779890272" alt="Next-day prediction performance by wind direction">
       </div>
     </div>
     </section>
@@ -112,7 +153,7 @@
     <div class="card">
       <h2>Model-gate evaluation history</h2>
       <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
-      <img src="model_gate_eval_history.png?v=1779889905" alt="Model gate evaluation history">
+      <img src="model_gate_eval_history.png?v=1779890272" alt="Model gate evaluation history">
     </div>
   </div>
   <p class="overview overview-mobile">
@@ -122,5 +163,14 @@
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
   </p>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+    
+    <script>
+        window.addEventListener("DOMContentLoaded", function () {
+            if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {
+                window.WindDashboardInteractive.initInteractiveWindDashboard();
+            }
+        });
+    </script>
 </body>
 </html>

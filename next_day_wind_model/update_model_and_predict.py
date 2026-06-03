@@ -1435,7 +1435,7 @@ def _draw_sufficient_wind_threshold(ax: plt.Axes) -> None:
 
 def _load_observations_raw(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
     query = """
-    SELECT ts, wind_speed, wind_dir, payload
+    SELECT ts, wind_speed, wind_gust, wind_dir, payload
     FROM observations
     WHERE site = ?
       AND ts IS NOT NULL
@@ -1443,39 +1443,53 @@ def _load_observations_raw(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
     """
     rows = conn.execute(query, (site,)).fetchall()
     if not rows:
-        return pd.DataFrame(columns=["actual_avg", "actual_dir"])
+        return pd.DataFrame(columns=["actual_avg", "actual_min", "actual_max", "actual_dir"])
+
+    def payload_value(payload: dict, *keys: str):
+        for key in keys:
+            if key in payload and payload.get(key) is not None:
+                return payload.get(key)
+        return None
+
+    def as_float(value) -> float:
+        try:
+            return float(value) if value is not None else np.nan
+        except (TypeError, ValueError):
+            return np.nan
 
     records: list[dict] = []
-    for ts, wind_speed, wind_dir, payload_raw in rows:
+    for ts, wind_speed, wind_gust, wind_dir, payload_raw in rows:
         payload = {}
         if payload_raw:
             try:
                 payload = json.loads(payload_raw)
             except json.JSONDecodeError:
                 payload = {}
-        avg = payload.get("AverageWind")
-        if avg is None:
-            avg = payload.get("WindSpeedAvg")
+        avg = payload_value(payload, "AverageWind", "WindSpeedAvg")
         if avg is None:
             avg = wind_speed
-        direc = payload.get("WindDirection")
+        min_wind = payload_value(payload, "MinWind", "WindSpeedMin")
+        max_wind = payload_value(payload, "MaxWind", "WindSpeedMax")
+        if max_wind is None:
+            max_wind = wind_gust
+        direc = payload_value(payload, "WindDirection")
         if direc is None:
             direc = wind_dir
-        try:
-            avg_f = float(avg) if avg is not None else np.nan
-        except (TypeError, ValueError):
-            avg_f = np.nan
-        try:
-            dir_f = float(direc) if direc is not None else np.nan
-        except (TypeError, ValueError):
-            dir_f = np.nan
-        records.append({"obs_ts": int(ts), "actual_avg": avg_f, "actual_dir": dir_f})
+        records.append(
+            {
+                "obs_ts": int(ts),
+                "actual_avg": as_float(avg),
+                "actual_min": as_float(min_wind),
+                "actual_max": as_float(max_wind),
+                "actual_dir": as_float(direc),
+            }
+        )
 
     out = pd.DataFrame.from_records(records)
     out["obs_dt"] = pd.to_datetime(out["obs_ts"], unit="ms", utc=True)
     out = out.set_index("obs_dt").sort_index()
     out = out[~out.index.duplicated(keep="last")]
-    return out[["actual_avg", "actual_dir"]]
+    return out[["actual_avg", "actual_min", "actual_max", "actual_dir"]]
 
 
 def _interp_hourly_to_dense(hourly_values: np.ndarray, hourly_index: pd.DatetimeIndex, dense_index: pd.DatetimeIndex) -> np.ndarray:
@@ -2028,23 +2042,25 @@ def build_current_day_table(
 
     # Actual measurements at higher cadence (latest known values up to now).
     actual_day_raw = obs_raw_local[(obs_raw_local.index >= day_start_local) & (obs_raw_local.index <= now_local)]
-    actual_speed_dense = (
-        actual_day_raw["actual_avg"]
-        .reindex(actual_day_raw.index.union(dense_times))
-        .sort_index()
-        .ffill()
-        .reindex(dense_times)
-        .to_numpy(dtype=np.float32)
-    )
-    actual_dir_dense = (
-        actual_day_raw["actual_dir"]
-        .reindex(actual_day_raw.index.union(dense_times))
-        .sort_index()
-        .ffill()
-        .reindex(dense_times)
-        .to_numpy(dtype=np.float32)
-    )
+    def forward_fill_actual(col: str) -> np.ndarray:
+        if col not in actual_day_raw.columns:
+            return np.full(len(dense_times), np.nan, dtype=np.float32)
+        return (
+            actual_day_raw[col]
+            .reindex(actual_day_raw.index.union(dense_times))
+            .sort_index()
+            .ffill()
+            .reindex(dense_times)
+            .to_numpy(dtype=np.float32)
+        )
+
+    actual_speed_dense = forward_fill_actual("actual_avg")
+    actual_min_dense = forward_fill_actual("actual_min")
+    actual_max_dense = forward_fill_actual("actual_max")
+    actual_dir_dense = forward_fill_actual("actual_dir")
     actual_speed_dense = np.where(dense_times <= now_local, actual_speed_dense, np.nan).astype(np.float32)
+    actual_min_dense = np.where(dense_times <= now_local, actual_min_dense, np.nan).astype(np.float32)
+    actual_max_dense = np.where(dense_times <= now_local, actual_max_dense, np.nan).astype(np.float32)
     actual_dir_dense = np.where(dense_times <= now_local, actual_dir_dense, np.nan).astype(np.float32)
 
     table = pd.DataFrame(
@@ -2055,6 +2071,8 @@ def build_current_day_table(
             "forecast_wind_max": fc_max_dense,
             "forecast_wind_dir_deg": fc_dir_dense,
             "actual_wind_speed": actual_speed_dense,
+            "actual_wind_min": actual_min_dense,
+            "actual_wind_max": actual_max_dense,
             "actual_wind_dir_deg": actual_dir_dense,
             "lstm_pred_wind_speed_full": lstm_full_dense,
             "lstm_pred_wind_dir_deg_full": lstm_dir_full_dense,
@@ -2183,49 +2201,31 @@ def save_current_day_plot(
     first_dt = table["time_local"].iloc[0]
     day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
 
-    speed_series = pd.concat(
-        [
-            table["forecast_wind_min"].dropna(),
-            table["forecast_wind_max"].dropna(),
-            table["forecast_wind_speed"].dropna(),
-            table["lstm_pred_wind_speed_full"].dropna(),
-            table["lstm_pred_wind_speed"].dropna(),
-            table["actual_wind_speed"].dropna(),
-        ]
-    )
-    y_min = float(speed_series.min()) if not speed_series.empty else 0.0
-    y_max = max(float(speed_series.max()) if not speed_series.empty else 0.0, SUFFICIENT_WIND_THRESHOLD_KTS)
-    pad = max((y_max - y_min) * 0.08, 0.8)
-    y_lower = 0.0
-    y_upper = y_max + pad
-
-    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
-    title_fs = 14 if mobile else None
-    title_pad = 18 if mobile else 28
-    label_fs = 12 if mobile else None
-    tick_fs = 11 if mobile else None
-    legend_fs = 10 if mobile else None
-    meta_fs = 10 if mobile else 9
-    mae_fs = 11 if mobile else 10
-    meta_text_y = 1.19 if mobile else 1.16
-    metric_box_y = 1.29 if mobile else 1.24
-    fig, ax = plt.subplots(figsize=fig_size)
-    _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
-    _draw_sufficient_wind_threshold(ax)
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
     fc_avg = table["forecast_wind_speed"].to_numpy(dtype=float)
     actual_avg = table["actual_wind_speed"].to_numpy(dtype=float)
-    ax.plot(
-        x,
-        actual_avg,
-        marker="o",
-        markersize=2.2,
-        color="magenta",
-        linewidth=2.2,
-        label="_nolegend_",
-        zorder=5,
+    actual_min = (
+        pd.to_numeric(table["actual_wind_min"], errors="coerce").to_numpy(dtype=float)
+        if "actual_wind_min" in table.columns
+        else np.full(len(table), np.nan, dtype=float)
     )
+    actual_max = (
+        pd.to_numeric(table["actual_wind_max"], errors="coerce").to_numpy(dtype=float)
+        if "actual_wind_max" in table.columns
+        else np.full(len(table), np.nan, dtype=float)
+    )
+    has_actual_avg = bool(np.any(~np.isnan(actual_avg)))
+    actual_trend = (
+        pd.Series(actual_avg, index=pd.DatetimeIndex(table["time_local"]))
+        .rolling("30min", min_periods=1)
+        .mean()
+        .to_numpy(dtype=float)
+        if has_actual_avg
+        else np.full(len(table), np.nan, dtype=float)
+    )
+    has_actual_trend = bool(np.any(~np.isnan(actual_trend)))
+    has_actual_minmax = bool(np.any(~np.isnan(actual_min)) or np.any(~np.isnan(actual_max)))
 
     current_issue_dt = _parse_iso_utc(prediction_generated_at_utc)
     if current_issue_dt is None:
@@ -2275,6 +2275,122 @@ def save_current_day_plot(
     if current_comparison_frame is None or current_comparison_frame.empty:
         current_comparison_frame = _prepare_branch_frame(table, fallback_issue_anchor=current_issue_anchor)[1]
         current_harmonie_anchor = current_issue_anchor
+
+    # Keep the static dashboard scale primarily forecast-based so it stays
+    # stable through the day. Measured values are only a safeguard against
+    # clipping observations that exceed the forecast-based range. Harmonie
+    # max-speed is a secondary uncertainty/gust-like line and is intentionally
+    # excluded from the hard y-limit, so it may be clipped.
+    forecast_core_parts = [
+        table["forecast_wind_speed"].dropna(),
+        table["lstm_pred_wind_speed"].dropna(),
+        table["lstm_pred_wind_speed_full"].dropna(),
+    ]
+    measured_safeguard_parts = [
+        table["actual_wind_speed"].dropna(),
+        pd.Series(actual_min).dropna(),
+        pd.Series(actual_max).dropna(),
+        pd.Series(actual_trend).dropna(),
+    ]
+    harmonie_max_parts = [table["forecast_wind_max"].dropna()]
+    for _issue_anchor, overlay in historical_branches:
+        if "lstm_pred_wind_speed" in overlay.columns:
+            forecast_core_parts.append(pd.to_numeric(overlay["lstm_pred_wind_speed"], errors="coerce").dropna())
+        if "forecast_wind_speed" in overlay.columns:
+            forecast_core_parts.append(pd.to_numeric(overlay["forecast_wind_speed"], errors="coerce").dropna())
+        if "forecast_wind_max" in overlay.columns:
+            harmonie_max_parts.append(pd.to_numeric(overlay["forecast_wind_max"], errors="coerce").dropna())
+
+    forecast_core_nonempty = [part.dropna() for part in forecast_core_parts if len(part.dropna())]
+    measured_safeguard_nonempty = [
+        part.dropna() for part in measured_safeguard_parts if len(part.dropna())
+    ]
+    harmonie_max_nonempty = [part.dropna() for part in harmonie_max_parts if len(part.dropna())]
+    forecast_core_series = (
+        pd.concat(forecast_core_nonempty) if forecast_core_nonempty else pd.Series(dtype=float)
+    )
+    measured_safeguard_series = (
+        pd.concat(measured_safeguard_nonempty)
+        if measured_safeguard_nonempty
+        else pd.Series(dtype=float)
+    )
+    harmonie_max_series = (
+        pd.concat(harmonie_max_nonempty) if harmonie_max_nonempty else pd.Series(dtype=float)
+    )
+    forecast_core_max = float(forecast_core_series.max()) if not forecast_core_series.empty else 0.0
+    measured_safeguard_max = (
+        float(measured_safeguard_series.max()) if not measured_safeguard_series.empty else 0.0
+    )
+    harmonie_max_diagnostic = float(harmonie_max_series.max()) if not harmonie_max_series.empty else 0.0
+    y_max_included = max(forecast_core_max, measured_safeguard_max)
+    y_upper_raw = max(y_max_included * 1.10, SUFFICIENT_WIND_THRESHOLD_KTS + 0.8, 10.0)
+    y_lower = 0.0
+    y_upper = float(np.ceil(y_upper_raw / 2.5) * 2.5)
+    if not mobile:
+        print(
+            "Static current-day y-axis | "
+            f"forecast_core_max={forecast_core_max:.2f} "
+            f"measured_safeguard_max={measured_safeguard_max:.2f} "
+            f"harmonie_max={harmonie_max_diagnostic:.2f} "
+            f"y_upper={y_upper:.2f} "
+            f"harmonie_max_clipped={harmonie_max_diagnostic > y_upper}"
+        )
+
+    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
+    title_fs = 14 if mobile else None
+    title_pad = 18 if mobile else 28
+    label_fs = 12 if mobile else None
+    tick_fs = 11 if mobile else None
+    legend_fs = 10 if mobile else None
+    meta_fs = 10 if mobile else 9
+    mae_fs = 11 if mobile else 10
+    meta_text_y = 1.19 if mobile else 1.16
+    metric_box_y = 1.29 if mobile else 1.24
+    fig, ax = plt.subplots(figsize=fig_size)
+    _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
+    _draw_sufficient_wind_threshold(ax)
+    if np.any(~np.isnan(actual_min)):
+        ax.plot(
+            x,
+            actual_min,
+            color="magenta",
+            linestyle=(0, (1.2, 1.2)),
+            linewidth=1.35 if mobile else 1.2,
+            alpha=0.62,
+            label="_nolegend_",
+            zorder=4.6,
+        )
+    if np.any(~np.isnan(actual_max)):
+        ax.plot(
+            x,
+            actual_max,
+            color="magenta",
+            linestyle=(0, (1.2, 1.2)),
+            linewidth=1.35 if mobile else 1.2,
+            alpha=0.62,
+            label="_nolegend_",
+            zorder=4.6,
+        )
+    ax.plot(
+        x,
+        actual_avg,
+        marker="o",
+        markersize=2.2,
+        color="magenta",
+        linewidth=2.2,
+        label="_nolegend_",
+        zorder=5,
+    )
+    if has_actual_trend:
+        ax.plot(
+            x,
+            actual_trend,
+            color="#b000b8",
+            linewidth=1.8 if mobile else 1.7,
+            alpha=0.82,
+            label="_nolegend_",
+            zorder=5.25,
+        )
 
     historical_superlocal_plotted = False
     historical_harmonie_plotted = False
@@ -2477,7 +2593,7 @@ def save_current_day_plot(
             marker="o",
             markersize=4.2 if mobile else 3.6,
         ),
-        "Super local - current forecast": Line2D(
+        "Super local forecast": Line2D(
             [0],
             [0],
             color=SUPERLOCAL_FORECAST_COLOR,
@@ -2488,7 +2604,7 @@ def save_current_day_plot(
             markeredgecolor="white",
             markeredgewidth=0.7,
         ),
-        "Harmonie - current forecast": Line2D(
+        "Harmonie forecast": Line2D(
             [0],
             [0],
             color="#555555",
@@ -2499,40 +2615,12 @@ def save_current_day_plot(
             markeredgecolor="white",
             markeredgewidth=0.7,
         ),
-        "Harmonie - max speed": Line2D(
-            [0],
-            [0],
-            color="#666666",
-            linewidth=1.2,
-            linestyle="--",
-        ),
     }
     desired_order = [
         "Measured wind",
-        "Super local - current forecast",
-        "Super local - prior issued forecasts",
-        "Harmonie - current forecast",
-        "Harmonie - prior issued forecasts",
-        "Harmonie - max speed",
+        "Super local forecast",
+        "Harmonie forecast",
     ]
-    if historical_superlocal_plotted:
-        order_map["Super local - prior issued forecasts"] = Line2D(
-            [0],
-            [0],
-            color=SUPERLOCAL_FORECAST_COLOR,
-            linestyle=(0, (4.8, 1.8)),
-            linewidth=2.15 if mobile else 1.9,
-            alpha=0.84,
-        )
-    if historical_harmonie_plotted:
-        order_map["Harmonie - prior issued forecasts"] = Line2D(
-            [0],
-            [0],
-            color="#8a8a8a",
-            linestyle=(0, (3.4, 1.6)),
-            linewidth=2.0 if mobile else 1.8,
-            alpha=0.8,
-        )
     ordered_handles = [order_map[label] for label in desired_order if label in order_map]
     ordered_labels = [label for label in desired_order if label in order_map]
     ax.legend(
@@ -3410,6 +3498,93 @@ def load_latest_current_day_snapshot(
     if snap.empty:
         return None
     return snap.sort_values("time_local").reset_index(drop=True)
+
+
+def compute_current_day_table_mae(table: pd.DataFrame) -> dict:
+    """Compute a display-only current-day MAE fallback from the generated table.
+
+    This is used when prediction-log based completed-interval scoring is not
+    available, for example in dev/test runs where logging is skipped. It does
+    not write data or affect model training/prediction logic.
+    """
+    empty_summary = {
+        "available": False,
+        "point_count": 0,
+        "measurement_point_count": 0,
+        "completed_interval_count": 0,
+        "partial_current_interval_included": True,
+        "mae_superlocal": None,
+        "mae_harmonie": None,
+        "rmse_superlocal": None,
+        "rmse_harmonie": None,
+        "model_win_rate": None,
+        "source": "current_day_table",
+        "segments": [],
+    }
+    if table is None or table.empty:
+        return empty_summary
+    required_cols = ["actual_wind_speed", "forecast_wind_speed"]
+    if any(col not in table.columns for col in required_cols):
+        return empty_summary
+    frame = table.copy()
+    actual = pd.to_numeric(frame["actual_wind_speed"], errors="coerce")
+    harmonie = pd.to_numeric(frame["forecast_wind_speed"], errors="coerce")
+    if "lstm_pred_wind_speed_full" in frame.columns:
+        superlocal = pd.to_numeric(frame["lstm_pred_wind_speed_full"], errors="coerce")
+    elif "lstm_pred_wind_speed" in frame.columns:
+        superlocal = pd.to_numeric(frame["lstm_pred_wind_speed"], errors="coerce")
+    else:
+        return empty_summary
+
+    valid = actual.notna() & harmonie.notna() & superlocal.notna()
+    if "is_future" in frame.columns:
+        is_future = (
+            frame["is_future"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+        valid &= ~is_future
+    if not bool(valid.any()):
+        return empty_summary
+
+    model_abs = np.abs(superlocal[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
+    harmonie_abs = np.abs(harmonie[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
+    model_sq = np.square(superlocal[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
+    harmonie_sq = np.square(harmonie[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
+    finite = (
+        ~np.isnan(model_abs)
+        & ~np.isnan(harmonie_abs)
+        & ~np.isnan(model_sq)
+        & ~np.isnan(harmonie_sq)
+    )
+    if not np.any(finite):
+        return empty_summary
+    model_abs = model_abs[finite]
+    harmonie_abs = harmonie_abs[finite]
+    model_sq = model_sq[finite]
+    harmonie_sq = harmonie_sq[finite]
+    return {
+        "available": True,
+        "point_count": int(len(model_abs)),
+        "measurement_point_count": int(len(model_abs)),
+        "completed_interval_count": 1,
+        "partial_current_interval_included": True,
+        "mae_superlocal": float(np.mean(model_abs)),
+        "mae_harmonie": float(np.mean(harmonie_abs)),
+        "rmse_superlocal": float(np.sqrt(np.mean(model_sq))),
+        "rmse_harmonie": float(np.sqrt(np.mean(harmonie_sq))),
+        "model_win_rate": float(np.mean(model_abs < harmonie_abs)),
+        "source": "current_day_table",
+        "segments": [
+            {
+                "measurement_point_count": int(len(model_abs)),
+                "point_count": int(len(model_abs)),
+                "source": "current_day_table",
+            }
+        ],
+    }
 
 
 def compute_current_day_completed_interval_mae(
@@ -6673,6 +6848,8 @@ def main() -> None:
             local_tz=args.local_timezone,
             prior_prediction_tables=current_day_prior_prediction_tables,
         )
+        if not current_day_live_monitoring_metric.get("available", False):
+            current_day_live_monitoring_metric = compute_current_day_table_mae(current_day_table)
         current_day_direction_csv = out_dir / "current_day_eval_speed_by_direction.csv"
         current_day_direction_spider_png = out_dir / "current_day_direction_spider.png"
         if save_current_day_direction_performance_csv(

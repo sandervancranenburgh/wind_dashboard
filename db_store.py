@@ -26,12 +26,16 @@ SPOT_TO_SITE = {
     "Oostvoornse meer": "oostvoorne",
 }
 SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
+    "visibility": "TEXT NOT NULL DEFAULT 'private'",
     "min_measured_wind_speed": "REAL",
     "mean_measured_direction": "REAL",
     "mean_measured_direction_label": "TEXT",
     "avg_forecast_temperature": "REAL",
     "min_forecast_temperature": "REAL",
     "max_forecast_temperature": "REAL",
+}
+USER_PROFILE_OPTIONAL_COLUMNS = {
+    "public_username": "TEXT",
 }
 
 
@@ -327,6 +331,7 @@ def init_account_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS user_profiles (
             user_id INTEGER PRIMARY KEY,
+            public_username TEXT,
             rider_name TEXT,
             rider_weight INTEGER,
             default_spot TEXT,
@@ -368,6 +373,7 @@ def init_account_db(conn: sqlite3.Connection) -> None:
             avg_forecast_temperature REAL,
             min_forecast_temperature REAL,
             max_forecast_temperature REAL,
+            visibility TEXT NOT NULL DEFAULT 'private',
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )
         """
@@ -376,8 +382,13 @@ def init_account_db(conn: sqlite3.Connection) -> None:
     for column_name, column_type in SURF_EXPERIENCE_OPTIONAL_COLUMNS.items():
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE surf_experiences ADD COLUMN {column_name} {column_type}")
+    existing_profile_columns = _table_columns(conn, "user_profiles")
+    for column_name, column_type in USER_PROFILE_OPTIONAL_COLUMNS.items():
+        if column_name not in existing_profile_columns:
+            conn.execute(f"ALTER TABLE user_profiles ADD COLUMN {column_name} {column_type}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_user_date ON surf_experiences(user_id, date, start_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_visibility_date ON surf_experiences(visibility, date, start_time)")
     conn.commit()
 
 
@@ -434,6 +445,10 @@ def _square_or_none(value: Optional[float]) -> Optional[float]:
         return None
     value_f = float(value)
     return value_f * value_f
+
+
+def _submission_visibility(value: Any) -> str:
+    return "public" if str(value or "").strip().lower() == "public" else "private"
 
 
 def guess_timestamp_ms(d: Dict[str, Any]) -> Optional[int]:
@@ -1875,7 +1890,7 @@ def mark_user_login(conn: sqlite3.Connection, user_id: int) -> None:
 def get_user_profile(conn: sqlite3.Connection, user_id: int) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         """
-        SELECT user_id, rider_name, rider_weight, default_spot, updated_ts, updated_iso
+        SELECT user_id, public_username, rider_name, rider_weight, default_spot, updated_ts, updated_iso
         FROM user_profiles
         WHERE user_id = ?
         """,
@@ -1885,17 +1900,19 @@ def get_user_profile(conn: sqlite3.Connection, user_id: int) -> Optional[Dict[st
         return None
     return {
         "user_id": int(row[0]),
-        "rider_name": row[1] or "",
-        "rider_weight": row[2],
-        "default_spot": row[3] or "",
-        "updated_ts": row[4],
-        "updated_iso": row[5],
+        "public_username": row[1] or "",
+        "rider_name": row[2] or "",
+        "rider_weight": row[3],
+        "default_spot": row[4] or "",
+        "updated_ts": row[5],
+        "updated_iso": row[6],
     }
 
 
 def upsert_user_profile(
     conn: sqlite3.Connection,
     user_id: int,
+    public_username: str,
     rider_name: str,
     rider_weight: Optional[int],
     default_spot: str,
@@ -1904,10 +1921,11 @@ def upsert_user_profile(
     conn.execute(
         """
         INSERT INTO user_profiles(
-            user_id, rider_name, rider_weight, default_spot, updated_ts, updated_iso
+            user_id, public_username, rider_name, rider_weight, default_spot, updated_ts, updated_iso
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
+            public_username = excluded.public_username,
             rider_name = excluded.rider_name,
             rider_weight = excluded.rider_weight,
             default_spot = excluded.default_spot,
@@ -1916,6 +1934,7 @@ def upsert_user_profile(
         """,
         (
             int(user_id),
+            public_username.strip() or None,
             rider_name.strip() or None,
             rider_weight,
             default_spot or None,
@@ -2332,9 +2351,9 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             measured_wind_point_count, avg_measured_wind_speed, max_measured_wind_speed,
             min_measured_wind_speed, avg_measured_wind_dir, mean_measured_direction,
             mean_measured_direction_label, avg_forecast_temperature,
-            min_forecast_temperature, max_forecast_temperature
+            min_forecast_temperature, max_forecast_temperature, visibility
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(experience["user_id"]),
@@ -2365,6 +2384,7 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             temperature_summary.get("avg_temperature"),
             temperature_summary.get("min_temperature"),
             temperature_summary.get("max_temperature"),
+            _submission_visibility(experience.get("visibility")),
         ),
     )
     conn.commit()
@@ -2392,7 +2412,8 @@ def update_surf_experience(
             rider_weight = ?,
             wing_size = ?,
             foil_size = ?,
-            rider_notes = ?
+            rider_notes = ?,
+            visibility = ?
         WHERE id = ?
           AND user_id = ?
         """,
@@ -2410,6 +2431,7 @@ def update_surf_experience(
             int(experience["wing_size"]),
             int(experience["foil_size"]),
             experience.get("rider_notes") or None,
+            _submission_visibility(experience.get("visibility")),
             int(experience_id),
             int(user_id),
         ),
@@ -2558,122 +2580,158 @@ def list_surf_experiences(
     user_id: int,
     sort_key: str = "date",
     sort_dir: str = "desc",
+    scope: str = "mine",
 ) -> List[Dict[str, Any]]:
     allowed_sort = {
-        "date": "date",
-        "spot": "spot COLLATE NOCASE",
-        "start_time": "start_time",
-        "end_time": "end_time",
-        "session_rating": "session_rating",
-        "wing_size": "wing_size",
-        "foil_size": "foil_size",
-        "avg_measured_wind_speed": "avg_measured_wind_speed",
-        "max_measured_wind_speed": "max_measured_wind_speed",
-        "min_measured_wind_speed": "min_measured_wind_speed",
-        "max_measured_wind_gust": "CAST(json_extract(measured_wind_data_json, '$.summary.max_wind_gust') AS REAL)",
-        "mean_measured_direction": "mean_measured_direction",
-        "avg_forecast_temperature": "avg_forecast_temperature",
+        "date": "e.date",
+        "visibility": "e.visibility COLLATE NOCASE",
+        "rider": "COALESCE(NULLIF(TRIM(p.public_username), ''), 'Unknown rider') COLLATE NOCASE",
+        "spot": "e.spot COLLATE NOCASE",
+        "start_time": "e.start_time",
+        "end_time": "e.end_time",
+        "session_rating": "e.session_rating",
+        "wing_size": "e.wing_size",
+        "foil_size": "e.foil_size",
+        "avg_measured_wind_speed": "e.avg_measured_wind_speed",
+        "max_measured_wind_speed": "e.max_measured_wind_speed",
+        "min_measured_wind_speed": "e.min_measured_wind_speed",
+        "max_measured_wind_gust": "CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL)",
+        "mean_measured_direction": "e.mean_measured_direction",
+        "avg_forecast_temperature": "e.avg_forecast_temperature",
     }
-    order_expr = allowed_sort.get(sort_key, "date")
+    order_expr = allowed_sort.get(sort_key, allowed_sort["date"])
     direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
+    where_clause = "e.user_id = ?" if scope != "all" else "(e.visibility = 'public' OR e.user_id = ?)"
     rows = conn.execute(
         f"""
-        SELECT id, submitted_iso, rider, spot, date, start_time, end_time,
-               session_rating, rider_review, wing_size, foil_size, rider_notes,
-               measured_wind_status, measured_wind_point_count,
-               avg_measured_wind_speed, max_measured_wind_speed, min_measured_wind_speed,
-               CAST(json_extract(measured_wind_data_json, '$.summary.max_wind_gust') AS REAL),
-               COALESCE(mean_measured_direction, avg_measured_wind_dir),
-               mean_measured_direction_label, avg_forecast_temperature
-        FROM surf_experiences
-        WHERE user_id = ?
-        ORDER BY {order_expr} {direction}, start_time {direction}, id {direction}
+        SELECT e.id, e.user_id, e.visibility,
+               COALESCE(NULLIF(TRIM(p.public_username), ''), 'Unknown rider'),
+               e.submitted_iso, e.rider, e.spot, e.date, e.start_time, e.end_time,
+               e.session_rating, e.rider_review, e.wing_size, e.foil_size, e.rider_notes,
+               e.measured_wind_status, e.measured_wind_point_count,
+               e.avg_measured_wind_speed, e.max_measured_wind_speed, e.min_measured_wind_speed,
+               CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL),
+               COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
+               e.mean_measured_direction_label, e.avg_forecast_temperature
+        FROM surf_experiences AS e
+        LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
+        WHERE {where_clause}
+        ORDER BY {order_expr} {direction}, e.start_time {direction}, e.id {direction}
         """,
         (int(user_id),),
     ).fetchall()
     experiences = []
     for row in rows:
-        mean_direction = row[18]
-        mean_direction_label = row[19] or _wind_direction_label(mean_direction)
+        mean_direction = row[21]
+        mean_direction_label = row[22] or _wind_direction_label(mean_direction)
+        is_owner = int(row[1]) == int(user_id)
         experiences.append(
             {
                 "id": int(row[0]),
-                "submitted_iso": row[1],
-                "rider": row[2],
-                "spot": row[3],
-                "date": row[4],
-                "start_time": row[5],
-                "end_time": row[6],
-                "session_rating": int(row[7]),
-                "rider_review": row[8] or "",
-                "wing_size": int(row[9]),
-                "foil_size": int(row[10]),
-                "rider_notes": row[11] or "",
-                "measured_wind_status": row[12],
-                "measured_wind_point_count": int(row[13]),
-                "avg_measured_wind_speed": row[14],
-                "max_measured_wind_speed": row[15],
-                "min_measured_wind_speed": row[16],
-                "max_measured_wind_gust": row[17],
+                "user_id": int(row[1]),
+                "visibility": _submission_visibility(row[2]),
+                "is_owner": is_owner,
+                "submitted_by": row[3],
+                "rider_display": row[3],
+                "submitted_iso": row[4],
+                "rider": row[5] if is_owner else None,
+                "spot": row[6],
+                "date": row[7],
+                "start_time": row[8],
+                "end_time": row[9],
+                "session_rating": int(row[10]),
+                "rider_review": row[11] or "",
+                "wing_size": int(row[12]),
+                "foil_size": int(row[13]),
+                "rider_notes": (row[14] or "") if is_owner else "",
+                "measured_wind_status": row[15],
+                "measured_wind_point_count": int(row[16]),
+                "avg_measured_wind_speed": row[17],
+                "max_measured_wind_speed": row[18],
+                "min_measured_wind_speed": row[19],
+                "max_measured_wind_gust": row[20],
                 "mean_measured_direction": mean_direction,
                 "mean_measured_direction_label": mean_direction_label,
                 "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
-                "avg_forecast_temperature": row[20],
+                "avg_forecast_temperature": row[23],
             }
         )
     return experiences
 
 
-def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
+def _get_surf_experience(
+    conn: sqlite3.Connection,
+    user_id: int,
+    experience_id: int,
+    allow_public: bool,
+) -> Optional[Dict[str, Any]]:
+    access_clause = "(e.user_id = ? OR e.visibility = 'public')" if allow_public else "e.user_id = ?"
     row = conn.execute(
-        """
-        SELECT id, submitted_iso, rider, spot, date, start_time, end_time,
-               session_rating, rider_review, rider_weight, wing_size, foil_size,
-               rider_notes, measured_wind_data_json, measured_wind_status,
-               measured_wind_point_count, avg_measured_wind_speed,
-               max_measured_wind_speed, min_measured_wind_speed,
-               COALESCE(mean_measured_direction, avg_measured_wind_dir),
-               mean_measured_direction_label, avg_forecast_temperature,
-               min_forecast_temperature, max_forecast_temperature
-        FROM surf_experiences
-        WHERE user_id = ?
-          AND id = ?
+        f"""
+        SELECT e.id, e.user_id, e.visibility,
+               COALESCE(NULLIF(TRIM(p.public_username), ''), 'Unknown rider'),
+               e.submitted_iso, e.rider, e.spot, e.date, e.start_time, e.end_time,
+               e.session_rating, e.rider_review, e.rider_weight, e.wing_size, e.foil_size,
+               e.rider_notes, e.measured_wind_data_json, e.measured_wind_status,
+               e.measured_wind_point_count, e.avg_measured_wind_speed,
+               e.max_measured_wind_speed, e.min_measured_wind_speed,
+               COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
+               e.mean_measured_direction_label, e.avg_forecast_temperature,
+               e.min_forecast_temperature, e.max_forecast_temperature
+        FROM surf_experiences AS e
+        LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
+        WHERE {access_clause}
+          AND e.id = ?
         """,
         (int(user_id), int(experience_id)),
     ).fetchone()
     if row is None:
         return None
-    measured_raw = row[13] or "{}"
+    measured_raw = row[16] or "{}"
     try:
         measured = json.loads(measured_raw)
     except json.JSONDecodeError:
         measured = {"status": "unavailable", "records": [], "summary": {}}
-    mean_direction = row[19]
-    mean_direction_label = row[20] or _wind_direction_label(mean_direction)
+    mean_direction = row[22]
+    mean_direction_label = row[23] or _wind_direction_label(mean_direction)
+    is_owner = int(row[1]) == int(user_id)
     return {
         "id": int(row[0]),
-        "submitted_iso": row[1],
-        "rider": row[2],
-        "spot": row[3],
-        "date": row[4],
-        "start_time": row[5],
-        "end_time": row[6],
-        "session_rating": int(row[7]),
-        "rider_review": row[8] or "",
-        "rider_weight": row[9],
-        "wing_size": int(row[10]),
-        "foil_size": int(row[11]),
-        "rider_notes": row[12] or "",
+        "user_id": int(row[1]),
+        "visibility": _submission_visibility(row[2]),
+        "is_owner": is_owner,
+        "submitted_by": row[3],
+        "rider_display": row[3],
+        "submitted_iso": row[4],
+        "rider": row[5] if is_owner else None,
+        "spot": row[6],
+        "date": row[7],
+        "start_time": row[8],
+        "end_time": row[9],
+        "session_rating": int(row[10]),
+        "rider_review": row[11] or "",
+        "rider_weight": row[12] if is_owner else None,
+        "wing_size": int(row[13]),
+        "foil_size": int(row[14]),
+        "rider_notes": (row[15] or "") if is_owner else "",
         "measured_wind": measured,
-        "measured_wind_status": row[14],
-        "measured_wind_point_count": int(row[15]),
-        "avg_measured_wind_speed": row[16],
-        "max_measured_wind_speed": row[17],
-        "min_measured_wind_speed": row[18],
+        "measured_wind_status": row[17],
+        "measured_wind_point_count": int(row[18]),
+        "avg_measured_wind_speed": row[19],
+        "max_measured_wind_speed": row[20],
+        "min_measured_wind_speed": row[21],
         "mean_measured_direction": mean_direction,
         "mean_measured_direction_label": mean_direction_label,
         "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
-        "avg_forecast_temperature": row[21],
-        "min_forecast_temperature": row[22],
-        "max_forecast_temperature": row[23],
+        "avg_forecast_temperature": row[24],
+        "min_forecast_temperature": row[25],
+        "max_forecast_temperature": row[26],
     }
+
+
+def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
+    return _get_surf_experience(conn, user_id, experience_id, allow_public=False)
+
+
+def get_visible_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
+    return _get_surf_experience(conn, user_id, experience_id, allow_public=True)

@@ -2,19 +2,20 @@
 {% block title %}Submission Detail{% endblock %}
 {% block content %}
   <main class="page">
-    <h2>Submission detail</h2>
+    <h2>Submission detail <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></h2>
     <dl class="detail-list">
       <dt>Date</dt><dd>{{ row.date }}</dd>
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
       <dt>Time</dt><dd>{{ row.start_time }} to {{ row.end_time }}</dd>
       <dt>Avg air temperature</dt><dd>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</dd>
       <dt>SessionRating</dt><dd>{{ row.session_rating }}/5</dd>
-      <dt>Rider</dt><dd>{{ row.rider }}</dd>
-      <dt>RiderWeight</dt><dd>{{ row.rider_weight }} kg</dd>
+      <dt>Submitted by</dt><dd>{{ row.submitted_by }}</dd>
+      {% if row.is_owner %}<dt>Rider</dt><dd>{{ row.rider }}</dd>{% endif %}
+      {% if row.is_owner %}<dt>RiderWeight</dt><dd>{{ row.rider_weight }} kg</dd>{% endif %}
       <dt>WingSize</dt><dd>{{ row.wing_size }} m2</dd>
       <dt>FoilSize</dt><dd>{{ row.foil_size }} cm2</dd>
       <dt>RiderReview</dt><dd>{{ row.rider_review }}</dd>
-      <dt>RiderNotes</dt><dd>{{ row.rider_notes }}</dd>
+      {% if row.is_owner %}<dt>RiderNotes</dt><dd>{{ row.rider_notes }}</dd>{% endif %}
       <dt>Measured wind</dt>
       <dd>
         {% if row.measured_wind_status == 'ok' %}

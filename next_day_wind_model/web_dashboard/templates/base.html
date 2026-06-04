@@ -76,6 +76,17 @@
       flex-wrap: wrap; margin: 0 0 16px 0;
     }
     .page-header-actions h2 { margin: 0; }
+    .scope-tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .scope-tabs a { border: 1px solid #bbb; border-radius: 999px; padding: 6px 10px; background: #fff; }
+    .scope-tabs a.active { border-color: #135f86; background: #eaf4f9; font-weight: 700; }
+    .visibility-badge {
+      display: inline-block; border: 1px solid #aaa; border-radius: 999px; padding: 2px 7px;
+      color: #444; background: #f7f7f7; font-size: 12px; font-weight: 700; text-transform: capitalize;
+    }
+    .visibility-badge.public { border-color: #4d8b68; color: #245b3a; background: #eef8f1; }
+    .choice-group { display: grid; gap: 8px; }
+    .choice-option { display: flex; align-items: flex-start; gap: 8px; font-weight: 400; margin: 0; }
+    .choice-option input { width: auto; margin-top: 3px; }
     .unit-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
     .unit { color: #555; white-space: nowrap; }
     .flash-list { max-width: 900px; margin: 0 0 14px 0; }
@@ -131,7 +142,7 @@
       }
       .primary-nav { gap: 10px; padding-top: 4px; }
       .account-control { padding-top: 0; }
-      .page-header-actions { margin-bottom: 14px; }
+      .page-header-actions { align-items: flex-start; margin-bottom: 14px; }
       .section-title { font-size: 21px; margin: 0 0 12px 0; }
       .performance-section h3 { font-size: 17px; margin: 0 0 6px 0; }
       .meta { margin: 0 0 10px 0; font-size: 14px; }
@@ -172,7 +183,7 @@
       {% if current_user %}
         <details class="account-menu">
           <summary class="account-badge" aria-label="Account menu for {{ current_user.username }}" title="{{ current_user.username }}">
-            {{ current_user.username[:1] }}
+            {{ (current_profile.public_username if current_profile and current_profile.public_username else current_user.username)[:1] }}
           </summary>
           <div class="account-dropdown">
             <a href="{{ url_for('profile') }}">Profile</a>
@@ -210,8 +221,9 @@
         <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="next" value="{{ request.args.get('next') or request.path }}">
         <div>
-          <label for="login-username">Username</label>
-          <input id="login-username" name="username" autocomplete="username" required>
+          <label for="login-username">Email</label>
+          <input id="login-username" name="username" autocomplete="username" placeholder="you@example.com" required>
+          <p class="desc">Existing users can still use their current login name.</p>
         </div>
         <div>
           <label for="login-password">Password</label>
@@ -224,8 +236,8 @@
         <form class="modal-form" method="post" action="{{ url_for('register') }}">
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <div>
-            <label for="register-username">Username</label>
-            <input id="register-username" name="username" autocomplete="username" required minlength="3">
+            <label for="register-username">Email</label>
+            <input id="register-username" name="username" type="email" autocomplete="email" placeholder="you@example.com" required>
           </div>
           <div>
             <label for="register-password">Password</label>

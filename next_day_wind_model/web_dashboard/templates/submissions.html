@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}My Submissions{% endblock %}
+{% block title %}{{ 'All Submissions' if scope == 'all' else 'My Submissions' }}{% endblock %}
 {% macro sort_link(label, key) -%}
   {%- set next_dir = 'asc' if sort_key != key or sort_dir == 'desc' else 'desc' -%}
-  <a class="sort-link" href="{{ url_for('experiences', sort=key, dir=next_dir) }}">
+  <a class="sort-link" href="{{ url_for('experiences', scope=scope, sort=key, dir=next_dir) }}">
     {{- label -}}
     {%- if sort_key == key -%}
       <span class="sort-arrow" aria-label="{{ 'ascending' if sort_dir == 'asc' else 'descending' }}">{% if sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>
@@ -12,7 +12,10 @@
 {% block content %}
   <main class="page submissions-page">
     <div class="page-header-actions">
-      <h2>My submissions</h2>
+      <nav class="scope-tabs" aria-label="Submission scope">
+        <a class="{{ 'active' if scope == 'mine' else '' }}" href="{{ url_for('experiences', scope='mine') }}">My submissions</a>
+        <a class="{{ 'active' if scope == 'all' else '' }}" href="{{ url_for('experiences', scope='all') }}">All submissions</a>
+      </nav>
       <a class="button primary" href="{{ url_for('new_experience') }}">New submission</a>
     </div>
     <div class="table-wrap">
@@ -20,6 +23,8 @@
         <thead>
           <tr>
             <th>{{ sort_link('Date', 'date') }}</th>
+            <th>{{ sort_link('Visibility', 'visibility') }}</th>
+            <th>{{ sort_link('Rider', 'rider') }}</th>
             <th>{{ sort_link('Spot', 'spot') }}</th>
             <th>{{ sort_link('StartTime', 'start_time') }}</th>
             <th>{{ sort_link('EndTime', 'end_time') }}</th>
@@ -37,6 +42,8 @@
           {% for row in rows %}
             <tr>
               <td><a href="{{ url_for('experience_detail', experience_id=row.id) }}">{{ row.date }}</a></td>
+              <td><span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></td>
+              <td>{{ row.rider_display }}</td>
               <td>{{ row.spot }}</td>
               <td>{{ row.start_time }}</td>
               <td>{{ row.end_time }}</td>
@@ -57,18 +64,22 @@
               <td>{{ row.mean_measured_direction_display or 'n/a' }}</td>
               <td>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</td>
               <td>
-                <div class="table-actions">
-                  <a class="button" href="{{ url_for('edit_experience', experience_id=row.id) }}">Modify</a>
-                  <form method="post" action="{{ url_for('delete_experience', experience_id=row.id) }}" onsubmit="return confirm('Delete this surf experience?');">
-                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit">Delete</button>
-                  </form>
-                </div>
+                {% if row.is_owner %}
+                  <div class="table-actions">
+                    <a class="button" href="{{ url_for('edit_experience', experience_id=row.id) }}">Modify</a>
+                    <form method="post" action="{{ url_for('delete_experience', experience_id=row.id) }}" onsubmit="return confirm('Delete this surf experience?');">
+                      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                      <button type="submit">Delete</button>
+                    </form>
+                  </div>
+                {% else %}
+                  <span class="unit">View only</span>
+                {% endif %}
               </td>
             </tr>
           {% else %}
             <tr>
-              <td colspan="12">No submissions yet.</td>
+              <td colspan="14">No submissions yet.</td>
             </tr>
           {% endfor %}
         </tbody>

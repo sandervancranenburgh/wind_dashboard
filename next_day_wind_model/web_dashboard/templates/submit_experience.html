@@ -84,6 +84,19 @@
           <label for="RiderNotes">RiderNotes</label>
           <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
         </div>
+        <fieldset class="form-row-full">
+          <legend>Visibility</legend>
+          <div class="choice-group">
+            <label class="choice-option">
+              <input type="radio" name="Visibility" value="private" {% if form_values.Visibility != 'public' %}checked{% endif %}>
+              <span>Private &mdash; only you can see this submission</span>
+            </label>
+            <label class="choice-option">
+              <input type="radio" name="Visibility" value="public" {% if form_values.Visibility == 'public' %}checked{% endif %}>
+              <span>Public &mdash; visible to logged-in riders</span>
+            </label>
+          </div>
+        </fieldset>
       </div>
       <div class="form-actions">
         <button class="primary" type="submit">{{ submit_label }}</button>

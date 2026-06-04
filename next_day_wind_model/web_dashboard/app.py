@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import math
 import os
+import re
 import secrets
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -52,6 +53,8 @@ FOIL_SIZE_OPTIONS = list(range(700, 2501, 100))
 HOUR_OPTIONS = [f"{hour:02d}:00" for hour in range(24)]
 SORT_OPTIONS = {
     "date",
+    "visibility",
+    "rider",
     "spot",
     "start_time",
     "end_time",
@@ -65,6 +68,7 @@ SORT_OPTIONS = {
     "mean_measured_direction",
     "avg_forecast_temperature",
 }
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _load_secret_key() -> str:
@@ -168,6 +172,10 @@ def _safe_next_url(value: str | None) -> str | None:
     return None
 
 
+def _is_valid_email(value: str) -> bool:
+    return bool(EMAIL_PATTERN.fullmatch(value.strip()))
+
+
 @app.context_processor
 def inject_globals():
     return {
@@ -246,6 +254,7 @@ def _experience_form_defaults() -> dict[str, Any]:
         "WingSize": "5",
         "FoilSize": "1500",
         "RiderNotes": "",
+        "Visibility": "private",
     }
 
 
@@ -260,6 +269,7 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
     rider_weight = _parse_int(form.get("RiderWeight"), "RiderWeight", errors)
     wing_size = _parse_int(form.get("WingSize"), "WingSize", errors)
     foil_size = _parse_int(form.get("FoilSize"), "FoilSize", errors)
+    visibility = (form.get("Visibility") or "private").strip().lower()
 
     if not rider:
         errors.append("Rider is required.")
@@ -283,6 +293,8 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
         errors.append("WingSize must be one of the allowed options.")
     if foil_size is not None and foil_size not in FOIL_SIZE_OPTIONS:
         errors.append("FoilSize must be one of the allowed options.")
+    if visibility not in {"private", "public"}:
+        errors.append("Visibility must be private or public.")
 
     start_ts, end_ts = _local_session_bounds(day, start_time, end_time)
     if start_ts is None or end_ts is None:
@@ -303,6 +315,7 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
             "wing_size": wing_size,
             "foil_size": foil_size,
             "rider_notes": form.get("RiderNotes", "").strip(),
+            "visibility": visibility,
         },
         errors,
     )
@@ -321,6 +334,7 @@ def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "WingSize": "" if row.get("wing_size") is None else str(row.get("wing_size")),
         "FoilSize": "" if row.get("foil_size") is None else str(row.get("foil_size")),
         "RiderNotes": row.get("rider_notes") or "",
+        "Visibility": row.get("visibility") or "private",
     }
 
 
@@ -610,8 +624,8 @@ def register():
     _validate_csrf()
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
-    if len(username) < 3:
-        flash("Username must be at least 3 characters.", "error")
+    if not _is_valid_email(username):
+        flash("Enter a valid email address to create a new account.", "error")
         return redirect(url_for("portal_home", login=1))
     if len(password) < 8:
         flash("Password must be at least 8 characters.", "error")
@@ -619,7 +633,7 @@ def register():
     try:
         user_id = db_store.create_user(get_db(), username, _hash_password(password))
     except Exception:
-        flash("That username is already in use.", "error")
+        flash("That email address is already in use.", "error")
         return redirect(url_for("portal_home", login=1))
     session.clear()
     session["user_id"] = user_id
@@ -634,7 +648,7 @@ def login():
     password = request.form.get("password", "")
     user = db_store.get_user_by_username(get_db(), username)
     if user is None or not _verify_password(password, user["password_hash"]):
-        flash("Invalid username or password.", "error")
+        flash("Invalid email/login name or password.", "error")
         return redirect(url_for("portal_home", login=1))
     session.clear()
     session["user_id"] = int(user["id"])
@@ -659,6 +673,7 @@ def profile():
     if request.method == "POST":
         _validate_csrf()
         errors: list[str] = []
+        public_username = request.form.get("PublicUsername", "").strip()
         rider_name = request.form.get("RiderName", "").strip()
         rider_weight = _parse_int(request.form.get("RiderWeight"), "RiderWeight", errors, required=False)
         default_spot = request.form.get("DefaultSpot", "")
@@ -670,10 +685,13 @@ def profile():
             for error in errors:
                 flash(error, "error")
         else:
-            db_store.upsert_user_profile(get_db(), int(user["id"]), rider_name, rider_weight, default_spot)
+            db_store.upsert_user_profile(
+                get_db(), int(user["id"]), public_username, rider_name, rider_weight, default_spot
+            )
             flash("Profile saved.", "success")
             return redirect(url_for("profile"))
         profile_row = {
+            "public_username": public_username,
             "rider_name": rider_name,
             "rider_weight": rider_weight,
             "default_spot": default_spot,
@@ -712,7 +730,7 @@ def new_experience():
         form_values=form_values,
         form_title="New submission",
         form_action=url_for("new_experience"),
-        submit_label="New submission",
+        submit_label="Save submission",
         spot_options=SPOT_OPTIONS,
         hour_options=HOUR_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
@@ -760,17 +778,21 @@ def edit_experience(experience_id: int):
 def experiences():
     sort_key = request.args.get("sort", "date")
     sort_dir = request.args.get("dir", "desc")
+    scope = request.args.get("scope", "mine")
     if sort_key not in SORT_OPTIONS:
         sort_key = "date"
     if sort_dir not in {"asc", "desc"}:
         sort_dir = "desc"
+    if scope not in {"mine", "all"}:
+        scope = "mine"
     db_store.backfill_surf_experience_measured_summaries(get_db(), user_id=int(current_user()["id"]))
-    rows = db_store.list_surf_experiences(get_db(), int(current_user()["id"]), sort_key, sort_dir)
+    rows = db_store.list_surf_experiences(get_db(), int(current_user()["id"]), sort_key, sort_dir, scope=scope)
     return render_template(
         "submissions.html",
         rows=rows,
         sort_key=sort_key,
         sort_dir=sort_dir,
+        scope=scope,
     )
 
 
@@ -791,11 +813,11 @@ def delete_experience(experience_id: int):
 def experience_detail(experience_id: int):
     conn = get_db()
     user_id = int(current_user()["id"])
-    row = db_store.get_surf_experience(conn, user_id, experience_id)
+    row = db_store.get_visible_surf_experience(conn, user_id, experience_id)
     if row is None:
         abort(404)
     measured_summary = (row.get("measured_wind") or {}).get("summary") or {}
-    if (
+    if row["is_owner"] and (
         row.get("avg_forecast_temperature") is None
         or not (row.get("measured_wind") or {}).get("plot_records")
         or measured_summary.get("max_wind_speed_kind") != "average_wind"
@@ -807,7 +829,7 @@ def experience_detail(experience_id: int):
         )
     ):
         db_store.refresh_surf_experience_measured_wind(conn, experience_id, user_id=user_id)
-        row = db_store.get_surf_experience(conn, user_id, experience_id)
+        row = db_store.get_visible_surf_experience(conn, user_id, experience_id)
         if row is None:
             abort(404)
     session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])

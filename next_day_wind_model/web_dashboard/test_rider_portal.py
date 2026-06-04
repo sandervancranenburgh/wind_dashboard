@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,14 +17,71 @@ class RiderPortalTest(unittest.TestCase):
 
         conn = db_store.connect_db(self.temp_dir.name)
         db_store.init_db(conn)
-        db_store.create_user(conn, "test-rider", portal._hash_password("test-password"))
+        self.user_id = db_store.create_user(conn, "test-rider", portal._hash_password("test-password"))
+        self.other_user_id = db_store.create_user(conn, "other-rider", portal._hash_password("other-password"))
         conn.close()
         self.client = portal.app.test_client()
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _set_user(self, user_id: int | None) -> None:
+        with self.client.session_transaction() as current_session:
+            current_session.clear()
+            if user_id is not None:
+                current_session["user_id"] = user_id
+
+    def _set_profile(self, user_id: int, public_username: str, rider_name: str = "Private rider name") -> None:
+        conn = db_store.connect_db(self.temp_dir.name)
+        db_store.upsert_user_profile(conn, user_id, public_username, rider_name, 80, "Valkenburgse meer")
+        conn.close()
+
+    def _create_submission(self, user_id: int, rider: str, day: str, visibility: str | None = None) -> int:
+        start_ms, end_ms = portal._local_session_bounds(day, "12:00", "14:00")
+        experience = {
+            "user_id": user_id,
+            "rider": rider,
+            "spot": "Valkenburgse meer",
+            "date": day,
+            "start_time": "12:00",
+            "end_time": "14:00",
+            "start_ts": start_ms,
+            "end_ts": end_ms,
+            "session_rating": 4,
+            "rider_review": f"Review by {rider}",
+            "rider_weight": 80,
+            "wing_size": 5,
+            "foil_size": 1200,
+            "rider_notes": f"Private notes by {rider}",
+            "measured_wind": {"status": "unavailable", "records": [], "plot_records": [], "summary": {}},
+        }
+        if visibility is not None:
+            experience["visibility"] = visibility
+        conn = db_store.connect_db(self.temp_dir.name)
+        experience_id = db_store.create_surf_experience(conn, experience)
+        conn.close()
+        return experience_id
+
+    def _valid_form(self, visibility: str | None = None) -> dict[str, str]:
+        form = {
+            "Rider": "Form Rider",
+            "Spot": "Valkenburgse meer",
+            "Date": "2026-01-20",
+            "StartTime": "12:00",
+            "EndTime": "14:00",
+            "SessionRating": "4",
+            "RiderReview": "Form review",
+            "RiderWeight": "80",
+            "WingSize": "5",
+            "FoilSize": "1200",
+            "RiderNotes": "Form notes",
+        }
+        if visibility is not None:
+            form["Visibility"] = visibility
+        return form
+
     def test_my_sessions_login_flow_and_account_indicator(self) -> None:
+        legacy_submission = self._create_submission(self.user_id, "Legacy Rider", "2026-01-09", "private")
         protected = self.client.get("/experiences")
         self.assertEqual(protected.status_code, 302)
         self.assertEqual(protected.headers["Location"], "/?login=1&next=/experiences")
@@ -32,6 +90,9 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(login_page.status_code, 200)
         self.assertIn(b'id="open-login">Login</button>', login_page.data)
         self.assertIn(b'name="next" value="/experiences"', login_page.data)
+        self.assertGreaterEqual(login_page.data.count(b">Email</label>"), 2)
+        self.assertIn(b"Existing users can still use their current login name.", login_page.data)
+        self.assertIn(b'placeholder="you@example.com"', login_page.data)
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
@@ -58,6 +119,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(sessions_page.data.count(b'href="/experiences"'), 0)
         self.assertEqual(sessions_page.data.count(b'href="/experience/new"'), 1)
         self.assertIn(b'class="page-header-actions"', sessions_page.data)
+        self.assertIn(f'href="/experiences/{legacy_submission}"'.encode(), sessions_page.data)
 
         root_handoff = self.client.get("/?next=/experience/new")
         self.assertEqual(root_handoff.status_code, 302)
@@ -69,11 +131,60 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(new_submission.data.count(b'href="/experiences"'), 1)
         self.assertEqual(new_submission.data.count(b'href="/experience/new"'), 0)
 
+        profile_page = self.client.get("/profile")
+        self.assertEqual(profile_page.status_code, 200)
+        self.assertIn(b"Public username", profile_page.data)
+        self.assertIn(b"Shown with your public submissions. Your email/login name is not shown publicly.", profile_page.data)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        profile_response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": "Legacy Public Rider",
+                "RiderName": "Legacy Private Rider",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+        self.assertEqual(profile_response.status_code, 302)
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertEqual(db_store.get_user_profile(conn, self.user_id)["public_username"], "Legacy Public Rider")
+        conn.close()
+
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
         logout_response = self.client.post("/logout", data={"_csrf_token": csrf_token})
         self.assertEqual(logout_response.status_code, 302)
         self.assertEqual(logout_response.headers["Location"], "/")
+
+    def test_registration_requires_email_but_accepts_valid_email(self) -> None:
+        register_page = self.client.get("/?login=1")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+
+        invalid = self.client.post(
+            "/register",
+            data={"_csrf_token": csrf_token, "username": "new-legacy-name", "password": "test-password"},
+        )
+        self.assertEqual(invalid.status_code, 302)
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertIsNone(db_store.get_user_by_username(conn, "new-legacy-name"))
+        conn.close()
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        valid = self.client.post(
+            "/register",
+            data={"_csrf_token": csrf_token, "username": "new.rider@example.com", "password": "test-password"},
+        )
+        self.assertEqual(valid.status_code, 302)
+        self.assertEqual(valid.headers["Location"], "/profile")
+        conn = db_store.connect_db(self.temp_dir.name)
+        created = db_store.get_user_by_username(conn, "new.rider@example.com")
+        conn.close()
+        self.assertIsNotNone(created)
 
     def test_measured_report_min_max_trend_and_variability(self) -> None:
         start_ms, end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
@@ -148,6 +259,10 @@ class RiderPortalTest(unittest.TestCase):
             "max_measured_wind_speed": 20.0,
             "min_measured_wind_speed": 9.0,
             "mean_measured_direction_display": "SW (208 deg)",
+            "visibility": "private",
+            "is_owner": True,
+            "submitted_by": "Test Public Rider",
+            "rider_display": "Test Rider",
         }
         with portal.app.test_request_context("/experiences/1"):
             portal.session["user_id"] = 1
@@ -165,6 +280,233 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b'class="form-actions"', detail)
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
         self.assertEqual(detail.count(b'href="/experience/new"'), 1)
+
+    def test_visibility_defaults_and_form_validation(self) -> None:
+        default_private_id = self._create_submission(self.user_id, "Default Private", "2026-01-10")
+        invalid_private_id = self._create_submission(self.user_id, "Invalid Private", "2026-01-11", "unexpected")
+        public_id = self._create_submission(self.user_id, "Public Rider", "2026-01-12", "public")
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertEqual(db_store.get_surf_experience(conn, self.user_id, default_private_id)["visibility"], "private")
+        self.assertEqual(db_store.get_surf_experience(conn, self.user_id, invalid_private_id)["visibility"], "private")
+        self.assertEqual(db_store.get_surf_experience(conn, self.user_id, public_id)["visibility"], "public")
+        visibility_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "visibility")
+        self.assertEqual(visibility_column[4], "'private'")
+        conn.close()
+
+        missing_visibility, missing_errors = portal._validate_experience_form(self._valid_form())
+        self.assertEqual(missing_visibility["visibility"], "private")
+        self.assertEqual(missing_errors, [])
+        public_form, public_errors = portal._validate_experience_form(self._valid_form("public"))
+        self.assertEqual(public_form["visibility"], "public")
+        self.assertEqual(public_errors, [])
+        _, invalid_errors = portal._validate_experience_form(self._valid_form("friends"))
+        self.assertIn("Visibility must be private or public.", invalid_errors)
+
+    def test_legacy_account_schema_migration_preserves_users_profiles_and_ownership(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                username_norm TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                created_iso TEXT NOT NULL,
+                last_login_ts INTEGER,
+                last_login_iso TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE user_profiles (
+                user_id INTEGER PRIMARY KEY,
+                rider_name TEXT,
+                rider_weight INTEGER,
+                default_spot TEXT,
+                updated_ts INTEGER NOT NULL,
+                updated_iso TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE surf_experiences (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                start_time TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO users(id, username, username_norm, password_hash, created_ts, created_iso)
+            VALUES (7, 'legacy-login', 'legacy-login', 'hash', 1, 'created')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO user_profiles(user_id, rider_name, rider_weight, default_spot, updated_ts, updated_iso)
+            VALUES (7, 'Existing private name', 81, 'Valkenburgse meer', 2, 'updated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO surf_experiences(id, user_id, date, start_time)
+            VALUES (1, 7, '2026-01-01', '12:00')
+            """
+        )
+
+        db_store.init_account_db(conn)
+        db_store.init_account_db(conn)
+
+        visibility_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "visibility")
+        public_username_column = next(row for row in conn.execute("PRAGMA table_info(user_profiles)") if row[1] == "public_username")
+        self.assertEqual(visibility_column[3], 1)
+        self.assertEqual(visibility_column[4], "'private'")
+        self.assertEqual(conn.execute("SELECT visibility FROM surf_experiences WHERE id = 1").fetchone()[0], "private")
+        self.assertEqual(public_username_column[2], "TEXT")
+        self.assertEqual(conn.execute("SELECT username FROM users WHERE id = 7").fetchone()[0], "legacy-login")
+        self.assertEqual(conn.execute("SELECT rider_name, public_username FROM user_profiles WHERE user_id = 7").fetchone(), ("Existing private name", None))
+        self.assertEqual(conn.execute("SELECT user_id FROM surf_experiences WHERE id = 1").fetchone()[0], 7)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM surf_experiences").fetchone()[0], 1)
+        conn.close()
+
+    def test_new_submission_route_stores_private_and_public_visibility(self) -> None:
+        self._set_user(self.user_id)
+        new_page = self.client.get("/experience/new")
+        self.assertEqual(new_page.status_code, 200)
+        self.assertIn(b'checked', new_page.data.split(b'value="private"', 1)[1].split(b'>', 1)[0])
+        self.assertIn(b'<button class="primary" type="submit">Save submission</button>', new_page.data)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        private_form = self._valid_form()
+        private_form["_csrf_token"] = csrf_token
+        private_response = self.client.post("/experience/new", data=private_form)
+        self.assertEqual(private_response.status_code, 302)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        public_form = self._valid_form("public")
+        public_form["Date"] = "2026-01-21"
+        public_form["_csrf_token"] = csrf_token
+        public_response = self.client.post("/experience/new", data=public_form)
+        self.assertEqual(public_response.status_code, 302)
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        rows = db_store.list_surf_experiences(conn, self.user_id)
+        visibility_by_date = {row["date"]: row["visibility"] for row in rows}
+        conn.close()
+        self.assertEqual(visibility_by_date["2026-01-20"], "private")
+        self.assertEqual(visibility_by_date["2026-01-21"], "public")
+
+    def test_submission_scopes_and_detail_access_control(self) -> None:
+        self._set_profile(self.user_id, "Zulu Rider", "Owner Private Name")
+        self._set_profile(self.other_user_id, "Alpha Rider", "Other Private Name")
+        own_private = self._create_submission(self.user_id, "Owner Private", "2026-02-01", "private")
+        own_public = self._create_submission(self.user_id, "Owner Public", "2026-02-02", "public")
+        other_private = self._create_submission(self.other_user_id, "Other Private", "2026-02-03", "private")
+        other_public = self._create_submission(self.other_user_id, "Other Public", "2026-02-04", "public")
+
+        self._set_user(self.user_id)
+        mine = self.client.get("/experiences?scope=mine")
+        self.assertEqual(mine.status_code, 200)
+        self.assertIn(f'href="/experiences/{own_private}"'.encode(), mine.data)
+        self.assertIn(f'href="/experiences/{own_public}"'.encode(), mine.data)
+        self.assertNotIn(f'href="/experiences/{other_private}"'.encode(), mine.data)
+        self.assertNotIn(f'href="/experiences/{other_public}"'.encode(), mine.data)
+        self.assertIn(b"Zulu Rider", mine.data)
+
+        mine_by_rider = self.client.get("/experiences?scope=mine&sort=rider&dir=asc")
+        self.assertEqual(mine_by_rider.status_code, 200)
+        self.assertIn(b"sort=rider", mine_by_rider.data)
+
+        all_submissions = self.client.get("/experiences?scope=all")
+        self.assertEqual(all_submissions.status_code, 200)
+        self.assertIn(f'href="/experiences/{own_private}"'.encode(), all_submissions.data)
+        self.assertIn(f'href="/experiences/{own_public}"'.encode(), all_submissions.data)
+        self.assertNotIn(f'href="/experiences/{other_private}"'.encode(), all_submissions.data)
+        self.assertIn(f'href="/experiences/{other_public}"'.encode(), all_submissions.data)
+        self.assertIn(b"Alpha Rider", all_submissions.data)
+        self.assertNotIn(b"other-rider", all_submissions.data)
+        self.assertNotIn(b"Other Public", all_submissions.data)
+        self.assertNotIn(b"<h2>All submissions</h2>", all_submissions.data)
+
+        all_by_visibility = self.client.get("/experiences?scope=all&sort=visibility&dir=asc")
+        self.assertEqual(all_by_visibility.status_code, 200)
+        self.assertLess(
+            all_by_visibility.data.index(f'href="/experiences/{own_private}"'.encode()),
+            all_by_visibility.data.index(f'href="/experiences/{own_public}"'.encode()),
+        )
+        all_by_rider = self.client.get("/experiences?scope=all&sort=rider&dir=asc")
+        self.assertEqual(all_by_rider.status_code, 200)
+        self.assertLess(
+            all_by_rider.data.index(f'href="/experiences/{other_public}"'.encode()),
+            all_by_rider.data.index(f'href="/experiences/{own_private}"'.encode()),
+        )
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        other_public_row = next(
+            row for row in db_store.list_surf_experiences(conn, self.user_id, scope="all") if row["id"] == other_public
+        )
+        other_public_detail_row = db_store.get_visible_surf_experience(conn, self.user_id, other_public)
+        conn.close()
+        self.assertIsNone(other_public_row["rider"])
+        self.assertEqual(other_public_row["submitted_by"], "Alpha Rider")
+        self.assertEqual(other_public_row["rider_notes"], "")
+        self.assertIsNotNone(other_public_detail_row)
+        self.assertIsNone(other_public_detail_row["rider"])
+        self.assertEqual(other_public_detail_row["submitted_by"], "Alpha Rider")
+        self.assertIsNone(other_public_detail_row["rider_weight"])
+        self.assertEqual(other_public_detail_row["rider_notes"], "")
+
+        owner_private_detail = self.client.get(f"/experiences/{own_private}")
+        self.assertEqual(owner_private_detail.status_code, 200)
+        self.assertIn(b"Owner Private", owner_private_detail.data)
+
+        other_private_detail = self.client.get(f"/experiences/{other_private}")
+        self.assertEqual(other_private_detail.status_code, 404)
+        other_public_detail = self.client.get(f"/experiences/{other_public}")
+        self.assertEqual(other_public_detail.status_code, 200)
+        self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", other_public_detail.data)
+        self.assertNotIn(b"other-rider", other_public_detail.data)
+        self.assertNotIn(b"<dt>Rider</dt><dd>Other Public</dd>", other_public_detail.data)
+        self.assertNotIn(b"<dt>RiderWeight</dt>", other_public_detail.data)
+        self.assertNotIn(b"Private notes by Other Public", other_public_detail.data)
+        self.assertNotIn(b"Modify", other_public_detail.data)
+
+        other_public_edit = self.client.get(f"/experiences/{other_public}/edit")
+        self.assertEqual(other_public_edit.status_code, 404)
+
+        self._set_user(None)
+        logged_out_detail = self.client.get(f"/experiences/{other_public}")
+        self.assertEqual(logged_out_detail.status_code, 302)
+        self.assertIn("login=1", logged_out_detail.headers["Location"])
+
+    def test_public_submission_without_public_username_uses_private_fallback(self) -> None:
+        no_name_user_id: int
+        conn = db_store.connect_db(self.temp_dir.name)
+        no_name_user_id = db_store.create_user(conn, "private.login@example.com", portal._hash_password("test-password"))
+        conn.close()
+        unnamed_public = self._create_submission(no_name_user_id, "Secret Freeform Name", "2026-02-05", "public")
+
+        self._set_user(self.user_id)
+        overview = self.client.get("/experiences?scope=all&sort=rider&dir=asc")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn(f'href="/experiences/{unnamed_public}"'.encode(), overview.data)
+        self.assertIn(b"Unknown rider", overview.data)
+        self.assertNotIn(b"private.login@example.com", overview.data)
+        self.assertNotIn(b"Secret Freeform Name", overview.data)
+
+        detail = self.client.get(f"/experiences/{unnamed_public}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn(b"<dt>Submitted by</dt><dd>Unknown rider</dd>", detail.data)
+        self.assertNotIn(b"private.login@example.com", detail.data)
 
 
 if __name__ == "__main__":

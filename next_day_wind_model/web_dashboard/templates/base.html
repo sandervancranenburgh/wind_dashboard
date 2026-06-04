@@ -24,14 +24,34 @@
     }
     button.primary, .button.primary { border-color: #135f86; background: #135f86; color: #fff; }
     button.linklike { border: 0; background: transparent; padding: 0; color: #135f86; }
-    .site-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
-    .account-nav { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; min-width: 240px; }
-    .account-nav form { margin: 0; }
-    .account-nav button.nav-link {
+    .site-header {
+      display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "brand nav account"; align-items: start;
+      gap: 18px; margin-bottom: 12px;
+    }
+    .site-brand { grid-area: brand; }
+    .primary-nav { grid-area: nav; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding-top: 10px; }
+    .account-control { grid-area: account; position: relative; justify-self: end; padding-top: 2px; }
+    .account-menu { position: relative; }
+    .account-menu summary { list-style: none; cursor: pointer; }
+    .account-menu summary::-webkit-details-marker { display: none; }
+    .account-dropdown {
+      display: none; position: absolute; z-index: 10; top: 100%; right: 0; min-width: 130px;
+      border: 1px solid #ccc; border-radius: 7px; padding: 7px; background: #fff; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+    }
+    .account-menu[open] .account-dropdown, .account-menu:hover .account-dropdown, .account-menu:focus-within .account-dropdown {
+      display: grid; gap: 7px;
+    }
+    .account-dropdown form { margin: 0; }
+    .account-dropdown a, .account-dropdown button.nav-link { display: block; width: 100%; box-sizing: border-box; text-align: left; }
+    .account-dropdown button.nav-link {
       border: 0; border-radius: 0; padding: 0; color: #135f86; background: transparent;
       font: inherit; cursor: pointer;
     }
-    .account-nav button.nav-link:hover { text-decoration: underline; }
+    .account-dropdown button.nav-link:hover { text-decoration: underline; }
+    .account-badge {
+      display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px;
+      border-radius: 50%; background: #135f86; color: #fff; font-weight: 700; text-transform: uppercase; user-select: none;
+    }
     .meta { color: #555; margin: 0 0 16px 0; }
     .overview { color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }
     .overview-mobile { display: none; }
@@ -51,6 +71,11 @@
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; max-width: 820px; }
     .form-row-full { grid-column: 1 / -1; }
     .form-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+    .page-header-actions {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      flex-wrap: wrap; margin: 0 0 16px 0;
+    }
+    .page-header-actions h2 { margin: 0; }
     .unit-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
     .unit { color: #555; white-space: nowrap; }
     .flash-list { max-width: 900px; margin: 0 0 14px 0; }
@@ -92,6 +117,7 @@
     .wind-plot figcaption { display: flex; gap: 14px; align-items: center; color: #555; margin-top: 8px; }
     .legend-line { display: inline-block; width: 28px; height: 0; border-top: 3px solid #cc33cc; }
     .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
+    .legend-line.trend { border-top-color: #b000b8; opacity: 0.82; }
     .legend-line.superlocal { border-top-color: #f28e2b; }
     .legend-line.harmonie { border-top-color: #777; }
     pre { white-space: pre-wrap; overflow-x: auto; background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
@@ -99,8 +125,13 @@
       body { margin: 10px; }
       h1 { font-size: 24px; margin: 0 0 6px 0; }
       h2 { font-size: 20px; margin: 0 0 6px 0; }
-      .site-header { display: block; }
-      .account-nav { justify-content: flex-start; min-width: 0; margin-top: 8px; }
+      .site-header {
+        grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "brand account" "nav nav";
+        gap: 8px 12px;
+      }
+      .primary-nav { gap: 10px; padding-top: 4px; }
+      .account-control { padding-top: 0; }
+      .page-header-actions { margin-bottom: 14px; }
       .section-title { font-size: 21px; margin: 0 0 12px 0; }
       .performance-section h3 { font-size: 17px; margin: 0 0 6px 0; }
       .meta { margin: 0 0 10px 0; font-size: 14px; }
@@ -121,31 +152,40 @@
 </head>
 <body>
   <header class="site-header">
-    <div>
+    <div class="site-brand">
       <h1>Rider portal</h1>
       <p class="meta">Companion app for the Super local wind forecast dashboard</p>
       {% block meta %}{% endblock %}
     </div>
-    <nav class="account-nav" aria-label="Account">
+    <nav class="primary-nav" aria-label="Primary navigation">
       <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
       {% if current_user %}
         {% if request.endpoint != 'experiences' %}
           <a href="{{ url_for('experiences') }}">My submissions</a>
         {% endif %}
         {% if request.endpoint not in ['experiences', 'new_experience'] %}
-          <a href="{{ url_for('new_experience') }}">Submit experience</a>
+          <a href="{{ url_for('new_experience') }}">New submission</a>
         {% endif %}
-        {% if request.endpoint != 'profile' %}
-          <a href="{{ url_for('profile') }}">Profile</a>
-        {% endif %}
-        <form method="post" action="{{ url_for('logout') }}">
-          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-          <button class="nav-link" type="submit">Logout</button>
-        </form>
+      {% endif %}
+    </nav>
+    <div class="account-control">
+      {% if current_user %}
+        <details class="account-menu">
+          <summary class="account-badge" aria-label="Account menu for {{ current_user.username }}" title="{{ current_user.username }}">
+            {{ current_user.username[:1] }}
+          </summary>
+          <div class="account-dropdown">
+            <a href="{{ url_for('profile') }}">Profile</a>
+            <form method="post" action="{{ url_for('logout') }}">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button class="nav-link" type="submit">Logout</button>
+            </form>
+          </div>
+        </details>
       {% else %}
         <button type="button" class="primary" id="open-login">Login</button>
       {% endif %}
-    </nav>
+    </div>
   </header>
 
   {% with messages = get_flashed_messages(with_categories=true) %}

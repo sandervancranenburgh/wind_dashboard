@@ -5354,8 +5354,8 @@ def publish_web_dashboard(
         companion_links = f"""
     <nav class="dashboard-actions" aria-label="Rider portal">
       <a class="button primary" href="{companion_url}/">Rider portal</a>
-      <a class="button" href="{companion_url}/experience/new">Submit experience</a>
-      <a class="button" href="{companion_url}/experiences">My sessions</a>
+      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperience%2Fnew">New submission</a>
+      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperiences">My sessions</a>
     </nav>"""
     current_day_mobile_src = (
         f"current_day_predictions_mobile.png?v={cache_bust}"

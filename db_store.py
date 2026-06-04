@@ -2198,7 +2198,12 @@ def get_measured_wind_for_session(
         gust = _extract_observation_measurement(
             payload_raw,
             wind_gust,
-            ["MaxWind", "wind_gust", "gust", "WG", "GUST", "fg"],
+            ["MaxWind", "WindSpeedMax", "wind_gust", "gust", "WG", "GUST", "fg"],
+        )
+        minimum = _extract_observation_measurement(
+            payload_raw,
+            None,
+            ["MinWind", "WindSpeedMin"],
         )
         direction = _extract_observation_measurement(
             payload_raw,
@@ -2210,6 +2215,8 @@ def get_measured_wind_for_session(
             "iso_time": iso_time,
             "measured_wind_speed": speed,
             "measured_wind_gust": gust,
+            "measured_wind_min": minimum,
+            "measured_wind_max": gust,
             "measured_wind_direction": direction,
         }
 
@@ -2229,6 +2236,20 @@ def get_measured_wind_for_session(
         cos_sum = sum(math.cos(math.radians(value)) for value in directions)
         avg_dir = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
 
+    rolling_standard_deviations = []
+    for index, record in enumerate(records):
+        window_start = int(record["timestamp"]) - 15 * 60 * 1000
+        window_speeds = [
+            float(candidate["measured_wind_speed"])
+            for candidate in records[: index + 1]
+            if int(candidate["timestamp"]) >= window_start and candidate["measured_wind_speed"] is not None
+        ]
+        if len(window_speeds) < 3:
+            continue
+        window_mean = sum(window_speeds) / len(window_speeds)
+        variance = sum((value - window_mean) ** 2 for value in window_speeds) / (len(window_speeds) - 1)
+        rolling_standard_deviations.append(math.sqrt(variance))
+
     summary = {
         "point_count": len(records),
         "avg_wind_speed": None if not speeds else sum(speeds) / len(speeds),
@@ -2236,6 +2257,12 @@ def get_measured_wind_for_session(
         "max_wind_speed_kind": "average_wind",
         "max_wind_gust": None if not gusts else max(gusts),
         "min_wind_speed": None if not speeds else min(speeds),
+        "wind_variability": (
+            None
+            if not rolling_standard_deviations
+            else sum(rolling_standard_deviations) / len(rolling_standard_deviations)
+        ),
+        "wind_variability_kind": "mean_15min_rolling_sample_standard_deviation",
         "mean_wind_dir": avg_dir,
         "mean_wind_dir_label": _wind_direction_label(avg_dir),
     }
@@ -2276,6 +2303,8 @@ def _forward_fill_observation_records_to_plot_grid(
                     "iso_time": _iso_utc_from_ms(int(grid_ts)),
                     "measured_wind_speed": latest.get("measured_wind_speed"),
                     "measured_wind_gust": latest.get("measured_wind_gust"),
+                    "measured_wind_min": latest.get("measured_wind_min"),
+                    "measured_wind_max": latest.get("measured_wind_max"),
                     "measured_wind_direction": latest.get("measured_wind_direction"),
                 }
             )

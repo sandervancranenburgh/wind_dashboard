@@ -359,8 +359,10 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
     for record in records:
         speed = record.get("measured_wind_speed")
         gust = record.get("measured_wind_gust")
+        minimum = record.get("measured_wind_min")
+        maximum = record.get("measured_wind_max", gust)
         timestamp = record.get("timestamp")
-        if speed is None and gust is None:
+        if speed is None and gust is None and minimum is None and maximum is None:
             continue
         try:
             ts_value = int(timestamp)
@@ -373,6 +375,8 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
                 "timestamp": ts_value,
                 "speed": None if speed is None else float(speed),
                 "gust": None if gust is None else float(gust),
+                "minimum": None if minimum is None else float(minimum),
+                "maximum": None if maximum is None else float(maximum),
                 "direction": None if record.get("measured_wind_direction") is None else float(record.get("measured_wind_direction")),
                 "iso_time": record.get("iso_time"),
             }
@@ -380,10 +384,19 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
     if not points:
         return {"available": False}
 
+    for index, point in enumerate(points):
+        window_start = point["timestamp"] - 30 * 60 * 1000
+        window_values = [
+            candidate["speed"]
+            for candidate in points[: index + 1]
+            if candidate["timestamp"] >= window_start and candidate["speed"] is not None
+        ]
+        point["trend"] = None if not window_values else sum(window_values) / len(window_values)
+
     values = [
         value
         for point in points
-        for value in (point["speed"], point["gust"])
+        for value in (point["speed"], point["minimum"], point["maximum"], point["trend"])
         if value is not None
     ]
     values.extend(
@@ -533,7 +546,9 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         "plot_width": plot_width,
         "plot_height": plot_height,
         "speed_points": polyline("speed"),
-        "gust_points": polyline("gust"),
+        "min_points": polyline("minimum"),
+        "max_points": polyline("maximum"),
+        "trend_points": polyline("trend"),
         "superlocal_points": prediction_polyline("superlocal_wind_speed"),
         "harmonie_points": prediction_polyline("harmonie_wind_speed"),
         "prediction_issued_iso": (predictions or {}).get("issued_iso"),
@@ -560,8 +575,9 @@ def _dashboard_last_updated() -> str:
 
 @app.route("/")
 def portal_home():
+    next_url = _safe_next_url(request.args.get("next"))
     if current_user() is not None:
-        return redirect(url_for("experiences"))
+        return redirect(next_url or url_for("experiences"))
     return render_template("portal_home.html")
 
 
@@ -694,9 +710,9 @@ def new_experience():
     return render_template(
         "submit_experience.html",
         form_values=form_values,
-        form_title="Submit experience",
+        form_title="New submission",
         form_action=url_for("new_experience"),
-        submit_label="Submit experience",
+        submit_label="New submission",
         spot_options=SPOT_OPTIONS,
         hour_options=HOUR_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
@@ -784,6 +800,11 @@ def experience_detail(experience_id: int):
         or not (row.get("measured_wind") or {}).get("plot_records")
         or measured_summary.get("max_wind_speed_kind") != "average_wind"
         or measured_summary.get("max_wind_gust") is None
+        or "wind_variability" not in measured_summary
+        or not any(
+            "measured_wind_min" in record and "measured_wind_max" in record
+            for record in (row.get("measured_wind") or {}).get("plot_records", [])
+        )
     ):
         db_store.refresh_surf_experience_measured_wind(conn, experience_id, user_id=user_id)
         row = db_store.get_surf_experience(conn, user_id, experience_id)

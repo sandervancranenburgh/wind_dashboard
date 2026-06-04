@@ -2,11 +2,7 @@
 {% block title %}Submission Detail{% endblock %}
 {% block content %}
   <main class="page">
-    <div class="form-actions">
-      <h2 style="margin-right:auto;">Submission detail</h2>
-      <a class="button" href="{{ url_for('experiences') }}">My submissions</a>
-      <a class="button primary" href="{{ url_for('new_experience') }}">Submit experience</a>
-    </div>
+    <h2>Submission detail</h2>
     <dl class="detail-list">
       <dt>Date</dt><dd>{{ row.date }}</dd>
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
@@ -24,11 +20,12 @@
         {% if row.measured_wind_status == 'ok' %}
           {% set measured_summary = row.measured_wind.summary or {} %}
           <div class="wind-summary">
-            <span>avg speed</span><span class="value">{{ '%.1f'|format(row.avg_measured_wind_speed) if row.avg_measured_wind_speed is not none else 'n/a' }}</span>
-            <span>max speed</span><span class="value">{{ '%.1f'|format(row.max_measured_wind_speed) if row.max_measured_wind_speed is not none else 'n/a' }}</span>
-            <span>min speed</span><span class="value">{{ '%.1f'|format(row.min_measured_wind_speed) if row.min_measured_wind_speed is not none else 'n/a' }}</span>
-            <span>max gust</span><span class="value">{{ '%.1f'|format(measured_summary.get('max_wind_gust')) if measured_summary.get('max_wind_gust') is not none else 'n/a' }}</span>
-            <span>Avg direction</span><span class="value">{{ row.mean_measured_direction_display or 'n/a' }}</span>
+            <span>avg speed</span><span class="value">{{ ('%.1f kts'|format(row.avg_measured_wind_speed)) if row.avg_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>max avg speed</span><span class="value">{{ ('%.1f kts'|format(row.max_measured_wind_speed)) if row.max_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>min avg speed</span><span class="value">{{ ('%.1f kts'|format(row.min_measured_wind_speed)) if row.min_measured_wind_speed is not none else 'n/a' }}</span>
+            <span>max gust</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('max_wind_gust'))) if measured_summary.get('max_wind_gust') is not none else 'n/a' }}</span>
+            <span title="Average 15-min rolling standard deviation of measured wind.">wind variability</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('wind_variability'))) if measured_summary.get('wind_variability') is not none else 'n/a' }}</span>
+            <span>avg direction</span><span class="value">{{ row.mean_measured_direction_display or 'n/a' }}</span>
           </div>
         {% else %}
           unavailable
@@ -38,7 +35,7 @@
     <h2>Measured wind</h2>
     {% if wind_plot.available %}
       <figure class="wind-plot">
-        <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured wind speed and gust during the session">
+        <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured average, minimum, maximum, and trend wind during the session">
           <defs>
             <linearGradient id="sessionWindBg" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="#7fb6ff" stop-opacity="0.45"></stop>
@@ -74,11 +71,17 @@
           {% if wind_plot.superlocal_points %}
             <polyline points="{{ wind_plot.superlocal_points }}" fill="none" stroke="#f28e2b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.95"></polyline>
           {% endif %}
-          {% if wind_plot.gust_points %}
-            <polyline points="{{ wind_plot.gust_points }}" fill="none" stroke="#cc33cc" stroke-width="2.0" stroke-dasharray="7 5" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.68"></polyline>
+          {% if wind_plot.min_points %}
+            <polyline points="{{ wind_plot.min_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.62"></polyline>
+          {% endif %}
+          {% if wind_plot.max_points %}
+            <polyline points="{{ wind_plot.max_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.62"></polyline>
           {% endif %}
           {% if wind_plot.speed_points %}
             <polyline points="{{ wind_plot.speed_points }}" fill="none" stroke="#cc33cc" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)"></polyline>
+          {% endif %}
+          {% if wind_plot.trend_points %}
+            <polyline points="{{ wind_plot.trend_points }}" fill="none" stroke="#b000b8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.82"></polyline>
           {% endif %}
           {% for arrow in wind_plot.direction_arrows %}
             <line x1="{{ arrow.x1 }}" y1="{{ arrow.y1 }}" x2="{{ arrow.x2 }}" y2="{{ arrow.y2 }}" stroke="#cc33cc" stroke-width="1.7" marker-end="url(#sessionWindArrow)"></line>
@@ -88,8 +91,13 @@
           {% endif %}
         </svg>
         <figcaption>
-          <span class="legend-line speed"></span> speed
-          <span class="legend-line gust"></span> gust
+          <span class="legend-line speed"></span> measured avg
+          {% if wind_plot.min_points or wind_plot.max_points %}
+            <span class="legend-line gust"></span> measured min/max
+          {% endif %}
+          {% if wind_plot.trend_points %}
+            <span class="legend-line trend"></span> measured trend
+          {% endif %}
           {% if wind_plot.superlocal_points %}
             <span class="legend-line superlocal"></span> Super local
           {% endif %}

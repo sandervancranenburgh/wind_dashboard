@@ -1909,6 +1909,46 @@ def get_user_profile(conn: sqlite3.Connection, user_id: int) -> Optional[Dict[st
     }
 
 
+def _normalize_profile_identity(value: str | None) -> str:
+    return (value or "").strip().casefold()
+
+
+def find_user_profile_identity_conflicts(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    public_username: str | None = None,
+    rider_name: str | None = None,
+) -> Dict[str, int]:
+    requested_values = {
+        "public_username": _normalize_profile_identity(public_username),
+        "rider_name": _normalize_profile_identity(rider_name),
+    }
+    requested_values = {key: value for key, value in requested_values.items() if value}
+    if not requested_values:
+        return {}
+
+    conflicts: Dict[str, int] = {}
+    rows = conn.execute(
+        """
+        SELECT user_id, public_username, rider_name
+        FROM user_profiles
+        WHERE user_id != ?
+        """,
+        (int(user_id),),
+    ).fetchall()
+    for row in rows:
+        other_user_id = int(row[0])
+        if (
+            "public_username" in requested_values
+            and _normalize_profile_identity(row[1]) == requested_values["public_username"]
+        ):
+            conflicts["public_username"] = other_user_id
+        if "rider_name" in requested_values and _normalize_profile_identity(row[2]) == requested_values["rider_name"]:
+            conflicts["rider_name"] = other_user_id
+    return conflicts
+
+
 def upsert_user_profile(
     conn: sqlite3.Connection,
     user_id: int,

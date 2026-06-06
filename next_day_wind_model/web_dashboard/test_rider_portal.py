@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,6 +188,104 @@ class RiderPortalTest(unittest.TestCase):
         conn.close()
         self.assertIsNotNone(created)
 
+    def test_duplicate_public_username_is_rejected_for_different_user(self) -> None:
+        self._set_profile(self.other_user_id, "Existing Public Rider", "Other Rider")
+        self._set_user(self.user_id)
+
+        self.assertEqual(self.client.get("/profile").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": "  existing public rider  ",
+                "RiderName": "Unique Rider",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Public username is already in use.", response.data)
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertIsNone(db_store.get_user_profile(conn, self.user_id))
+        conn.close()
+
+    def test_duplicate_rider_name_is_rejected_for_different_user(self) -> None:
+        self._set_profile(self.other_user_id, "Other Public Rider", "Existing Rider Name")
+        self._set_user(self.user_id)
+
+        self.assertEqual(self.client.get("/profile").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": "Unique Public Rider",
+                "RiderName": "existing rider name",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Rider name is already in use.", response.data)
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertIsNone(db_store.get_user_profile(conn, self.user_id))
+        conn.close()
+
+    def test_same_user_can_save_existing_profile_identity_case_insensitively(self) -> None:
+        self._set_profile(self.user_id, "Current Public Rider", "Current Rider Name")
+        self._set_user(self.user_id)
+
+        self.assertEqual(self.client.get("/profile").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": " current public rider ",
+                "RiderName": " current rider name ",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        conn = db_store.connect_db(self.temp_dir.name)
+        profile = db_store.get_user_profile(conn, self.user_id)
+        conn.close()
+        self.assertEqual(profile["public_username"], "current public rider")
+        self.assertEqual(profile["rider_name"], "current rider name")
+
+    def test_blank_public_username_and_rider_name_are_allowed(self) -> None:
+        self._set_profile(self.other_user_id, "", "")
+        self._set_user(self.user_id)
+
+        self.assertEqual(self.client.get("/profile").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": "   ",
+                "RiderName": "",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        conn = db_store.connect_db(self.temp_dir.name)
+        profile = db_store.get_user_profile(conn, self.user_id)
+        conn.close()
+        self.assertEqual(profile["public_username"], "")
+        self.assertEqual(profile["rider_name"], "")
+
     def test_rider_name_defaults_to_public_username_without_rewriting_profile(self) -> None:
         self._set_user(self.user_id)
         self.assertEqual(self.client.get("/profile").status_code, 200)
@@ -305,6 +404,52 @@ class RiderPortalTest(unittest.TestCase):
         self.assertTrue(plot["min_points"])
         self.assertTrue(plot["max_points"])
         self.assertTrue(plot["trend_points"])
+        self.assertIn("threshold_y", plot)
+
+    def test_measured_wind_plot_trend_uses_measured_speed_records_only(self) -> None:
+        start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
+        measured = {
+            "plot_records": [
+                {"timestamp": start_ms, "measured_wind_speed": 10.0, "measured_wind_max": 12.0},
+                {"timestamp": start_ms + 3 * 60 * 1000, "measured_wind_speed": 12.0, "measured_wind_max": 14.0},
+                {"timestamp": start_ms + 6 * 60 * 1000, "measured_wind_max": 16.0},
+            ],
+            "summary": {},
+        }
+
+        plot = portal._measured_wind_plot(
+            {
+                "date": "2026-01-15",
+                "start_time": "12:00",
+                "end_time": "13:00",
+                "measured_wind": measured,
+            }
+        )
+
+        trend_coords = plot["trend_points"].split()
+        speed_coords = plot["speed_points"].split()
+        self.assertEqual(len(speed_coords), 2)
+        self.assertEqual(len(trend_coords), 2)
+        self.assertEqual(trend_coords[-1].split(",", 1)[0], speed_coords[-1].split(",", 1)[0])
+
+    def test_current_day_actual_trend_uses_measured_rows_only(self) -> None:
+        model_dir = str(Path(__file__).resolve().parents[1])
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
+        from next_day_wind_model import update_model_and_predict as updater
+
+        time_local = updater.pd.date_range(
+            "2026-01-15 08:00", periods=5, freq="3min", tz="Europe/Amsterdam"
+        )
+        trend = updater._measured_actual_trend_values(
+            updater.pd.Series(time_local),
+            updater.np.array([10.0, 12.0, updater.np.nan, updater.np.nan, updater.np.nan]),
+        )
+
+        self.assertEqual(trend[0], 10.0)
+        self.assertEqual(trend[1], 11.0)
+        self.assertTrue(updater.np.isnan(trend[2]))
+        self.assertTrue(updater.np.isnan(trend[-1]))
 
     def test_submission_detail_labels_units_and_primary_navigation_only(self) -> None:
         row = {

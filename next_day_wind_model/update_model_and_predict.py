@@ -1569,6 +1569,20 @@ def _smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
     return out
 
 
+def _measured_actual_trend_values(time_local: pd.Series, actual_values: np.ndarray) -> np.ndarray:
+    actual_series = pd.Series(np.asarray(actual_values, dtype=float), index=pd.DatetimeIndex(time_local))
+    measured_series = actual_series.dropna().sort_index()
+    out = pd.Series(np.nan, index=actual_series.index, dtype=float)
+    if measured_series.empty:
+        return out.to_numpy(dtype=float)
+
+    trend = measured_series.rolling("30min", min_periods=1).mean()
+    # This is a measured-data trend only, not a forecast; missing/future rows
+    # remain NaN so the plotted line stops at the latest actual measurement.
+    out.loc[trend.index] = trend
+    return out.to_numpy(dtype=float)
+
+
 def _parse_iso_utc(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -2236,10 +2250,7 @@ def save_current_day_plot(
     )
     has_actual_avg = bool(np.any(~np.isnan(actual_avg)))
     actual_trend = (
-        pd.Series(actual_avg, index=pd.DatetimeIndex(table["time_local"]))
-        .rolling("30min", min_periods=1)
-        .mean()
-        .to_numpy(dtype=float)
+        _measured_actual_trend_values(table["time_local"], actual_avg)
         if has_actual_avg
         else np.full(len(table), np.nan, dtype=float)
     )

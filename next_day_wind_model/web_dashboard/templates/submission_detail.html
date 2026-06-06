@@ -59,6 +59,8 @@
             <text x="6" y="{{ tick.label_y }}" font-size="12" fill="#555">{{ tick.label }}</text>
           {% endfor %}
           <text x="6" y="{{ wind_plot.pad_top - 5 }}" font-size="12" fill="#555">kts</text>
+          <line x1="{{ wind_plot.pad_left }}" y1="{{ wind_plot.threshold_y }}" x2="{{ wind_plot.plot_right }}" y2="{{ wind_plot.threshold_y }}" stroke="#174f4a" stroke-width="2.6" stroke-opacity="0.9"></line>
+          <text x="{{ wind_plot.plot_right - 6 }}" y="{{ wind_plot.threshold_label_y }}" font-size="12" fill="#174f4a" font-weight="700" text-anchor="end">10 kts</text>
           <line x1="{{ wind_plot.pad_left }}" y1="{{ wind_plot.pad_top }}" x2="{{ wind_plot.pad_left }}" y2="{{ wind_plot.axis_y }}" stroke="#888"></line>
           <line x1="{{ wind_plot.pad_left }}" y1="{{ wind_plot.axis_y }}" x2="{{ wind_plot.plot_right }}" y2="{{ wind_plot.axis_y }}" stroke="#888"></line>
           {% for tick in wind_plot.hour_ticks %}

@@ -452,12 +452,16 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
     if not points:
         return {"available": False}
 
-    for index, point in enumerate(points):
+    points.sort(key=lambda point: point["timestamp"])
+    for point in points:
+        if point["speed"] is None:
+            point["trend"] = None
+            continue
         window_start = point["timestamp"] - 30 * 60 * 1000
         window_values = [
             candidate["speed"]
-            for candidate in points[: index + 1]
-            if candidate["timestamp"] >= window_start and candidate["speed"] is not None
+            for candidate in points
+            if window_start <= candidate["timestamp"] <= point["timestamp"] and candidate["speed"] is not None
         ]
         point["trend"] = None if not window_values else sum(window_values) / len(window_values)
 
@@ -478,7 +482,7 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
 
     min_value = 0.0
     max_observed = max(values)
-    max_value = max(5.0, math.ceil(max_observed / 5.0) * 5.0)
+    max_value = max(10.0, math.ceil(max_observed / 5.0) * 5.0)
 
     min_ts = session_start_ms if session_start_ms is not None else min(point["timestamp"] for point in points)
     max_ts = session_end_ms if session_end_ms is not None else max(point["timestamp"] for point in points)
@@ -601,6 +605,8 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         for value in [tick + 2.5 for tick in y_tick_values[:-1]]
         if value < max_value
     ]
+    threshold_y = to_y(10.0)
+    threshold_label_y = threshold_y - 6.0 if threshold_y > pad_top + 14.0 else threshold_y + 16.0
 
     return {
         "available": True,
@@ -625,6 +631,8 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         "hour_ticks": hour_ticks,
         "y_ticks": y_ticks,
         "y_minor_ticks": y_minor_ticks,
+        "threshold_y": f"{threshold_y:.1f}",
+        "threshold_label_y": f"{threshold_label_y:.1f}",
         "direction_arrows": arrow_candidates,
     }
 
@@ -735,6 +743,16 @@ def profile():
             errors.append("RiderWeight must be greater than zero.")
         if default_spot and default_spot not in SPOT_OPTIONS:
             errors.append("DefaultSpot must be one of the allowed options.")
+        conflicts = db_store.find_user_profile_identity_conflicts(
+            get_db(),
+            int(user["id"]),
+            public_username=public_username,
+            rider_name=rider_name,
+        )
+        if "public_username" in conflicts:
+            errors.append("Public username is already in use.")
+        if "rider_name" in conflicts:
+            errors.append("Rider name is already in use.")
         if errors:
             for error in errors:
                 flash(error, "error")

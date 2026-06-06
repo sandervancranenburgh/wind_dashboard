@@ -50,7 +50,7 @@ SPOT_OPTIONS = [
 ]
 WING_SIZE_OPTIONS = [2, 3, 4, 5, 6, 7, 8]
 FOIL_SIZE_OPTIONS = list(range(700, 2501, 100))
-HOUR_OPTIONS = [f"{hour:02d}:00" for hour in range(24)]
+SESSION_TIME_OPTIONS = [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
 SORT_OPTIONS = {
     "date",
     "visibility",
@@ -201,6 +201,22 @@ def current_profile() -> dict[str, Any] | None:
     return db_store.get_user_profile(get_db(), int(user["id"]))
 
 
+def _effective_profile_rider_name(profile: dict[str, Any] | None) -> str:
+    if not profile:
+        return ""
+    return (profile.get("rider_name") or profile.get("public_username") or "").strip()
+
+
+def _profile_form_values(profile: dict[str, Any] | None) -> dict[str, Any]:
+    profile = profile or {}
+    return {
+        "public_username": profile.get("public_username") or "",
+        "rider_name": _effective_profile_rider_name(profile),
+        "rider_weight": profile.get("rider_weight"),
+        "default_spot": profile.get("default_spot") or "",
+    }
+
+
 def login_required(view: Callable):
     @functools.wraps(view)
     def wrapped(*args, **kwargs):
@@ -224,13 +240,33 @@ def _parse_int(value: str | None, field: str, errors: list[str], required: bool 
         return None
 
 
+def _parse_session_time(value: str) -> tuple[int, int] | None:
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (AttributeError, ValueError):
+        return None
+    if 0 <= hour <= 23 and minute in {0, 30}:
+        return hour, minute
+    return None
+
+
 def _local_session_bounds(day: str, start_time: str, end_time: str) -> tuple[int | None, int | None]:
     try:
-        start_hour = int(start_time[:2])
-        end_hour = int(end_time[:2])
+        start_parts = _parse_session_time(start_time)
+        end_parts = _parse_session_time(end_time)
+        if start_parts is None or end_parts is None:
+            return None, None
         session_date = date.fromisoformat(day)
-        start_dt = datetime.combine(session_date, datetime.min.time(), tzinfo=LOCAL_TZ).replace(hour=start_hour)
-        end_dt = datetime.combine(session_date, datetime.min.time(), tzinfo=LOCAL_TZ).replace(hour=end_hour)
+        start_dt = datetime.combine(session_date, datetime.min.time(), tzinfo=LOCAL_TZ).replace(
+            hour=start_parts[0],
+            minute=start_parts[1],
+        )
+        end_dt = datetime.combine(session_date, datetime.min.time(), tzinfo=LOCAL_TZ).replace(
+            hour=end_parts[0],
+            minute=end_parts[1],
+        )
     except (ValueError, TypeError):
         return None, None
     return (
@@ -243,7 +279,7 @@ def _experience_form_defaults() -> dict[str, Any]:
     profile = current_profile() or {}
     start_time = "12:00"
     return {
-        "Rider": profile.get("rider_name", ""),
+        "Rider": _effective_profile_rider_name(profile),
         "Spot": profile.get("default_spot") or "Valkenburgse meer",
         "Date": datetime.now(LOCAL_TZ).date().isoformat(),
         "StartTime": start_time,
@@ -279,11 +315,11 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
         date.fromisoformat(day)
     except ValueError:
         errors.append("Date must be valid.")
-    if start_time not in HOUR_OPTIONS:
-        errors.append("StartTime must be a full-hour time.")
-    if end_time not in HOUR_OPTIONS:
-        errors.append("EndTime must be a full-hour time.")
-    if start_time in HOUR_OPTIONS and end_time in HOUR_OPTIONS and end_time < start_time:
+    if start_time not in SESSION_TIME_OPTIONS:
+        errors.append("StartTime must be a half-hour time.")
+    if end_time not in SESSION_TIME_OPTIONS:
+        errors.append("EndTime must be a half-hour time.")
+    if start_time in SESSION_TIME_OPTIONS and end_time in SESSION_TIME_OPTIONS and end_time < start_time:
         errors.append("EndTime cannot be earlier than StartTime.")
     if rating is not None and not 1 <= rating <= 5:
         errors.append("SessionRating must be between 1 and 5.")
@@ -340,6 +376,24 @@ def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def _dashboard_asset_url(filename: str) -> str:
     return url_for("dashboard_asset", filename=filename)
+
+
+@app.template_filter("overview_date")
+def _format_overview_date(value: str) -> str:
+    try:
+        day = date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value or ""
+    return day.strftime("%d-%m-%Y")
+
+
+@app.template_filter("long_session_date")
+def _format_long_session_date(value: str) -> str:
+    try:
+        day = date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value or ""
+    return f"{day.strftime('%A')} {day.day} {day.strftime('%B %Y')}"
 
 
 def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, str] | None:
@@ -696,7 +750,7 @@ def profile():
             "rider_weight": rider_weight,
             "default_spot": default_spot,
         }
-    return render_template("profile.html", profile=profile_row or {}, spot_options=SPOT_OPTIONS)
+    return render_template("profile.html", profile=_profile_form_values(profile_row), spot_options=SPOT_OPTIONS)
 
 
 @app.route("/experience/new", methods=["GET", "POST"])
@@ -732,7 +786,7 @@ def new_experience():
         form_action=url_for("new_experience"),
         submit_label="Save submission",
         spot_options=SPOT_OPTIONS,
-        hour_options=HOUR_OPTIONS,
+        hour_options=SESSION_TIME_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
     )
@@ -767,7 +821,7 @@ def edit_experience(experience_id: int):
         form_action=url_for("edit_experience", experience_id=experience_id),
         submit_label="Save changes",
         spot_options=SPOT_OPTIONS,
-        hour_options=HOUR_OPTIONS,
+        hour_options=SESSION_TIME_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
     )

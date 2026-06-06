@@ -134,7 +134,8 @@ class RiderPortalTest(unittest.TestCase):
         profile_page = self.client.get("/profile")
         self.assertEqual(profile_page.status_code, 200)
         self.assertIn(b"Public username", profile_page.data)
-        self.assertIn(b"Shown with your public submissions. Your email/login name is not shown publicly.", profile_page.data)
+        self.assertIn(b"Shown with public submissions as your rider identity. Your email/login name is not shown publicly.", profile_page.data)
+        self.assertIn(b"Leave it empty to use your public username.", profile_page.data)
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
@@ -185,6 +186,72 @@ class RiderPortalTest(unittest.TestCase):
         created = db_store.get_user_by_username(conn, "new.rider@example.com")
         conn.close()
         self.assertIsNotNone(created)
+
+    def test_rider_name_defaults_to_public_username_without_rewriting_profile(self) -> None:
+        self._set_user(self.user_id)
+        self.assertEqual(self.client.get("/profile").status_code, 200)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        profile_response = self.client.post(
+            "/profile",
+            data={
+                "_csrf_token": csrf_token,
+                "PublicUsername": "Public Default",
+                "RiderName": "",
+                "RiderWeight": "80",
+                "DefaultSpot": "Valkenburgse meer",
+            },
+        )
+        self.assertEqual(profile_response.status_code, 302)
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertEqual(db_store.get_user_profile(conn, self.user_id)["rider_name"], "")
+        conn.close()
+
+        profile_page = self.client.get("/profile")
+        self.assertEqual(profile_page.status_code, 200)
+        self.assertIn(b'name="RiderName" value="Public Default"', profile_page.data)
+
+        new_page = self.client.get("/experience/new")
+        self.assertEqual(new_page.status_code, 200)
+        self.assertIn(b'name="Rider" value="Public Default"', new_page.data)
+        self.assertIn(b"Prefilled from RiderName, or Public username when RiderName is empty.", new_page.data)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        custom_form = self._valid_form("public")
+        custom_form["_csrf_token"] = csrf_token
+        custom_form["Rider"] = "Submission Custom Rider"
+        response = self.client.post("/experience/new", data=custom_form)
+        self.assertEqual(response.status_code, 302)
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        row = db_store.get_surf_experience(conn, self.user_id, 1)
+        self.assertEqual(row["rider"], "Submission Custom Rider")
+        self.assertEqual(db_store.get_user_profile(conn, self.user_id)["rider_name"], "")
+        conn.close()
+
+    def test_explicit_rider_name_overrides_public_username_for_new_submission_default(self) -> None:
+        self._set_profile(self.user_id, "Public Identity", "Private Form Rider")
+        self._set_user(self.user_id)
+
+        new_page = self.client.get("/experience/new")
+        self.assertEqual(new_page.status_code, 200)
+        self.assertIn(b'name="Rider" value="Private Form Rider"', new_page.data)
+        self.assertNotIn(b'name="Rider" value="Public Identity"', new_page.data)
+
+    def test_public_overview_uses_public_username_not_private_rider_name(self) -> None:
+        self._set_profile(self.user_id, "Visible Public Rider", "Private Form Rider")
+        public_id = self._create_submission(self.user_id, "Submission Private Rider", "2026-02-06", "public")
+        self._set_user(self.other_user_id)
+
+        overview = self.client.get("/experiences?scope=all")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn(f'href="/experiences/{public_id}"'.encode(), overview.data)
+        self.assertIn(b"Visible Public Rider", overview.data)
+        self.assertNotIn(b"Private Form Rider", overview.data)
+        self.assertNotIn(b"Submission Private Rider", overview.data)
 
     def test_measured_report_min_max_trend_and_variability(self) -> None:
         start_ms, end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
@@ -277,6 +344,7 @@ class RiderPortalTest(unittest.TestCase):
             self.assertIn(label, detail)
         for value in (b"14.4 kts", b"20.0 kts", b"9.0 kts", b"30.0 kts", b"1.8 kts", b"SW (208 deg)"):
             self.assertIn(value, detail)
+        self.assertIn(b"<dt>Date</dt><dd>Thursday 15 January 2026</dd>", detail)
         self.assertNotIn(b'class="form-actions"', detail)
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
         self.assertEqual(detail.count(b'href="/experience/new"'), 1)
@@ -300,6 +368,18 @@ class RiderPortalTest(unittest.TestCase):
         public_form, public_errors = portal._validate_experience_form(self._valid_form("public"))
         self.assertEqual(public_form["visibility"], "public")
         self.assertEqual(public_errors, [])
+        half_hour_form = self._valid_form()
+        half_hour_form["StartTime"] = "15:30"
+        half_hour_form["EndTime"] = "17:30"
+        half_hour_experience, half_hour_errors = portal._validate_experience_form(half_hour_form)
+        self.assertEqual(half_hour_errors, [])
+        self.assertEqual(half_hour_experience["start_time"], "15:30")
+        self.assertEqual(half_hour_experience["end_time"], "17:30")
+        self.assertEqual(half_hour_experience["end_ts"] - half_hour_experience["start_ts"], 120 * 60 * 1000)
+        invalid_time_form = self._valid_form()
+        invalid_time_form["StartTime"] = "15:15"
+        _, invalid_time_errors = portal._validate_experience_form(invalid_time_form)
+        self.assertIn("StartTime must be a half-hour time.", invalid_time_errors)
         _, invalid_errors = portal._validate_experience_form(self._valid_form("friends"))
         self.assertIn("Visibility must be private or public.", invalid_errors)
 
@@ -382,10 +462,22 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(new_page.status_code, 200)
         self.assertIn(b'checked', new_page.data.split(b'value="private"', 1)[1].split(b'>', 1)[0])
         self.assertIn(b'<button class="primary" type="submit">Save submission</button>', new_page.data)
+        self.assertIn(b'<option value="12:30"', new_page.data)
+        self.assertIn(b'<option value="15:30"', new_page.data)
+        self.assertIn(b'<option value="17:30"', new_page.data)
+        self.assertIn(b"function parseTimeToMinutes(value)", new_page.data)
+        self.assertIn(b"function formatMinutesToTime(totalMinutes)", new_page.data)
+        self.assertIn(b"resolveEndValue(start + 120, start)", new_page.data)
+        self.assertIn(b"validOptions[validOptions.length - 1]", new_page.data)
+        self.assertIn(b"addEventListener(\"change\", () => syncEndOptions(true))", new_page.data)
+        self.assertIn(b"Private RiderNotes", new_page.data)
+        self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
         private_form = self._valid_form()
+        private_form["StartTime"] = "12:30"
+        private_form["EndTime"] = "14:00"
         private_form["_csrf_token"] = csrf_token
         private_response = self.client.post("/experience/new", data=private_form)
         self.assertEqual(private_response.status_code, 302)
@@ -401,9 +493,19 @@ class RiderPortalTest(unittest.TestCase):
         conn = db_store.connect_db(self.temp_dir.name)
         rows = db_store.list_surf_experiences(conn, self.user_id)
         visibility_by_date = {row["date"]: row["visibility"] for row in rows}
+        private_time_row = conn.execute(
+            "SELECT start_time, end_time, end_ts - start_ts FROM surf_experiences WHERE date = ?",
+            ("2026-01-20",),
+        ).fetchone()
+        private_notes_row = conn.execute(
+            "SELECT rider_notes FROM surf_experiences WHERE date = ?",
+            ("2026-01-20",),
+        ).fetchone()
         conn.close()
         self.assertEqual(visibility_by_date["2026-01-20"], "private")
         self.assertEqual(visibility_by_date["2026-01-21"], "public")
+        self.assertEqual(private_time_row, ("12:30", "14:00", 90 * 60 * 1000))
+        self.assertEqual(private_notes_row, ("Form notes",))
 
     def test_submission_scopes_and_detail_access_control(self) -> None:
         self._set_profile(self.user_id, "Zulu Rider", "Owner Private Name")
@@ -421,6 +523,8 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(f'href="/experiences/{other_private}"'.encode(), mine.data)
         self.assertNotIn(f'href="/experiences/{other_public}"'.encode(), mine.data)
         self.assertIn(b"Zulu Rider", mine.data)
+        self.assertIn(b">01-02-2026</a>", mine.data)
+        self.assertIn(b"data-sort=\"2026-02-01\"", mine.data)
 
         mine_by_rider = self.client.get("/experiences?scope=mine&sort=rider&dir=asc")
         self.assertEqual(mine_by_rider.status_code, 200)
@@ -433,6 +537,8 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(f'href="/experiences/{other_private}"'.encode(), all_submissions.data)
         self.assertIn(f'href="/experiences/{other_public}"'.encode(), all_submissions.data)
         self.assertIn(b"Alpha Rider", all_submissions.data)
+        self.assertIn(b">04-02-2026</a>", all_submissions.data)
+        self.assertIn(b"data-sort=\"2026-02-04\"", all_submissions.data)
         self.assertNotIn(b"other-rider", all_submissions.data)
         self.assertNotIn(b"Other Public", all_submissions.data)
         self.assertNotIn(b"<h2>All submissions</h2>", all_submissions.data)
@@ -468,6 +574,10 @@ class RiderPortalTest(unittest.TestCase):
         owner_private_detail = self.client.get(f"/experiences/{own_private}")
         self.assertEqual(owner_private_detail.status_code, 200)
         self.assertIn(b"Owner Private", owner_private_detail.data)
+        self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Private</dd>", owner_private_detail.data)
+        owner_public_detail = self.client.get(f"/experiences/{own_public}")
+        self.assertEqual(owner_public_detail.status_code, 200)
+        self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Public</dd>", owner_public_detail.data)
 
         other_private_detail = self.client.get(f"/experiences/{other_private}")
         self.assertEqual(other_private_detail.status_code, 404)
@@ -477,6 +587,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"other-rider", other_public_detail.data)
         self.assertNotIn(b"<dt>Rider</dt><dd>Other Public</dd>", other_public_detail.data)
         self.assertNotIn(b"<dt>RiderWeight</dt>", other_public_detail.data)
+        self.assertNotIn(b"Private RiderNotes", other_public_detail.data)
         self.assertNotIn(b"Private notes by Other Public", other_public_detail.data)
         self.assertNotIn(b"Modify", other_public_detail.data)
 

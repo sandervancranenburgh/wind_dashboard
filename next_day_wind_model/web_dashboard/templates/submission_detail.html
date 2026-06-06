@@ -4,7 +4,7 @@
   <main class="page">
     <h2>Submission detail <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></h2>
     <dl class="detail-list">
-      <dt>Date</dt><dd>{{ row.date }}</dd>
+      <dt>Date</dt><dd>{{ row.date|long_session_date }}</dd>
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
       <dt>Time</dt><dd>{{ row.start_time }} to {{ row.end_time }}</dd>
       <dt>Avg air temperature</dt><dd>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</dd>
@@ -15,7 +15,7 @@
       <dt>WingSize</dt><dd>{{ row.wing_size }} m2</dd>
       <dt>FoilSize</dt><dd>{{ row.foil_size }} cm2</dd>
       <dt>RiderReview</dt><dd>{{ row.rider_review }}</dd>
-      {% if row.is_owner %}<dt>RiderNotes</dt><dd>{{ row.rider_notes }}</dd>{% endif %}
+      {% if row.is_owner %}<dt>Private RiderNotes</dt><dd>{{ row.rider_notes }}</dd>{% endif %}
       <dt>Measured wind</dt>
       <dd>
         {% if row.measured_wind_status == 'ok' %}
@@ -113,7 +113,7 @@
     {% if current_day_archive_plot %}
       <h2>Measured wind full day from archive</h2>
       <figure class="wind-plot">
-        <img src="{{ current_day_archive_plot.url }}" alt="Archived current-day wind prediction for {{ row.date }}">
+        <img src="{{ current_day_archive_plot.url }}" alt="Archived current-day wind prediction for {{ row.date|long_session_date }}">
       </figure>
     {% endif %}
   </main>

@@ -1626,6 +1626,11 @@ def _format_last_plot_update_text(plot_updated_at_utc: datetime | pd.Timestamp |
     return f"Last plot update: {plot_txt}"
 
 
+def _format_static_day_label(value: datetime | pd.Timestamp) -> str:
+    dt = pd.Timestamp(value)
+    return f"{dt.strftime('%A')} {dt.day} {dt.strftime('%B %Y')}"
+
+
 def _format_model_id(model_trained_at_utc: str | None, local_tz: str) -> str:
     train_dt = _parse_iso_utc(model_trained_at_utc)
     if train_dt is None:
@@ -1662,18 +1667,32 @@ def save_prediction_plot(
     x = np.arange(len(table))
     table["hour_label"] = table["target_time_local"].dt.strftime("%H")
     first_dt = table["target_time_local"].iloc[0]
-    day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
+    day_label = _format_static_day_label(first_dt)
 
-    y_min = float(min(table["forecast_wind_min"].min(), table["forecast_wind_speed"].min(), table["lstm_pred_wind_speed"].min()))
-    y_max = float(
-        max(
-            table["forecast_wind_max"].max(),
-            table["forecast_wind_speed"].max(),
-            table["lstm_pred_wind_speed"].max(),
-            SUFFICIENT_WIND_THRESHOLD_KTS,
-        )
+    forecast_core_parts = [
+        table["forecast_wind_speed"].dropna(),
+        table["lstm_pred_wind_speed"].dropna(),
+    ]
+    forecast_core_nonempty = [part for part in forecast_core_parts if len(part)]
+    forecast_core_series = pd.concat(forecast_core_nonempty) if forecast_core_nonempty else pd.Series(dtype=float)
+    forecast_core_max = float(forecast_core_series.max()) if not forecast_core_series.empty else 0.0
+    harmonie_max_series = table["forecast_wind_max"].dropna()
+    harmonie_max = float(harmonie_max_series.max()) if not harmonie_max_series.empty else 0.0
+    y_upper_raw = max(
+        forecast_core_max * 1.12,
+        min(harmonie_max * 1.04, forecast_core_max * 1.35 + 2.0),
+        SUFFICIENT_WIND_THRESHOLD_KTS + 0.8,
+        10.0,
     )
-    pad = max((y_max - y_min) * 0.08, 0.8)
+    y_upper = float(np.ceil(y_upper_raw / 2.5) * 2.5)
+    if not mobile:
+        print(
+            "Static next-day y-axis | "
+            f"forecast_core_max={forecast_core_max:.2f} "
+            f"harmonie_max={harmonie_max:.2f} "
+            f"y_upper={y_upper:.2f} "
+            f"harmonie_max_clipped={harmonie_max > y_upper}"
+        )
 
     fig_size = (8.4, 8.8) if mobile else (14, 7.2)
     title_fs = 14 if mobile else None
@@ -1683,7 +1702,7 @@ def save_prediction_plot(
     meta_fs = 10 if mobile else 9
     meta_y = 1.14 if mobile else 1.13
     fig, ax = plt.subplots(figsize=fig_size)
-    _apply_speed_background(ax, y_max + pad, x_left=0.0, x_right=len(table) - 1.0)
+    _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     _draw_sufficient_wind_threshold(ax)
     marker_size = 3.0
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
@@ -1699,7 +1718,7 @@ def save_prediction_plot(
         linewidth=2.4,
         label="Super local wind prediction - avg speed",
     )
-    ax.set_title(f"Next-day wind speed: {day_label}.", fontsize=title_fs)
+    ax.set_title(day_label, fontsize=title_fs)
     ax.set_xlabel("Time", fontsize=label_fs)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
@@ -1726,7 +1745,7 @@ def save_prediction_plot(
     ax.set_xticks(x, table["hour_label"], rotation=0)
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)
-    ax.set_ylim(0.0, y_max + pad)
+    ax.set_ylim(0.0, y_upper)
     ax.text(
         0.015,
         meta_y,
@@ -2199,7 +2218,7 @@ def save_current_day_plot(
     x = np.arange(len(table))
     x_lookup = {ts: idx for idx, ts in enumerate(table["time_local"])}
     first_dt = table["time_local"].iloc[0]
-    day_label = f"{first_dt.day} {first_dt.strftime('%B %Y')}"
+    day_label = _format_static_day_label(first_dt)
 
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
     fc_high = table["forecast_wind_max"].to_numpy(dtype=float)
@@ -2580,7 +2599,7 @@ def save_current_day_plot(
             label="_nolegend_",
         )
 
-    ax.set_title(f"Current-day wind prediction: {day_label}", fontsize=title_fs, pad=title_pad)
+    ax.set_title(day_label, fontsize=title_fs, pad=title_pad)
     ax.set_xlabel("Time", fontsize=label_fs)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)

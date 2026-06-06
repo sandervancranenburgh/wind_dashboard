@@ -41,7 +41,7 @@
         <tbody>
           {% for row in rows %}
             <tr>
-              <td><a href="{{ url_for('experience_detail', experience_id=row.id) }}">{{ row.date }}</a></td>
+              <td data-sort="{{ row.date }}"><a href="{{ url_for('experience_detail', experience_id=row.id) }}">{{ row.date|overview_date }}</a></td>
               <td><span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></td>
               <td>{{ row.rider_display }}</td>
               <td>{{ row.spot }}</td>

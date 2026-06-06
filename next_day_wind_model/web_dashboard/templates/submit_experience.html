@@ -9,6 +9,7 @@
         <div>
           <label for="Rider">Rider *</label>
           <input id="Rider" name="Rider" value="{{ form_values.Rider }}" required>
+          <p class="desc">Prefilled from RiderName, or Public username when RiderName is empty.</p>
         </div>
         <div>
           <label for="Spot">Spot *</label>
@@ -81,8 +82,9 @@
           </div>
         </div>
         <div class="form-row-full">
-          <label for="RiderNotes">RiderNotes</label>
+          <label for="RiderNotes">Private RiderNotes</label>
           <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
+          <p class="desc">Only visible to you. Not shown on public submissions.</p>
         </div>
         <fieldset class="form-row-full">
           <legend>Visibility</legend>
@@ -108,17 +110,37 @@
   <script>
     const startSelect = document.getElementById("StartTime");
     const endSelect = document.getElementById("EndTime");
-    function hourValue(value) { return Number(value.slice(0, 2)); }
-    function syncEndOptions() {
-      const start = hourValue(startSelect.value);
-      for (const option of endSelect.options) option.disabled = hourValue(option.value) < start;
-      if (hourValue(endSelect.value) < start) {
-        const next = Math.min(start + 2, 23);
-        endSelect.value = `${String(next).padStart(2, "0")}:00`;
+    function parseTimeToMinutes(value) {
+      const [hours, minutes] = value.split(":").map(Number);
+      return hours * 60 + minutes;
+    }
+    function formatMinutesToTime(totalMinutes) {
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    }
+    function resolveEndValue(target, start) {
+      const targetValue = formatMinutesToTime(target);
+      const validOptions = Array.from(endSelect.options)
+        .map((option) => ({ value: option.value, minutes: parseTimeToMinutes(option.value) }))
+        .filter((option) => option.minutes >= start);
+      const exact = validOptions.find((option) => option.value === targetValue);
+      if (exact) return exact.value;
+      const later = validOptions.find((option) => option.minutes > target);
+      if (later) return later.value;
+      return validOptions.length ? validOptions[validOptions.length - 1].value : endSelect.value;
+    }
+    function syncEndOptions(updateDefault = false) {
+      const start = parseTimeToMinutes(startSelect.value);
+      for (const option of endSelect.options) option.disabled = parseTimeToMinutes(option.value) < start;
+      if (updateDefault) {
+        endSelect.value = resolveEndValue(start + 120, start);
+      } else if (parseTimeToMinutes(endSelect.value) < start) {
+        endSelect.value = resolveEndValue(parseTimeToMinutes(endSelect.value), start);
       }
     }
     if (startSelect && endSelect) {
-      startSelect.addEventListener("change", syncEndOptions);
+      startSelect.addEventListener("change", () => syncEndOptions(true));
       syncEndOptions();
     }
   </script>

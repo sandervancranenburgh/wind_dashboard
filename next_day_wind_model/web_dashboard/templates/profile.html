@@ -10,11 +10,12 @@
         <div class="form-row-full">
           <label for="PublicUsername">Public username</label>
           <input id="PublicUsername" name="PublicUsername" value="{{ profile.public_username or '' }}" autocomplete="nickname">
-          <p class="desc">Shown with your public submissions. Your email/login name is not shown publicly.</p>
+          <p class="desc">Shown with public submissions as your rider identity. Your email/login name is not shown publicly.</p>
         </div>
         <div>
           <label for="RiderName">RiderName</label>
           <input id="RiderName" name="RiderName" value="{{ profile.rider_name or '' }}" autocomplete="name">
+          <p class="desc">Optional name used to prefill your own session forms and details. Leave it empty to use your public username.</p>
         </div>
         <div>
           <label for="RiderWeight">RiderWeight</label>

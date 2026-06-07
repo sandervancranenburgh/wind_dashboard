@@ -2778,3 +2778,10 @@ def get_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: i
 
 def get_visible_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id: int) -> Optional[Dict[str, Any]]:
     return _get_surf_experience(conn, user_id, experience_id, allow_public=True)
+
+
+def get_public_surf_experience(conn: sqlite3.Connection, experience_id: int) -> Optional[Dict[str, Any]]:
+    row = _get_surf_experience(conn, -1, experience_id, allow_public=True)
+    if row is None or row["visibility"] != "public":
+        return None
+    return row

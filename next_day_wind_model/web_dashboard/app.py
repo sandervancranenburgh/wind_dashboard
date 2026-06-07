@@ -907,5 +907,24 @@ def experience_detail(experience_id: int):
     )
 
 
+@app.route("/share/experience/<int:experience_id>")
+def public_experience_share(experience_id: int):
+    conn = get_db()
+    row = db_store.get_public_surf_experience(conn, experience_id)
+    if row is None:
+        abort(404)
+    session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])
+    predictions = (
+        db_store.get_prediction_lines_for_session(conn, row["spot"], session_start_ms, session_end_ms)
+        if session_start_ms is not None and session_end_ms is not None
+        else {"status": "unavailable", "records": []}
+    )
+    return render_template(
+        "submission_public.html",
+        row=row,
+        wind_plot=_measured_wind_plot(row, predictions),
+    )
+
+
 if __name__ == "__main__":
     app.run(host=os.environ.get("WIND_DASHBOARD_HOST", "127.0.0.1"), port=int(os.environ.get("WIND_DASHBOARD_PORT", "8080")))

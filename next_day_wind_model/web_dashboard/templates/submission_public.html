@@ -1,44 +1,50 @@
-{% extends "base.html" %}
-{% block title %}Submission Detail{% endblock %}
-{% block content %}
-  <main class="page">
-    <div class="detail-header">
-      <h2 class="detail-title">
-        <span>Submission detail</span>
-        <span class="detail-title-actions">
-          <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span>
-          {% if row.visibility == 'public' %}
-            <span class="share-control">
-              <button type="button" class="share-icon-button" data-share-url="{{ url_for('public_experience_share', experience_id=row.id, _external=True) }}" aria-label="Share public submission" title="Share public submission">
-                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                  <path d="M12 3v11"></path>
-                  <path d="m7 8 5-5 5 5"></path>
-                  <path d="M6 11v8h12v-8"></path>
-                </svg>
-              </button>
-              <input class="share-url" type="text" readonly hidden value="{{ url_for('public_experience_share', experience_id=row.id, _external=True) }}" aria-label="Public share URL">
-              <span class="share-feedback" role="status" aria-live="polite"></span>
-            </span>
-          {% endif %}
-        </span>
-      </h2>
-      {% if row.visibility != 'public' and row.is_owner %}
-        <p class="desc share-note">Make this submission public to share it.</p>
-      {% endif %}
-    </div>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Public Session - {{ row.date|long_session_date }}</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111; background: #fff; }
+    main { max-width: 900px; }
+    h1 { margin: 0 0 8px 0; font-size: 28px; }
+    h2 { margin: 22px 0 10px 0; font-size: 20px; }
+    .meta { color: #555; margin: 0 0 16px 0; }
+    .visibility-badge { display: inline-block; border: 1px solid #4d8b68; border-radius: 999px; padding: 2px 7px; color: #245b3a; background: #eef8f1; font-size: 12px; font-weight: 700; text-transform: capitalize; }
+    .detail-list { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 8px 14px; max-width: 760px; }
+    .detail-list dt { font-weight: 700; }
+    .detail-list dd { margin: 0; }
+    .wind-summary { display: grid; grid-template-columns: max-content max-content; gap: 3px 18px; align-items: baseline; }
+    .wind-summary .value { font-variant-numeric: tabular-nums; }
+    .wind-plot { margin: 10px 0 0 0; max-width: 900px; }
+    .wind-plot svg { width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+    .wind-plot figcaption { display: flex; gap: 14px; align-items: center; color: #555; margin-top: 8px; flex-wrap: wrap; }
+    .legend-line { display: inline-block; width: 28px; height: 0; border-top: 3px solid #cc33cc; }
+    .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
+    .legend-line.superlocal { border-top-color: #f28e2b; }
+    .legend-line.harmonie { border-top-color: #777; }
+    .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
+    @media (max-width: 768px) {
+      body { margin: 10px; }
+      h1 { font-size: 24px; }
+      .detail-list { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Public session <span class="visibility-badge">public</span></h1>
+    <p class="meta">Shared from the Rider portal</p>
     <dl class="detail-list">
       <dt>Date</dt><dd>{{ row.date|long_session_date }}</dd>
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
       <dt>Time</dt><dd>{{ row.start_time }} to {{ row.end_time }}</dd>
-      <dt>Avg air temperature</dt><dd>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</dd>
-      <dt>SessionRating</dt><dd>{{ row.session_rating }}/5</dd>
       <dt>Submitted by</dt><dd>{{ row.submitted_by }}</dd>
-      {% if row.is_owner %}<dt>Rider</dt><dd>{{ row.rider }}</dd>{% endif %}
-      {% if row.is_owner %}<dt>RiderWeight</dt><dd>{{ row.rider_weight }} kg</dd>{% endif %}
+      <dt>SessionRating</dt><dd>{{ row.session_rating }}/5</dd>
       <dt>WingSize</dt><dd>{{ row.wing_size }} m2</dd>
       <dt>FoilSize</dt><dd>{{ row.foil_size }} cm2</dd>
       <dt>RiderReview</dt><dd>{{ row.rider_review }}</dd>
-      {% if row.is_owner %}<dt>Private RiderNotes</dt><dd>{{ row.rider_notes }}</dd>{% endif %}
       <dt>Measured wind</dt>
       <dd>
         {% if row.measured_wind_status == 'ok' %}
@@ -48,7 +54,7 @@
             <span>max avg speed</span><span class="value">{{ ('%.1f kts'|format(row.max_measured_wind_speed)) if row.max_measured_wind_speed is not none else 'n/a' }}</span>
             <span>min avg speed</span><span class="value">{{ ('%.1f kts'|format(row.min_measured_wind_speed)) if row.min_measured_wind_speed is not none else 'n/a' }}</span>
             <span>max gust</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('max_wind_gust'))) if measured_summary.get('max_wind_gust') is not none else 'n/a' }}</span>
-            <span title="Average 15-min rolling standard deviation of measured wind.">wind variability</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('wind_variability'))) if measured_summary.get('wind_variability') is not none else 'n/a' }}</span>
+            <span>wind variability</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('wind_variability'))) if measured_summary.get('wind_variability') is not none else 'n/a' }}</span>
             <span>avg direction</span><span class="value">{{ row.mean_measured_direction_display or 'n/a' }}</span>
           </div>
         {% else %}
@@ -61,19 +67,19 @@
       <figure class="wind-plot">
         <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured average, minimum, and maximum wind during the session">
           <defs>
-            <linearGradient id="sessionWindBg" x1="0" y1="1" x2="0" y2="0">
+            <linearGradient id="publicSessionWindBg" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="#7fb6ff" stop-opacity="0.45"></stop>
               <stop offset="42%" stop-color="#4ecdb2" stop-opacity="0.42"></stop>
               <stop offset="100%" stop-color="#22b36a" stop-opacity="0.45"></stop>
             </linearGradient>
-            <clipPath id="sessionWindClip">
+            <clipPath id="publicSessionWindClip">
               <rect x="{{ wind_plot.pad_left }}" y="{{ wind_plot.pad_top }}" width="{{ wind_plot.plot_width }}" height="{{ wind_plot.plot_height }}"></rect>
             </clipPath>
-            <marker id="sessionWindArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+            <marker id="publicSessionWindArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
               <path d="M 0 0 L 8 4 L 0 8 z" fill="#cc33cc"></path>
             </marker>
           </defs>
-          <rect x="{{ wind_plot.pad_left }}" y="{{ wind_plot.pad_top }}" width="{{ wind_plot.plot_width }}" height="{{ wind_plot.plot_height }}" fill="url(#sessionWindBg)"></rect>
+          <rect x="{{ wind_plot.pad_left }}" y="{{ wind_plot.pad_top }}" width="{{ wind_plot.plot_width }}" height="{{ wind_plot.plot_height }}" fill="url(#publicSessionWindBg)"></rect>
           {% for tick in wind_plot.y_minor_ticks %}
             <line x1="{{ wind_plot.pad_left }}" y1="{{ tick.y }}" x2="{{ wind_plot.plot_right }}" y2="{{ tick.y }}" stroke="#ffffff" stroke-opacity="0.28"></line>
           {% endfor %}
@@ -92,22 +98,22 @@
             <text x="{{ tick.x }}" y="{{ wind_plot.axis_y + 20 }}" font-size="12" fill="#555" text-anchor="middle">{{ tick.label }}</text>
           {% endfor %}
           {% if wind_plot.harmonie_points %}
-            <polyline points="{{ wind_plot.harmonie_points }}" fill="none" stroke="#777777" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.9"></polyline>
+            <polyline points="{{ wind_plot.harmonie_points }}" fill="none" stroke="#777777" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindClip)" opacity="0.9"></polyline>
           {% endif %}
           {% if wind_plot.superlocal_points %}
-            <polyline points="{{ wind_plot.superlocal_points }}" fill="none" stroke="#f28e2b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.95"></polyline>
+            <polyline points="{{ wind_plot.superlocal_points }}" fill="none" stroke="#f28e2b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindClip)" opacity="0.95"></polyline>
           {% endif %}
           {% if wind_plot.min_points %}
-            <polyline points="{{ wind_plot.min_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.62"></polyline>
+            <polyline points="{{ wind_plot.min_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindClip)" opacity="0.62"></polyline>
           {% endif %}
           {% if wind_plot.max_points %}
-            <polyline points="{{ wind_plot.max_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.62"></polyline>
+            <polyline points="{{ wind_plot.max_points }}" fill="none" stroke="#cc33cc" stroke-width="1.6" stroke-dasharray="2 3" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindClip)" opacity="0.62"></polyline>
           {% endif %}
           {% if wind_plot.speed_points %}
-            <polyline points="{{ wind_plot.speed_points }}" fill="none" stroke="#cc33cc" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)"></polyline>
+            <polyline points="{{ wind_plot.speed_points }}" fill="none" stroke="#cc33cc" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindClip)"></polyline>
           {% endif %}
           {% for arrow in wind_plot.direction_arrows %}
-            <line x1="{{ arrow.x1 }}" y1="{{ arrow.y1 }}" x2="{{ arrow.x2 }}" y2="{{ arrow.y2 }}" stroke="#cc33cc" stroke-width="1.7" marker-end="url(#sessionWindArrow)"></line>
+            <line x1="{{ arrow.x1 }}" y1="{{ arrow.y1 }}" x2="{{ arrow.x2 }}" y2="{{ arrow.y2 }}" stroke="#cc33cc" stroke-width="1.7" marker-end="url(#publicSessionWindArrow)"></line>
           {% endfor %}
           {% if wind_plot.direction_arrows %}
             <text x="{{ wind_plot.pad_left }}" y="{{ wind_plot.arrow_y + 28 }}" font-size="12" fill="#555">measured direction</text>
@@ -129,43 +135,6 @@
     {% else %}
       <p class="desc">Measured wind data are unavailable for this session.</p>
     {% endif %}
-    {% if current_day_archive_plot %}
-      <h2>Measured wind full day from archive</h2>
-      <figure class="wind-plot">
-        <img src="{{ current_day_archive_plot.url }}" alt="Archived current-day wind prediction for {{ row.date|long_session_date }}">
-      </figure>
-    {% endif %}
   </main>
-  {% if row.visibility == 'public' %}
-    <script>
-      (() => {
-        const button = document.querySelector(".share-icon-button");
-        const input = document.querySelector(".share-url");
-        const feedback = document.querySelector(".share-feedback");
-        if (!button || !input) return;
-
-        const setFeedback = (message) => {
-          if (!feedback) return;
-          feedback.textContent = message;
-        };
-
-        button.addEventListener("click", async () => {
-          const url = button.dataset.shareUrl || window.location.href;
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            try {
-              await navigator.clipboard.writeText(url);
-              setFeedback("Link copied");
-              return;
-            } catch (error) {
-              // Leave the visible URL selected as the final fallback.
-            }
-          }
-          input.hidden = false;
-          input.focus();
-          input.select();
-          setFeedback("Copy the link");
-        });
-      })();
-    </script>
-  {% endif %}
-{% endblock %}
+</body>
+</html>

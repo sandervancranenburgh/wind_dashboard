@@ -44,6 +44,7 @@ class RiderPortalTest(unittest.TestCase):
         day: str,
         visibility: str | None = None,
         measured_summary: dict[str, float] | None = None,
+        rider_review: str | None = None,
     ) -> int:
         start_ms, end_ms = portal._local_session_bounds(day, "12:00", "14:00")
         experience = {
@@ -56,7 +57,7 @@ class RiderPortalTest(unittest.TestCase):
             "start_ts": start_ms,
             "end_ts": end_ms,
             "session_rating": 4,
-            "rider_review": f"Review by {rider}",
+            "rider_review": f"Review by {rider}" if rider_review is None else rider_review,
             "rider_weight": 80,
             "wing_size": 5,
             "foil_size": 1200,
@@ -500,6 +501,7 @@ class RiderPortalTest(unittest.TestCase):
         for value in (b"14.4 kts", b"20.0 kts", b"9.0 kts", b"30.0 kts", b"1.8 kts", b"SW (208 deg)"):
             self.assertIn(value, detail)
         self.assertIn(b"Make this submission public to share it.", detail)
+        self.assertNotIn(b'class="share-icon-button"', detail)
         self.assertNotIn(b'class="primary share-button"', detail)
         self.assertIn(b"<dt>Date</dt><dd>Thursday 15 January 2026</dd>", detail)
         self.assertNotIn(b'class="form-actions"', detail)
@@ -748,19 +750,23 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"Owner Private", owner_private_detail.data)
         self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Private</dd>", owner_private_detail.data)
         self.assertIn(b"Make this submission public to share it.", owner_private_detail.data)
+        self.assertNotIn(b'class="share-icon-button"', owner_private_detail.data)
         self.assertNotIn(b'class="primary share-button"', owner_private_detail.data)
         owner_public_detail = self.client.get(f"/experiences/{own_public}")
         self.assertEqual(owner_public_detail.status_code, 200)
         self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Public</dd>", owner_public_detail.data)
-        self.assertIn(b'class="primary share-button"', owner_public_detail.data)
-        self.assertIn(f'value="http://localhost/experiences/{own_public}"'.encode(), owner_public_detail.data)
+        self.assertIn(b'class="share-icon-button"', owner_public_detail.data)
+        self.assertIn(b'aria-label="Share public submission"', owner_public_detail.data)
+        self.assertIn(f'data-share-url="http://localhost/share/experience/{own_public}"'.encode(), owner_public_detail.data)
+        self.assertIn(f'value="http://localhost/share/experience/{own_public}"'.encode(), owner_public_detail.data)
+        self.assertNotIn(f'value="http://localhost/experiences/{own_public}"'.encode(), owner_public_detail.data)
 
         other_private_detail = self.client.get(f"/experiences/{other_private}")
         self.assertEqual(other_private_detail.status_code, 404)
         other_public_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(other_public_detail.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", other_public_detail.data)
-        self.assertIn(b'class="primary share-button"', other_public_detail.data)
+        self.assertIn(b'class="share-icon-button"', other_public_detail.data)
         self.assertNotIn(b"other-rider", other_public_detail.data)
         self.assertNotIn(b"<dt>Rider</dt><dd>Other Public</dd>", other_public_detail.data)
         self.assertNotIn(b"<dt>RiderWeight</dt>", other_public_detail.data)
@@ -772,6 +778,27 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(other_public_edit.status_code, 404)
 
         self._set_user(None)
+        public_share = self.client.get(f"/share/experience/{other_public}")
+        self.assertEqual(public_share.status_code, 200)
+        self.assertIn(b"Public session", public_share.data)
+        self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", public_share.data)
+        self.assertIn(b"<dt>Spot</dt><dd>Valkenburgse meer</dd>", public_share.data)
+        self.assertIn(b"<dt>RiderReview</dt><dd>Review by Other Public</dd>", public_share.data)
+        self.assertIn(b"Measured wind", public_share.data)
+        self.assertNotIn(b"other-rider", public_share.data)
+        self.assertNotIn(b"<dt>Rider</dt>", public_share.data)
+        self.assertNotIn(b"RiderWeight", public_share.data)
+        self.assertNotIn(b"Private RiderNotes", public_share.data)
+        self.assertNotIn(b"Private notes by Other Public", public_share.data)
+        self.assertNotIn(b"Modify", public_share.data)
+        self.assertNotIn(b"Delete", public_share.data)
+        self.assertNotIn(b"_csrf_token", public_share.data)
+        self.assertNotIn(b"Profile", public_share.data)
+        self.assertNotIn(b"Login", public_share.data)
+
+        self.assertEqual(self.client.get(f"/share/experience/{own_private}").status_code, 404)
+        self.assertEqual(self.client.get(f"/share/experience/{other_private}").status_code, 404)
+
         logged_out_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(logged_out_detail.status_code, 302)
         self.assertIn("login=1", logged_out_detail.headers["Location"])
@@ -781,7 +808,13 @@ class RiderPortalTest(unittest.TestCase):
         conn = db_store.connect_db(self.temp_dir.name)
         no_name_user_id = db_store.create_user(conn, "private.login@example.com", portal._hash_password("test-password"))
         conn.close()
-        unnamed_public = self._create_submission(no_name_user_id, "Secret Freeform Name", "2026-02-05", "public")
+        unnamed_public = self._create_submission(
+            no_name_user_id,
+            "Secret Freeform Name",
+            "2026-02-05",
+            "public",
+            rider_review="Public review without private name",
+        )
 
         self._set_user(self.user_id)
         overview = self.client.get("/experiences?scope=all&sort=rider&dir=asc")
@@ -795,6 +828,14 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Unknown rider</dd>", detail.data)
         self.assertNotIn(b"private.login@example.com", detail.data)
+
+        self._set_user(None)
+        public_share = self.client.get(f"/share/experience/{unnamed_public}")
+        self.assertEqual(public_share.status_code, 200)
+        self.assertIn(b"<dt>Submitted by</dt><dd>Unknown rider</dd>", public_share.data)
+        self.assertIn(b"Public review without private name", public_share.data)
+        self.assertNotIn(b"private.login@example.com", public_share.data)
+        self.assertNotIn(b"Secret Freeform Name", public_share.data)
 
 
 if __name__ == "__main__":

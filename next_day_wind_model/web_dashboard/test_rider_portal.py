@@ -37,7 +37,14 @@ class RiderPortalTest(unittest.TestCase):
         db_store.upsert_user_profile(conn, user_id, public_username, rider_name, 80, "Valkenburgse meer")
         conn.close()
 
-    def _create_submission(self, user_id: int, rider: str, day: str, visibility: str | None = None) -> int:
+    def _create_submission(
+        self,
+        user_id: int,
+        rider: str,
+        day: str,
+        visibility: str | None = None,
+        measured_summary: dict[str, float] | None = None,
+    ) -> int:
         start_ms, end_ms = portal._local_session_bounds(day, "12:00", "14:00")
         experience = {
             "user_id": user_id,
@@ -54,7 +61,12 @@ class RiderPortalTest(unittest.TestCase):
             "wing_size": 5,
             "foil_size": 1200,
             "rider_notes": f"Private notes by {rider}",
-            "measured_wind": {"status": "unavailable", "records": [], "plot_records": [], "summary": {}},
+            "measured_wind": {
+                "status": "ok" if measured_summary else "unavailable",
+                "records": [],
+                "plot_records": [],
+                "summary": measured_summary or {},
+            },
         }
         if visibility is not None:
             experience["visibility"] = visibility
@@ -352,7 +364,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"Private Form Rider", overview.data)
         self.assertNotIn(b"Submission Private Rider", overview.data)
 
-    def test_measured_report_min_max_trend_and_variability(self) -> None:
+    def test_measured_report_min_max_and_variability_without_session_trend(self) -> None:
         start_ms, end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
         self.assertIsNotNone(start_ms)
         self.assertIsNotNone(end_ms)
@@ -403,10 +415,10 @@ class RiderPortalTest(unittest.TestCase):
         self.assertTrue(plot["available"])
         self.assertTrue(plot["min_points"])
         self.assertTrue(plot["max_points"])
-        self.assertTrue(plot["trend_points"])
+        self.assertNotIn("trend_points", plot)
         self.assertIn("threshold_y", plot)
 
-    def test_measured_wind_plot_trend_uses_measured_speed_records_only(self) -> None:
+    def test_measured_wind_plot_speed_uses_measured_speed_records_only(self) -> None:
         start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
         measured = {
             "plot_records": [
@@ -426,11 +438,9 @@ class RiderPortalTest(unittest.TestCase):
             }
         )
 
-        trend_coords = plot["trend_points"].split()
         speed_coords = plot["speed_points"].split()
         self.assertEqual(len(speed_coords), 2)
-        self.assertEqual(len(trend_coords), 2)
-        self.assertEqual(trend_coords[-1].split(",", 1)[0], speed_coords[-1].split(",", 1)[0])
+        self.assertNotIn("trend_points", plot)
 
     def test_current_day_actual_trend_uses_measured_rows_only(self) -> None:
         model_dir = str(Path(__file__).resolve().parents[1])
@@ -489,6 +499,8 @@ class RiderPortalTest(unittest.TestCase):
             self.assertIn(label, detail)
         for value in (b"14.4 kts", b"20.0 kts", b"9.0 kts", b"30.0 kts", b"1.8 kts", b"SW (208 deg)"):
             self.assertIn(value, detail)
+        self.assertIn(b"Make this submission public to share it.", detail)
+        self.assertNotIn(b'class="primary share-button"', detail)
         self.assertIn(b"<dt>Date</dt><dd>Thursday 15 January 2026</dd>", detail)
         self.assertNotIn(b'class="form-actions"', detail)
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
@@ -656,9 +668,21 @@ class RiderPortalTest(unittest.TestCase):
         self._set_profile(self.user_id, "Zulu Rider", "Owner Private Name")
         self._set_profile(self.other_user_id, "Alpha Rider", "Other Private Name")
         own_private = self._create_submission(self.user_id, "Owner Private", "2026-02-01", "private")
-        own_public = self._create_submission(self.user_id, "Owner Public", "2026-02-02", "public")
+        own_public = self._create_submission(
+            self.user_id,
+            "Owner Public",
+            "2026-02-02",
+            "public",
+            {"wind_variability": 1.8, "point_count": 3},
+        )
         other_private = self._create_submission(self.other_user_id, "Other Private", "2026-02-03", "private")
-        other_public = self._create_submission(self.other_user_id, "Other Public", "2026-02-04", "public")
+        other_public = self._create_submission(
+            self.other_user_id,
+            "Other Public",
+            "2026-02-04",
+            "public",
+            {"wind_variability": 2.4, "point_count": 3},
+        )
 
         self._set_user(self.user_id)
         mine = self.client.get("/experiences?scope=mine")
@@ -700,6 +724,9 @@ class RiderPortalTest(unittest.TestCase):
             all_by_rider.data.index(f'href="/experiences/{other_public}"'.encode()),
             all_by_rider.data.index(f'href="/experiences/{own_private}"'.encode()),
         )
+        all_by_variability = self.client.get("/experiences?scope=all&sort=wind_variability&dir=asc")
+        self.assertEqual(all_by_variability.status_code, 200)
+        self.assertIn(b"sort=wind_variability", all_by_variability.data)
 
         conn = db_store.connect_db(self.temp_dir.name)
         other_public_row = next(
@@ -720,15 +747,20 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(owner_private_detail.status_code, 200)
         self.assertIn(b"Owner Private", owner_private_detail.data)
         self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Private</dd>", owner_private_detail.data)
+        self.assertIn(b"Make this submission public to share it.", owner_private_detail.data)
+        self.assertNotIn(b'class="primary share-button"', owner_private_detail.data)
         owner_public_detail = self.client.get(f"/experiences/{own_public}")
         self.assertEqual(owner_public_detail.status_code, 200)
         self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Public</dd>", owner_public_detail.data)
+        self.assertIn(b'class="primary share-button"', owner_public_detail.data)
+        self.assertIn(f'value="http://localhost/experiences/{own_public}"'.encode(), owner_public_detail.data)
 
         other_private_detail = self.client.get(f"/experiences/{other_private}")
         self.assertEqual(other_private_detail.status_code, 404)
         other_public_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(other_public_detail.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", other_public_detail.data)
+        self.assertIn(b'class="primary share-button"', other_public_detail.data)
         self.assertNotIn(b"other-rider", other_public_detail.data)
         self.assertNotIn(b"<dt>Rider</dt><dd>Other Public</dd>", other_public_detail.data)
         self.assertNotIn(b"<dt>RiderWeight</dt>", other_public_detail.data)

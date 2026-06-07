@@ -120,6 +120,11 @@
     .detail-list { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 8px 14px; max-width: 780px; }
     .detail-list dt { font-weight: 700; }
     .detail-list dd { margin: 0; }
+    .detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; max-width: 900px; }
+    .share-control { display: grid; grid-template-columns: auto minmax(220px, 1fr); align-items: center; gap: 8px; max-width: min(100%, 560px); }
+    .share-url { min-width: 0; padding: 8px 10px; font-size: 14px; }
+    .share-feedback { min-height: 18px; color: #245b3a; font-size: 13px; grid-column: 2; }
+    .share-note { margin: 0; }
     .wind-summary { display: grid; grid-template-columns: max-content max-content; gap: 3px 18px; align-items: baseline; }
     .wind-summary .value { font-variant-numeric: tabular-nums; }
     .wind-plot { margin: 10px 0 0 0; max-width: 900px; }
@@ -128,7 +133,6 @@
     .wind-plot figcaption { display: flex; gap: 14px; align-items: center; color: #555; margin-top: 8px; }
     .legend-line { display: inline-block; width: 28px; height: 0; border-top: 3px solid #cc33cc; }
     .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
-    .legend-line.trend { border-top-color: #b000b8; opacity: 0.82; }
     .legend-line.superlocal { border-top-color: #f28e2b; }
     .legend-line.harmonie { border-top-color: #777; }
     pre { white-space: pre-wrap; overflow-x: auto; background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
@@ -158,6 +162,9 @@
       img { max-height: 60vh; object-fit: contain; }
       .form-grid { grid-template-columns: 1fr; }
       .detail-list { grid-template-columns: 1fr; }
+      .detail-header { display: block; }
+      .share-control { grid-template-columns: 1fr; margin: 8px 0 0 0; }
+      .share-feedback { grid-column: 1; }
     }
   </style>
 </head>

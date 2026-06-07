@@ -2,7 +2,18 @@
 {% block title %}Submission Detail{% endblock %}
 {% block content %}
   <main class="page">
-    <h2>Submission detail <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></h2>
+    <div class="detail-header">
+      <h2>Submission detail <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span></h2>
+      {% if row.visibility == 'public' %}
+        <div class="share-control">
+          <button type="button" class="primary share-button" data-share-url="{{ url_for('experience_detail', experience_id=row.id, _external=True) }}">Share</button>
+          <input class="share-url" type="text" readonly value="{{ url_for('experience_detail', experience_id=row.id, _external=True) }}" aria-label="Share URL">
+          <span class="share-feedback" role="status" aria-live="polite"></span>
+        </div>
+      {% elif row.is_owner %}
+        <p class="desc share-note">Make this submission public to share it.</p>
+      {% endif %}
+    </div>
     <dl class="detail-list">
       <dt>Date</dt><dd>{{ row.date|long_session_date }}</dd>
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
@@ -36,7 +47,7 @@
     <h2>Measured wind</h2>
     {% if wind_plot.available %}
       <figure class="wind-plot">
-        <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured average, minimum, maximum, and trend wind during the session">
+        <svg viewBox="0 0 {{ wind_plot.width }} {{ wind_plot.height }}" role="img" aria-label="Measured average, minimum, and maximum wind during the session">
           <defs>
             <linearGradient id="sessionWindBg" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="#7fb6ff" stop-opacity="0.45"></stop>
@@ -83,9 +94,6 @@
           {% if wind_plot.speed_points %}
             <polyline points="{{ wind_plot.speed_points }}" fill="none" stroke="#cc33cc" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)"></polyline>
           {% endif %}
-          {% if wind_plot.trend_points %}
-            <polyline points="{{ wind_plot.trend_points }}" fill="none" stroke="#b000b8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#sessionWindClip)" opacity="0.82"></polyline>
-          {% endif %}
           {% for arrow in wind_plot.direction_arrows %}
             <line x1="{{ arrow.x1 }}" y1="{{ arrow.y1 }}" x2="{{ arrow.x2 }}" y2="{{ arrow.y2 }}" stroke="#cc33cc" stroke-width="1.7" marker-end="url(#sessionWindArrow)"></line>
           {% endfor %}
@@ -97,9 +105,6 @@
           <span class="legend-line speed"></span> measured avg
           {% if wind_plot.min_points or wind_plot.max_points %}
             <span class="legend-line gust"></span> measured min/max
-          {% endif %}
-          {% if wind_plot.trend_points %}
-            <span class="legend-line trend"></span> measured trend
           {% endif %}
           {% if wind_plot.superlocal_points %}
             <span class="legend-line superlocal"></span> Super local
@@ -119,4 +124,44 @@
       </figure>
     {% endif %}
   </main>
+  {% if row.visibility == 'public' %}
+    <script>
+      (() => {
+        const button = document.querySelector(".share-button");
+        const input = document.querySelector(".share-url");
+        const feedback = document.querySelector(".share-feedback");
+        if (!button || !input) return;
+
+        const setFeedback = (message) => {
+          if (!feedback) return;
+          feedback.textContent = message;
+        };
+
+        button.addEventListener("click", async () => {
+          const url = button.dataset.shareUrl || window.location.href;
+          if (navigator.share) {
+            try {
+              await navigator.share({ url, title: document.title });
+              setFeedback("Shared");
+              return;
+            } catch (error) {
+              if (error && error.name === "AbortError") return;
+            }
+          }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            try {
+              await navigator.clipboard.writeText(url);
+              setFeedback("Link copied");
+              return;
+            } catch (error) {
+              // Leave the visible URL selected as the final fallback.
+            }
+          }
+          input.focus();
+          input.select();
+          setFeedback("Copy the link");
+        });
+      })();
+    </script>
+  {% endif %}
 {% endblock %}

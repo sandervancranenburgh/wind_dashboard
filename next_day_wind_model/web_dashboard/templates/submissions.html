@@ -33,6 +33,7 @@
             <th>{{ sort_link('Min avg wind', 'min_measured_wind_speed') }}</th>
             <th>{{ sort_link('Max avg wind', 'max_measured_wind_speed') }}</th>
             <th>{{ sort_link('Max gust', 'max_measured_wind_gust') }}</th>
+            <th>{{ sort_link('Variability', 'wind_variability') }}</th>
             <th>{{ sort_link('Mean dir', 'mean_measured_direction') }}</th>
             <th>{{ sort_link('Avg air temp', 'avg_forecast_temperature') }}</th>
             <th>Actions</th>
@@ -61,6 +62,7 @@
               <td>{{ ('%.1f'|format(row.min_measured_wind_speed) ~ ' kts') if row.min_measured_wind_speed is not none else 'n/a' }}</td>
               <td>{{ ('%.1f'|format(row.max_measured_wind_speed) ~ ' kts') if row.max_measured_wind_speed is not none else 'n/a' }}</td>
               <td>{{ ('%.1f'|format(row.max_measured_wind_gust) ~ ' kts') if row.max_measured_wind_gust is not none else 'n/a' }}</td>
+              <td>{{ ('%.1f'|format(row.wind_variability) ~ ' kts') if row.wind_variability is not none else 'n/a' }}</td>
               <td>{{ row.mean_measured_direction_display or 'n/a' }}</td>
               <td>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</td>
               <td>
@@ -79,7 +81,7 @@
             </tr>
           {% else %}
             <tr>
-              <td colspan="14">No submissions yet.</td>
+              <td colspan="15">No submissions yet.</td>
             </tr>
           {% endfor %}
         </tbody>

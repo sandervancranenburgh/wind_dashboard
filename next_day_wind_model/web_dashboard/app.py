@@ -65,6 +65,7 @@ SORT_OPTIONS = {
     "max_measured_wind_speed",
     "min_measured_wind_speed",
     "max_measured_wind_gust",
+    "wind_variability",
     "mean_measured_direction",
     "avg_forecast_temperature",
 }
@@ -453,22 +454,11 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         return {"available": False}
 
     points.sort(key=lambda point: point["timestamp"])
-    for point in points:
-        if point["speed"] is None:
-            point["trend"] = None
-            continue
-        window_start = point["timestamp"] - 30 * 60 * 1000
-        window_values = [
-            candidate["speed"]
-            for candidate in points
-            if window_start <= candidate["timestamp"] <= point["timestamp"] and candidate["speed"] is not None
-        ]
-        point["trend"] = None if not window_values else sum(window_values) / len(window_values)
 
     values = [
         value
         for point in points
-        for value in (point["speed"], point["minimum"], point["maximum"], point["trend"])
+        for value in (point["speed"], point["minimum"], point["maximum"])
         if value is not None
     ]
     values.extend(
@@ -622,7 +612,6 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         "speed_points": polyline("speed"),
         "min_points": polyline("minimum"),
         "max_points": polyline("maximum"),
-        "trend_points": polyline("trend"),
         "superlocal_points": prediction_polyline("superlocal_wind_speed"),
         "harmonie_points": prediction_polyline("harmonie_wind_speed"),
         "prediction_issued_iso": (predictions or {}).get("issued_iso"),

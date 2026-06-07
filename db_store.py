@@ -2636,6 +2636,7 @@ def list_surf_experiences(
         "max_measured_wind_speed": "e.max_measured_wind_speed",
         "min_measured_wind_speed": "e.min_measured_wind_speed",
         "max_measured_wind_gust": "CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL)",
+        "wind_variability": "CAST(json_extract(e.measured_wind_data_json, '$.summary.wind_variability') AS REAL)",
         "mean_measured_direction": "e.mean_measured_direction",
         "avg_forecast_temperature": "e.avg_forecast_temperature",
     }
@@ -2651,6 +2652,7 @@ def list_surf_experiences(
                e.measured_wind_status, e.measured_wind_point_count,
                e.avg_measured_wind_speed, e.max_measured_wind_speed, e.min_measured_wind_speed,
                CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL),
+               CAST(json_extract(e.measured_wind_data_json, '$.summary.wind_variability') AS REAL),
                COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
                e.mean_measured_direction_label, e.avg_forecast_temperature
         FROM surf_experiences AS e
@@ -2662,8 +2664,8 @@ def list_surf_experiences(
     ).fetchall()
     experiences = []
     for row in rows:
-        mean_direction = row[21]
-        mean_direction_label = row[22] or _wind_direction_label(mean_direction)
+        mean_direction = row[22]
+        mean_direction_label = row[23] or _wind_direction_label(mean_direction)
         is_owner = int(row[1]) == int(user_id)
         experiences.append(
             {
@@ -2690,10 +2692,11 @@ def list_surf_experiences(
                 "max_measured_wind_speed": row[18],
                 "min_measured_wind_speed": row[19],
                 "max_measured_wind_gust": row[20],
+                "wind_variability": row[21],
                 "mean_measured_direction": mean_direction,
                 "mean_measured_direction_label": mean_direction_label,
                 "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
-                "avg_forecast_temperature": row[23],
+                "avg_forecast_temperature": row[24],
             }
         )
     return experiences

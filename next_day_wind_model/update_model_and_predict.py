@@ -1608,11 +1608,125 @@ def _parse_iso_series_utc(values: pd.Series) -> pd.Series:
     return pd.to_datetime(parsed, utc=True)
 
 
+def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _parse_harmonie_ms_utc(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _load_latest_harmonie_metadata_time(db_path: Path, site: str) -> tuple[datetime | None, str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if _sqlite_table_exists(conn, "harmonie_knmi_features"):
+            row = conn.execute(
+                """
+                SELECT fetched_ts, run_ts
+                FROM harmonie_knmi_features
+                WHERE site = ?
+                ORDER BY run_ts DESC, horizon_hr ASC
+                LIMIT 1
+                """,
+                (site,),
+            ).fetchone()
+            if row is not None:
+                fetched_dt = _parse_iso_utc(None if row[0] is None else str(row[0]))
+                if fetched_dt is not None:
+                    return fetched_dt, "fetched"
+                run_dt = _parse_iso_utc(None if row[1] is None else str(row[1]))
+                if run_dt is not None:
+                    return run_dt, "run"
+
+        if _sqlite_table_exists(conn, "knmi_forecasts_shadow"):
+            row = conn.execute(
+                """
+                SELECT fetched_iso, fetched_ts, run_iso, run_ts
+                FROM knmi_forecasts_shadow
+                WHERE site = ?
+                  AND model = 'HARMONIE'
+                ORDER BY run_ts DESC, horizon_hr ASC
+                LIMIT 1
+                """,
+                (site,),
+            ).fetchone()
+            if row is not None:
+                fetched_dt = _parse_iso_utc(None if row[0] is None else str(row[0]))
+                if fetched_dt is None:
+                    fetched_dt = _parse_harmonie_ms_utc(row[1])
+                if fetched_dt is not None:
+                    return fetched_dt, "fetched"
+                run_dt = _parse_iso_utc(None if row[2] is None else str(row[2]))
+                if run_dt is None:
+                    run_dt = _parse_harmonie_ms_utc(row[3])
+                if run_dt is not None:
+                    return run_dt, "run"
+
+        if _sqlite_table_exists(conn, "prediction_log"):
+            row = conn.execute(
+                """
+                SELECT harmonie_fetched_iso, harmonie_fetched_ts, harmonie_run_iso, harmonie_run_ts
+                FROM prediction_log
+                WHERE site = ?
+                  AND harmonie_run_ts IS NOT NULL
+                ORDER BY issued_ts DESC, target_ts ASC
+                LIMIT 1
+                """,
+                (site,),
+            ).fetchone()
+            if row is not None:
+                fetched_dt = _parse_iso_utc(None if row[0] is None else str(row[0]))
+                if fetched_dt is None:
+                    fetched_dt = _parse_harmonie_ms_utc(row[1])
+                if fetched_dt is not None:
+                    return fetched_dt, "fetched"
+                run_dt = _parse_iso_utc(None if row[2] is None else str(row[2]))
+                if run_dt is None:
+                    run_dt = _parse_harmonie_ms_utc(row[3])
+                if run_dt is not None:
+                    return run_dt, "run"
+    except sqlite3.Error:
+        return None, "fetched"
+    finally:
+        conn.close()
+    return None, "fetched"
+
+
+def _format_harmonie_metadata_text(
+    harmonie_time_utc: datetime | pd.Timestamp | str | None,
+    harmonie_time_kind: str,
+    local_tz: str,
+) -> str:
+    harmonie_dt = _parse_iso_utc(None if harmonie_time_utc is None else str(harmonie_time_utc))
+    kind = "run" if harmonie_time_kind == "run" else "fetched"
+    label = "HARMONIE run" if kind == "run" else "HARMONIE fetched"
+    if harmonie_dt is None:
+        return f"{label}: unknown"
+    tz = ZoneInfo(local_tz)
+    local_dt = harmonie_dt.astimezone(tz)
+    if local_dt.date() == datetime.now(tz).date():
+        harmonie_txt = local_dt.strftime("%H:%M")
+    else:
+        harmonie_txt = f"{local_dt.day} {local_dt.strftime('%B %H:%M')}"
+    return f"{label}: {harmonie_txt} local"
+
+
 def _format_plot_meta_text(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
     local_tz: str,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_time_kind: str = "fetched",
 ) -> str:
     pred_dt = _parse_iso_utc(prediction_generated_at_utc)
     pred_upd_dt = _parse_iso_utc(prediction_updated_at_utc)
@@ -1628,6 +1742,7 @@ def _format_plot_meta_text(
     return (
         f"Last plot update: {pred_txt}\n"
         f"Last prediction update: {pred_upd_txt}\n"
+        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz)}\n"
         f"Champion model trained & promoted: {train_txt}"
     )
 
@@ -1663,6 +1778,8 @@ def save_prediction_plot(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_time_kind: str = "fetched",
     mobile: bool = False,
 ) -> None:
     table = table.copy()
@@ -1733,7 +1850,7 @@ def save_prediction_plot(
         label="Super local wind prediction - avg speed",
     )
     ax.set_title(day_label, fontsize=title_fs)
-    ax.set_xlabel("Time", fontsize=label_fs)
+    ax.set_xlabel("Time", fontsize=label_fs, labelpad=24 if mobile else 26)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
     handles, labels = ax.get_legend_handles_labels()
@@ -1763,7 +1880,14 @@ def save_prediction_plot(
     ax.text(
         0.015,
         meta_y,
-        _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
+        _format_plot_meta_text(
+            prediction_generated_at_utc,
+            prediction_updated_at_utc,
+            model_trained_at_utc,
+            local_tz,
+            harmonie_time_utc=harmonie_time_utc,
+            harmonie_time_kind=harmonie_time_kind,
+        ),
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -2127,6 +2251,8 @@ def save_current_day_plot(
     prediction_generated_at_utc: str,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_time_kind: str = "fetched",
     prior_prediction_tables: list[pd.DataFrame] | None = None,
     live_monitoring_metric: dict | None = None,
     mobile: bool = False,
@@ -2368,7 +2494,7 @@ def save_current_day_plot(
 
     fig_size = (8.4, 8.8) if mobile else (14, 7.2)
     title_fs = 14 if mobile else None
-    title_pad = 18 if mobile else 28
+    title_pad = 12 if mobile else 20
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
@@ -2611,7 +2737,7 @@ def save_current_day_plot(
         )
 
     ax.set_title(day_label, fontsize=title_fs, pad=title_pad)
-    ax.set_xlabel("Time", fontsize=label_fs)
+    ax.set_xlabel("Time", fontsize=label_fs, labelpad=0)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
     order_map = {
@@ -2798,7 +2924,14 @@ def save_current_day_plot(
     ax.text(
         0.015,
         meta_text_y,
-        _format_plot_meta_text(prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz),
+        _format_plot_meta_text(
+            prediction_generated_at_utc,
+            prediction_updated_at_utc,
+            model_trained_at_utc,
+            local_tz,
+            harmonie_time_utc=harmonie_time_utc,
+            harmonie_time_kind=harmonie_time_kind,
+        ),
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -2843,9 +2976,12 @@ def save_current_day_plot(
                 zorder=z,
             )
 
-    layout_top = 0.89 if mobile else 0.94
-    layout_bottom = 0.055 if mobile else 0.04
+    layout_top = 0.78 if mobile else 0.82
+    layout_bottom = 0.20 if mobile else 0.19
+    xlabel_y = -0.21 if mobile else -0.23
     fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
+    fig.subplots_adjust(bottom=layout_bottom, top=layout_top)
+    ax.xaxis.set_label_coords(0.5, xlabel_y)
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -5183,6 +5319,8 @@ def _write_interactive_plot_assets(
     prediction_generated_at_utc: str | None = None,
     prediction_updated_at_utc: str | None = None,
     model_trained_at_utc: str | None = None,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_time_kind: str = "fetched",
 ) -> dict:
     assets: dict[str, str] = {}
 
@@ -5234,6 +5372,8 @@ def _write_interactive_plot_assets(
                 prediction_updated_at_utc,
                 model_trained_at_utc,
                 local_tz,
+                harmonie_time_utc=harmonie_time_utc,
+                harmonie_time_kind=harmonie_time_kind,
             )
 
             prior_payload_rows: list[dict] = []
@@ -5318,6 +5458,8 @@ def publish_web_dashboard(
     prediction_generated_at_utc: str | None = None,
     prediction_updated_at_utc: str | None = None,
     model_trained_at_utc: str | None = None,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_time_kind: str = "fetched",
     companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -5363,6 +5505,8 @@ def publish_web_dashboard(
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
     )
     if "dashboard_interactive_js" in interactive_assets:
         copied[interactive_assets["dashboard_interactive_js"]] = str(
@@ -5558,7 +5702,6 @@ def publish_web_dashboard(
                 <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
-            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
             <picture id="current-day-fallback">
         <source media="(max-width: 768px)" srcset="{current_day_mobile_src}">
         <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
@@ -5580,7 +5723,6 @@ def publish_web_dashboard(
                 <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
                 <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
-            <p class="interactive-fallback-note">If interactivity is unavailable, the static plot below remains visible.</p>
             <picture id="next-day-fallback">
         <source media="(max-width: 768px)" srcset="{next_day_mobile_src}">
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
@@ -6680,6 +6822,7 @@ def main() -> None:
         microsecond=0,
     )
     prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
+    harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
     next_day_prediction_log_rows = 0
     current_day_prediction_log_rows = 0
     prediction_evaluation_rows_materialized = 0
@@ -6745,6 +6888,8 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
     )
     save_prediction_plot(
         table,
@@ -6753,6 +6898,8 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
         mobile=True,
     )
 
@@ -6904,6 +7051,8 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
     )
@@ -6914,6 +7063,8 @@ def main() -> None:
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
@@ -7079,6 +7230,8 @@ def main() -> None:
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,
             model_trained_at_utc=model_last_trained_at_utc,
+            harmonie_time_utc=harmonie_time_utc,
+            harmonie_time_kind=harmonie_time_kind,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:

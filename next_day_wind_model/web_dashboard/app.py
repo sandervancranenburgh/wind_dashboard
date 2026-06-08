@@ -19,6 +19,7 @@ from flask import (
     abort,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -869,6 +870,25 @@ def delete_experience(experience_id: int):
     return redirect(url_for("experiences"))
 
 
+@app.post("/experiences/<int:experience_id>/share")
+@login_required
+def share_experience(experience_id: int):
+    _validate_csrf()
+    token = db_store.create_or_get_surf_experience_share_token(
+        get_db(),
+        experience_id,
+        int(current_user()["id"]),
+    )
+    if token is None:
+        abort(404)
+    share_url = url_for("public_experience_share", share_token=token, _external=True)
+    wants_json = request.headers.get("Accept", "").startswith("application/json")
+    if wants_json:
+        return jsonify({"share_url": share_url, "share_token": token})
+    flash("Share link ready.", "success")
+    return redirect(url_for("experience_detail", experience_id=experience_id, shared=1))
+
+
 @app.route("/experiences/<int:experience_id>")
 @login_required
 def experience_detail(experience_id: int):
@@ -907,10 +927,10 @@ def experience_detail(experience_id: int):
     )
 
 
-@app.route("/share/experience/<int:experience_id>")
-def public_experience_share(experience_id: int):
+@app.route("/share/experience/<share_token>")
+def public_experience_share(share_token: str):
     conn = get_db()
-    row = db_store.get_public_surf_experience(conn, experience_id)
+    row = db_store.get_shared_public_surf_experience(conn, share_token)
     if row is None:
         abort(404)
     session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])

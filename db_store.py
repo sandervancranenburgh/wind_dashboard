@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import secrets
 import shutil
 import sqlite3
 from datetime import datetime, timezone
@@ -33,6 +34,8 @@ SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
     "avg_forecast_temperature": "REAL",
     "min_forecast_temperature": "REAL",
     "max_forecast_temperature": "REAL",
+    "share_token": "TEXT",
+    "shared_at": "TEXT",
 }
 USER_PROFILE_OPTIONAL_COLUMNS = {
     "public_username": "TEXT",
@@ -389,6 +392,7 @@ def init_account_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_user_date ON surf_experiences(user_id, date, start_time)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_visibility_date ON surf_experiences(visibility, date, start_time)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_experiences_share_token ON surf_experiences(share_token)")
     conn.commit()
 
 
@@ -2235,18 +2239,6 @@ def get_measured_wind_for_session(
         """,
         (site, int(start_ts_ms), int(end_ts_ms)),
     ).fetchall()
-    prior_row = conn.execute(
-        """
-        SELECT ts, iso_time, wind_speed, wind_gust, wind_dir, payload
-        FROM observations
-        WHERE site = ?
-          AND ts < ?
-        ORDER BY ts DESC
-        LIMIT 1
-        """,
-        (site, int(start_ts_ms)),
-    ).fetchone()
-
     def observation_record(row: Any) -> Dict[str, Any]:
         ts, iso_time, wind_speed, wind_gust, wind_dir, payload_raw = row
         speed = _extract_observation_measurement(
@@ -2280,8 +2272,7 @@ def get_measured_wind_for_session(
         }
 
     records = [observation_record(row) for row in rows]
-    plot_source_records = ([observation_record(prior_row)] if prior_row is not None else []) + records
-    plot_records = _forward_fill_observation_records_to_plot_grid(plot_source_records, int(start_ts_ms), int(end_ts_ms))
+    plot_records = [record.copy() for record in records]
     speeds = [float(record["measured_wind_speed"]) for record in records if record["measured_wind_speed"] is not None]
     gusts = [float(record["measured_wind_gust"]) for record in records if record["measured_wind_gust"] is not None]
     directions = [
@@ -2335,40 +2326,6 @@ def get_measured_wind_for_session(
         "summary": summary,
     }
     return result
-
-
-def _forward_fill_observation_records_to_plot_grid(
-    records: List[Dict[str, Any]],
-    start_ts_ms: int,
-    end_ts_ms: int,
-) -> List[Dict[str, Any]]:
-    if not records:
-        return []
-    ordered = sorted(records, key=lambda record: int(record["timestamp"]))
-    dense_records: List[Dict[str, Any]] = []
-    grid_ts = (int(start_ts_ms) // CURRENT_DAY_PLOT_INTERVAL_MS) * CURRENT_DAY_PLOT_INTERVAL_MS
-    if grid_ts < int(start_ts_ms):
-        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
-    idx = 0
-    latest: Dict[str, Any] | None = None
-    while grid_ts <= int(end_ts_ms):
-        while idx < len(ordered) and int(ordered[idx]["timestamp"]) <= grid_ts:
-            latest = ordered[idx]
-            idx += 1
-        if latest is not None:
-            dense_records.append(
-                {
-                    "timestamp": int(grid_ts),
-                    "iso_time": _iso_utc_from_ms(int(grid_ts)),
-                    "measured_wind_speed": latest.get("measured_wind_speed"),
-                    "measured_wind_gust": latest.get("measured_wind_gust"),
-                    "measured_wind_min": latest.get("measured_wind_min"),
-                    "measured_wind_max": latest.get("measured_wind_max"),
-                    "measured_wind_direction": latest.get("measured_wind_direction"),
-                }
-            )
-        grid_ts += CURRENT_DAY_PLOT_INTERVAL_MS
-    return dense_records
 
 
 def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any]) -> int:
@@ -2720,7 +2677,8 @@ def _get_surf_experience(
                e.max_measured_wind_speed, e.min_measured_wind_speed,
                COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
                e.mean_measured_direction_label, e.avg_forecast_temperature,
-               e.min_forecast_temperature, e.max_forecast_temperature
+               e.min_forecast_temperature, e.max_forecast_temperature,
+               e.share_token, e.shared_at
         FROM surf_experiences AS e
         LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
         WHERE {access_clause}
@@ -2769,6 +2727,8 @@ def _get_surf_experience(
         "avg_forecast_temperature": row[24],
         "min_forecast_temperature": row[25],
         "max_forecast_temperature": row[26],
+        "share_token": row[27] if is_owner else None,
+        "shared_at": row[28] if is_owner else None,
     }
 
 
@@ -2785,3 +2745,79 @@ def get_public_surf_experience(conn: sqlite3.Connection, experience_id: int) -> 
     if row is None or row["visibility"] != "public":
         return None
     return row
+
+
+def get_shared_public_surf_experience(conn: sqlite3.Connection, share_token: str) -> Optional[Dict[str, Any]]:
+    token = (share_token or "").strip()
+    if not token:
+        return None
+    row = conn.execute(
+        """
+        SELECT id
+        FROM surf_experiences
+        WHERE share_token = ?
+          AND visibility = 'public'
+        """,
+        (token,),
+    ).fetchone()
+    if row is None:
+        return None
+    return get_public_surf_experience(conn, int(row[0]))
+
+
+def create_or_get_surf_experience_share_token(
+    conn: sqlite3.Connection,
+    experience_id: int,
+    user_id: int,
+) -> Optional[str]:
+    row = conn.execute(
+        """
+        SELECT share_token
+        FROM surf_experiences
+        WHERE id = ?
+          AND user_id = ?
+          AND visibility = 'public'
+        """,
+        (int(experience_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    existing = row[0]
+    if existing:
+        return str(existing)
+
+    for _ in range(8):
+        token = secrets.token_urlsafe(24)
+        now = _now_ms()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE surf_experiences
+                SET share_token = ?,
+                    shared_at = ?
+                WHERE id = ?
+                  AND user_id = ?
+                  AND visibility = 'public'
+                  AND share_token IS NULL
+                """,
+                (token, _iso_utc_from_ms(now), int(experience_id), int(user_id)),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            continue
+        if int(cur.rowcount) > 0:
+            return token
+        row = conn.execute(
+            """
+            SELECT share_token
+            FROM surf_experiences
+            WHERE id = ?
+              AND user_id = ?
+              AND visibility = 'public'
+            """,
+            (int(experience_id), int(user_id)),
+        ).fetchone()
+        if row is not None and row[0]:
+            return str(row[0])
+    return None

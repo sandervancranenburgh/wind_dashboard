@@ -7,18 +7,20 @@
         <span>Submission detail</span>
         <span class="detail-title-actions">
           <span class="visibility-badge {{ row.visibility }}">{{ row.visibility }}</span>
-          {% if row.visibility == 'public' %}
-            <span class="share-control">
-              <button type="button" class="share-icon-button" data-share-url="{{ url_for('public_experience_share', experience_id=row.id, _external=True) }}" aria-label="Share public submission" title="Share public submission">
+          {% if row.visibility == 'public' and row.is_owner %}
+            {% set share_url = url_for('public_experience_share', share_token=row.share_token, _external=True) if row.share_token else '' %}
+            <form class="share-control" method="post" action="{{ url_for('share_experience', experience_id=row.id) }}">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="share-icon-button" data-share-url="{{ share_url }}" aria-label="Share public submission" title="Share public submission">
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                   <path d="M12 3v11"></path>
                   <path d="m7 8 5-5 5 5"></path>
                   <path d="M6 11v8h12v-8"></path>
                 </svg>
               </button>
-              <input class="share-url" type="text" readonly hidden value="{{ url_for('public_experience_share', experience_id=row.id, _external=True) }}" aria-label="Public share URL">
-              <span class="share-feedback" role="status" aria-live="polite"></span>
-            </span>
+              <input class="share-url" type="text" readonly {% if not (row.share_token and request.args.get('shared')) %}hidden{% endif %} value="{{ share_url }}" aria-label="Public share URL">
+              <span class="share-feedback" role="status" aria-live="polite">{% if row.share_token and request.args.get('shared') %}Copy the link{% endif %}</span>
+            </form>
           {% endif %}
         </span>
       </h2>
@@ -136,24 +138,27 @@
       </figure>
     {% endif %}
   </main>
-  {% if row.visibility == 'public' %}
+  {% if row.visibility == 'public' and row.is_owner %}
     <script>
       (() => {
+        const form = document.querySelector(".share-control");
         const button = document.querySelector(".share-icon-button");
         const input = document.querySelector(".share-url");
         const feedback = document.querySelector(".share-feedback");
-        if (!button || !input) return;
+        if (!form || !button || !input) return;
 
         const setFeedback = (message) => {
           if (!feedback) return;
           feedback.textContent = message;
         };
 
-        button.addEventListener("click", async () => {
-          const url = button.dataset.shareUrl || window.location.href;
+        const copyUrl = async (url) => {
+          input.value = url;
+          button.dataset.shareUrl = url;
           if (navigator.clipboard && navigator.clipboard.writeText) {
             try {
               await navigator.clipboard.writeText(url);
+              input.hidden = true;
               setFeedback("Link copied");
               return;
             } catch (error) {
@@ -164,6 +169,29 @@
           input.focus();
           input.select();
           setFeedback("Copy the link");
+        };
+
+        form.addEventListener("submit", async (event) => {
+          const existingUrl = button.dataset.shareUrl;
+          if (existingUrl) {
+            event.preventDefault();
+            await copyUrl(existingUrl);
+            return;
+          }
+          event.preventDefault();
+          try {
+            const response = await fetch(form.action, {
+              method: "POST",
+              body: new FormData(form),
+              headers: {"Accept": "application/json"},
+              credentials: "same-origin",
+            });
+            if (!response.ok) throw new Error("Share request failed");
+            const payload = await response.json();
+            await copyUrl(payload.share_url);
+          } catch (error) {
+            form.submit();
+          }
         });
       })();
     </script>

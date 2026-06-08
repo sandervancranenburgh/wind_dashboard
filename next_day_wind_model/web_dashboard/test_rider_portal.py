@@ -404,6 +404,12 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIsNone(sparse["summary"]["wind_variability"])
         self.assertTrue(all("measured_wind_min" in record for record in measured["plot_records"]))
         self.assertTrue(all("measured_wind_max" in record for record in measured["plot_records"]))
+        plot_timestamps = [record["timestamp"] for record in measured["plot_records"]]
+        self.assertEqual(plot_timestamps, [row["timestamp"] for row in rows])
+        self.assertEqual(
+            [plot_timestamps[index + 1] - plot_timestamps[index] for index in range(len(plot_timestamps) - 1)],
+            [3 * 60 * 1000] * (len(plot_timestamps) - 1),
+        )
 
         plot = portal._measured_wind_plot(
             {
@@ -418,6 +424,41 @@ class RiderPortalTest(unittest.TestCase):
         self.assertTrue(plot["max_points"])
         self.assertNotIn("trend_points", plot)
         self.assertIn("threshold_y", plot)
+
+    def test_measured_report_keeps_six_minute_source_cadence_when_that_is_all_available(self) -> None:
+        start_ms, end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
+        rows = [
+            {
+                "timestamp": start_ms + index * 6 * 60 * 1000,
+                "AverageWind": 10.0 + index,
+                "MinWind": 9.0 + index,
+                "MaxWind": 12.0 + index,
+                "WindDirection": 225.0,
+            }
+            for index in range(4)
+        ]
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        db_store.upsert_observations(conn, "valkenburgsemeer", rows)
+        measured = db_store.get_measured_wind_for_session(conn, "Valkenburgse meer", start_ms, end_ms)
+        conn.close()
+
+        plot_timestamps = [record["timestamp"] for record in measured["plot_records"]]
+        self.assertEqual(plot_timestamps, [row["timestamp"] for row in rows])
+        self.assertEqual(
+            [plot_timestamps[index + 1] - plot_timestamps[index] for index in range(len(plot_timestamps) - 1)],
+            [6 * 60 * 1000] * (len(plot_timestamps) - 1),
+        )
+        plot = portal._measured_wind_plot(
+            {
+                "date": "2026-01-15",
+                "start_time": "12:00",
+                "end_time": "13:00",
+                "measured_wind": measured,
+            }
+        )
+        self.assertTrue(plot["available"])
+        self.assertEqual(len(plot["speed_points"].split()), len(rows))
 
     def test_measured_wind_plot_speed_uses_measured_speed_records_only(self) -> None:
         start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
@@ -603,11 +644,16 @@ class RiderPortalTest(unittest.TestCase):
         db_store.init_account_db(conn)
 
         visibility_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "visibility")
+        share_token_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "share_token")
+        shared_at_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "shared_at")
         public_username_column = next(row for row in conn.execute("PRAGMA table_info(user_profiles)") if row[1] == "public_username")
         self.assertEqual(visibility_column[3], 1)
         self.assertEqual(visibility_column[4], "'private'")
         self.assertEqual(conn.execute("SELECT visibility FROM surf_experiences WHERE id = 1").fetchone()[0], "private")
         self.assertEqual(public_username_column[2], "TEXT")
+        self.assertEqual(share_token_column[2], "TEXT")
+        self.assertEqual(shared_at_column[2], "TEXT")
+        self.assertIsNone(conn.execute("SELECT share_token FROM surf_experiences WHERE id = 1").fetchone()[0])
         self.assertEqual(conn.execute("SELECT username FROM users WHERE id = 7").fetchone()[0], "legacy-login")
         self.assertEqual(conn.execute("SELECT rider_name, public_username FROM user_profiles WHERE user_id = 7").fetchone(), ("Existing private name", None))
         self.assertEqual(conn.execute("SELECT user_id FROM surf_experiences WHERE id = 1").fetchone()[0], 7)
@@ -757,8 +803,9 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"<dt>Private RiderNotes</dt><dd>Private notes by Owner Public</dd>", owner_public_detail.data)
         self.assertIn(b'class="share-icon-button"', owner_public_detail.data)
         self.assertIn(b'aria-label="Share public submission"', owner_public_detail.data)
-        self.assertIn(f'data-share-url="http://localhost/share/experience/{own_public}"'.encode(), owner_public_detail.data)
-        self.assertIn(f'value="http://localhost/share/experience/{own_public}"'.encode(), owner_public_detail.data)
+        self.assertIn(f'action="/experiences/{own_public}/share"'.encode(), owner_public_detail.data)
+        self.assertIn(b'data-share-url=""', owner_public_detail.data)
+        self.assertNotIn(f"/share/experience/{own_public}".encode(), owner_public_detail.data)
         self.assertNotIn(f'value="http://localhost/experiences/{own_public}"'.encode(), owner_public_detail.data)
 
         other_private_detail = self.client.get(f"/experiences/{other_private}")
@@ -766,7 +813,8 @@ class RiderPortalTest(unittest.TestCase):
         other_public_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(other_public_detail.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", other_public_detail.data)
-        self.assertIn(b'class="share-icon-button"', other_public_detail.data)
+        self.assertNotIn(b'class="share-icon-button"', other_public_detail.data)
+        self.assertNotIn(f'action="/experiences/{other_public}/share"'.encode(), other_public_detail.data)
         self.assertNotIn(b"other-rider", other_public_detail.data)
         self.assertNotIn(b"<dt>Rider</dt><dd>Other Public</dd>", other_public_detail.data)
         self.assertNotIn(b"<dt>RiderWeight</dt>", other_public_detail.data)
@@ -777,8 +825,16 @@ class RiderPortalTest(unittest.TestCase):
         other_public_edit = self.client.get(f"/experiences/{other_public}/edit")
         self.assertEqual(other_public_edit.status_code, 404)
 
+        self.assertEqual(self.client.get(f"/share/experience/{other_public}").status_code, 404)
+        conn = db_store.connect_db(self.temp_dir.name)
+        other_public_token = db_store.create_or_get_surf_experience_share_token(conn, other_public, self.other_user_id)
+        conn.close()
+        self.assertIsNotNone(other_public_token)
+        self.assertNotEqual(other_public_token, str(other_public))
+        self.assertGreaterEqual(len(other_public_token), 22)
+
         self._set_user(None)
-        public_share = self.client.get(f"/share/experience/{other_public}")
+        public_share = self.client.get(f"/share/experience/{other_public_token}")
         self.assertEqual(public_share.status_code, 200)
         self.assertIn(b"Public session", public_share.data)
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", public_share.data)
@@ -802,6 +858,67 @@ class RiderPortalTest(unittest.TestCase):
         logged_out_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(logged_out_detail.status_code, 302)
         self.assertIn("login=1", logged_out_detail.headers["Location"])
+
+    def test_owner_generates_unguessable_share_token_for_public_submission(self) -> None:
+        self._set_profile(self.user_id, "Share Owner", "Private Owner Name")
+        public_id = self._create_submission(self.user_id, "Shared Public", "2026-02-06", "public")
+        private_id = self._create_submission(self.user_id, "Shared Private", "2026-02-07", "private")
+        other_public_id = self._create_submission(self.other_user_id, "Other Shared Public", "2026-02-08", "public")
+
+        self.assertEqual(self.client.get(f"/share/experience/{public_id}").status_code, 404)
+
+        self._set_user(self.user_id)
+        self.assertEqual(self.client.get(f"/experiences/{public_id}").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        response = self.client.post(
+            f"/experiences/{public_id}/share",
+            data={"_csrf_token": csrf_token},
+            headers={"Accept": "application/json"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        token = payload["share_token"]
+        self.assertTrue(token)
+        self.assertNotEqual(token, str(public_id))
+        self.assertGreaterEqual(len(token), 22)
+        self.assertIn(f"/share/experience/{token}", payload["share_url"])
+
+        detail = self.client.get(f"/experiences/{public_id}?shared=1")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn(f'value="http://localhost/share/experience/{token}"'.encode(), detail.data)
+        self.assertNotIn(f"/share/experience/{public_id}".encode(), detail.data)
+
+        anonymous_share = self.client.get(f"/share/experience/{token}")
+        self.assertEqual(anonymous_share.status_code, 200)
+        self.assertIn(b"Public session", anonymous_share.data)
+        self.assertNotIn(b"Private notes by Shared Public", anonymous_share.data)
+        self.assertNotIn(b"RiderWeight", anonymous_share.data)
+        self.assertNotIn(b"test-rider", anonymous_share.data)
+        self.assertNotIn(b"_csrf_token", anonymous_share.data)
+        self.assertNotIn(b"Profile", anonymous_share.data)
+        self.assertEqual(self.client.get(f"/share/experience/{public_id}").status_code, 404)
+
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        private_response = self.client.post(f"/experiences/{private_id}/share", data={"_csrf_token": csrf_token})
+        self.assertEqual(private_response.status_code, 404)
+
+        self._set_user(self.other_user_id)
+        self.assertEqual(self.client.get(f"/experiences/{public_id}").status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        other_response = self.client.post(f"/experiences/{public_id}/share", data={"_csrf_token": csrf_token})
+        self.assertEqual(other_response.status_code, 404)
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertEqual(conn.execute("SELECT share_token FROM surf_experiences WHERE id = ?", (public_id,)).fetchone()[0], token)
+        self.assertIsNone(conn.execute("SELECT share_token FROM surf_experiences WHERE id = ?", (other_public_id,)).fetchone()[0])
+        conn.execute("UPDATE surf_experiences SET visibility = 'private' WHERE id = ?", (public_id,))
+        conn.commit()
+        conn.close()
+
+        self._set_user(None)
+        self.assertEqual(self.client.get(f"/share/experience/{token}").status_code, 404)
 
     def test_public_submission_without_public_username_uses_private_fallback(self) -> None:
         no_name_user_id: int
@@ -829,8 +946,13 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"<dt>Submitted by</dt><dd>Unknown rider</dd>", detail.data)
         self.assertNotIn(b"private.login@example.com", detail.data)
 
+        conn = db_store.connect_db(self.temp_dir.name)
+        share_token = db_store.create_or_get_surf_experience_share_token(conn, unnamed_public, no_name_user_id)
+        conn.close()
+        self.assertIsNotNone(share_token)
+
         self._set_user(None)
-        public_share = self.client.get(f"/share/experience/{unnamed_public}")
+        public_share = self.client.get(f"/share/experience/{share_token}")
         self.assertEqual(public_share.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Unknown rider</dd>", public_share.data)
         self.assertIn(b"Public review without private name", public_share.data)

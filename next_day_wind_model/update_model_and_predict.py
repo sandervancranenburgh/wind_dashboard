@@ -2689,26 +2689,6 @@ def save_current_day_plot(
                         label="_nolegend_",
                     )
                 historical_harmonie_plotted = True
-            if "forecast_wind_max" in harmonie_overlay.columns:
-                harmonie_max_y = pd.to_numeric(harmonie_overlay["forecast_wind_max"], errors="coerce").to_numpy(dtype=float)
-                harmonie_max_valid = (~np.isnan(harmonie_x)) & (~np.isnan(harmonie_max_y))
-                if np.any(harmonie_max_valid):
-                    h_max_x = harmonie_x[harmonie_max_valid]
-                    h_max_y = harmonie_max_y[harmonie_max_valid]
-                    order = np.argsort(h_max_x)
-                    h_max_x = h_max_x[order]
-                    h_max_y = h_max_y[order]
-                    if len(h_max_x) >= 2:
-                        ax.plot(
-                            h_max_x,
-                            h_max_y,
-                            color="#666666",
-                            linestyle="--",
-                            linewidth=1.1,
-                            alpha=max(float(overlay_alpha), 0.5),
-                            zorder=2.25,
-                            label="_nolegend_",
-                        )
 
     # The solid current comparison is anchored to the latest active Harmonie
     # update. We plot the Super local branch issued at that same anchor so the

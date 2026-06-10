@@ -103,6 +103,21 @@ def parse_args() -> argparse.Namespace:
         help="Skip model training and only refresh prediction outputs using saved models/scalers.",
     )
     parser.add_argument(
+        "--skip-prediction",
+        action="store_true",
+        help="Skip model inference and regenerate plots/dashboard from cached prediction artifacts.",
+    )
+    parser.add_argument(
+        "--plots-only",
+        action="store_true",
+        help="Fast mode: skip data refresh, training, and prediction; regenerate plots/dashboard from cached artifacts.",
+    )
+    parser.add_argument(
+        "--use-existing-artifacts",
+        action="store_true",
+        help="Reuse cached model and prediction artifacts where possible. Currently implies --skip-training and --skip-prediction.",
+    )
+    parser.add_argument(
         "--validation-split",
         type=float,
         default=0.2,
@@ -5829,6 +5844,442 @@ def publish_web_dashboard(
     return copied
 
 
+def normalize_stage_flags(args: argparse.Namespace) -> dict:
+    """Normalize staged workflow flags while preserving the default full path."""
+    if args.plots_only or args.use_existing_artifacts:
+        args.skip_training = True
+        args.skip_prediction = True
+        args.skip_data_refresh_check = True
+    elif args.skip_prediction:
+        args.skip_training = True
+        args.skip_data_refresh_check = True
+
+    return {
+        "training": not bool(args.skip_training),
+        "prediction": not bool(args.skip_prediction),
+        "dashboard": True,
+        "plots_only": bool(args.plots_only),
+        "use_existing_artifacts": bool(args.use_existing_artifacts),
+    }
+
+
+def cached_prediction_artifact_paths(out_dir: Path, test_suffix: str = "") -> dict[str, Path]:
+    return {
+        "next_day_predictions_csv": out_dir / "next_day_predictions.csv",
+        "current_day_predictions_csv": out_dir / f"current_day_predictions{test_suffix}.csv",
+        "metadata_json": out_dir / ("metadata_update.json" if not test_suffix else f"metadata_update{test_suffix}.json"),
+    }
+
+
+def require_cached_artifacts(paths: dict[str, Path], *, args: argparse.Namespace) -> None:
+    missing = [(name, path) for name, path in paths.items() if not path.exists()]
+    if not missing:
+        return
+    searched = "\n".join(f"- {name}: {path}" for name, path in paths.items())
+    missing_text = "\n".join(f"- {name}: {path}" for name, path in missing)
+    create_cmd = (
+        "python next_day_wind_model/update_model_and_predict.py "
+        f"--db {args.db} --site {args.site} --model {args.model} "
+        "--skip-training "
+        f"--model-artifact-dir {args.model_artifact_dir or args.out_dir} "
+        f"--out-dir {args.out_dir} --web-out-dir {args.web_out_dir} "
+        f"--current-day-interval-minutes {args.current_day_interval_minutes}"
+    )
+    raise FileNotFoundError(
+        "Missing required cached artifact(s) for --plots-only/--skip-prediction mode.\n"
+        f"Missing:\n{missing_text}\n"
+        f"Searched:\n{searched}\n"
+        "Run a prediction-generating command first, for example:\n"
+        f"{create_cmd}"
+    )
+
+
+def _require_cached_columns(frame: pd.DataFrame, path: Path, columns: list[str]) -> None:
+    missing = [col for col in columns if col not in frame.columns]
+    if missing:
+        raise ValueError(f"Cached artifact {path} is missing required column(s): {', '.join(missing)}")
+
+
+def _load_cached_json(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Cached metadata artifact is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Cached metadata artifact must contain a JSON object: {path}")
+    return payload
+
+
+def load_cached_prediction_artifacts(
+    out_dir: Path,
+    *,
+    local_tz: str,
+    test_suffix: str = "",
+    args: argparse.Namespace,
+) -> dict:
+    paths = cached_prediction_artifact_paths(out_dir, test_suffix=test_suffix)
+    require_cached_artifacts(paths, args=args)
+
+    next_day_table = pd.read_csv(paths["next_day_predictions_csv"])
+    _require_cached_columns(
+        next_day_table,
+        paths["next_day_predictions_csv"],
+        [
+            "target_time_utc",
+            "forecast_wind_speed",
+            "forecast_wind_min",
+            "forecast_wind_max",
+            "lstm_pred_wind_speed",
+            "forecast_wind_dir_deg",
+            "lstm_pred_wind_dir_deg",
+        ],
+    )
+    next_day_table["target_time_utc"] = pd.to_datetime(
+        next_day_table["target_time_utc"],
+        utc=True,
+        errors="coerce",
+    )
+    if "target_time_local" in next_day_table.columns:
+        next_day_table["target_time_local"] = pd.to_datetime(
+            next_day_table["target_time_local"],
+            utc=True,
+            errors="coerce",
+        ).dt.tz_convert(ZoneInfo(local_tz))
+    else:
+        next_day_table["target_time_local"] = next_day_table["target_time_utc"].dt.tz_convert(ZoneInfo(local_tz))
+    next_day_table = next_day_table.dropna(subset=["target_time_utc", "target_time_local"]).copy()
+    if next_day_table.empty:
+        raise ValueError(f"Cached next-day prediction artifact has no usable timestamp rows: {paths['next_day_predictions_csv']}")
+
+    current_day_table = pd.read_csv(paths["current_day_predictions_csv"])
+    _require_cached_columns(
+        current_day_table,
+        paths["current_day_predictions_csv"],
+        [
+            "time_local",
+            "forecast_wind_speed",
+            "forecast_wind_min",
+            "forecast_wind_max",
+            "forecast_wind_dir_deg",
+            "actual_wind_speed",
+            "actual_wind_dir_deg",
+            "lstm_pred_wind_speed_full",
+            "lstm_pred_wind_dir_deg_full",
+            "lstm_pred_wind_speed",
+            "lstm_pred_wind_dir_deg",
+        ],
+    )
+    current_day_table["time_local"] = pd.to_datetime(
+        current_day_table["time_local"],
+        utc=True,
+        errors="coerce",
+    ).dt.tz_convert(ZoneInfo(local_tz))
+    current_day_table = current_day_table.dropna(subset=["time_local"]).copy()
+    if current_day_table.empty:
+        raise ValueError(f"Cached current-day prediction artifact has no usable timestamp rows: {paths['current_day_predictions_csv']}")
+
+    return {
+        "paths": paths,
+        "metadata": _load_cached_json(paths["metadata_json"]),
+        "next_day_table": next_day_table,
+        "current_day_table": current_day_table,
+    }
+
+
+def _cached_metadata_value(metadata: dict, key: str) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _cached_plot_metadata(metadata: dict) -> tuple[str, str | None, str | None, str | None]:
+    prediction_generated_at_utc = (
+        _cached_metadata_value(metadata, "prediction_generated_at_utc")
+        or _cached_metadata_value(metadata, "trained_at_utc")
+        or datetime.now(timezone.utc).isoformat()
+    )
+    prediction_updated_at_utc = _cached_metadata_value(metadata, "prediction_updated_at_utc")
+    model_trained_at_utc = (
+        _cached_metadata_value(metadata, "model_last_trained_at_utc")
+        or _cached_metadata_value(metadata, "trained_at_utc")
+    )
+    intraday_model_trained_at_utc = _cached_metadata_value(metadata, "intraday_model_last_trained_at_utc")
+    return prediction_generated_at_utc, prediction_updated_at_utc, model_trained_at_utc, intraday_model_trained_at_utc
+
+
+def run_dashboard_stage_from_cached_artifacts(
+    *,
+    args: argparse.Namespace,
+    out_dir: Path,
+    model_artifact_dir: Path,
+    db_path: Path,
+    cfg: DatasetConfig,
+    stage_plan: dict,
+) -> None:
+    is_test_mode = args.test_now_local_hour is not None
+    test_suffix = f"_test_hour_{int(args.test_now_local_hour):02d}" if is_test_mode else ""
+    cached = load_cached_prediction_artifacts(
+        out_dir,
+        local_tz=args.local_timezone,
+        test_suffix=test_suffix,
+        args=args,
+    )
+    metadata = cached["metadata"]
+    table = cached["next_day_table"]
+    current_day_table = cached["current_day_table"]
+    prediction_generated_at_utc, prediction_updated_at_utc, model_last_trained_at_utc, intraday_model_last_trained_at_utc = _cached_plot_metadata(metadata)
+
+    harmonie_time_utc: datetime | None = None
+    harmonie_time_kind = "fetched"
+    if db_path.exists():
+        try:
+            harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
+        except Exception as exc:
+            print(f"Cached dashboard stage: Harmonie metadata lookup skipped: {exc}")
+
+    print("Stage plan: training=skipped, prediction=skipped, dashboard=running from cached artifacts")
+    print(f"Cached next-day table: {cached['paths']['next_day_predictions_csv']}")
+    print(f"Cached current-day table: {cached['paths']['current_day_predictions_csv']}")
+    print(f"Cached metadata: {cached['paths']['metadata_json']}")
+
+    plot_path = out_dir / "next_day_predictions.png"
+    plot_path_mobile = out_dir / "next_day_predictions_mobile.png"
+    save_prediction_plot(
+        table,
+        plot_path,
+        local_tz=args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+    )
+    save_prediction_plot(
+        table,
+        plot_path_mobile,
+        local_tz=args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        mobile=True,
+    )
+
+    current_day_table_path = cached["paths"]["current_day_predictions_csv"]
+    current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
+    current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
+    current_day_target_local = current_day_table["time_local"].iloc[0].date()
+    current_day_prior_prediction_tables = []
+    if not is_test_mode:
+        current_day_prior_prediction_tables = load_current_day_prediction_history(
+            out_dir=out_dir,
+            target_day_local=current_day_target_local,
+            local_tz=args.local_timezone,
+            max_snapshots=16,
+        )
+
+    current_day_live_monitoring_metric = metadata.get("current_day_live_monitoring_metric")
+    if not isinstance(current_day_live_monitoring_metric, dict) or not current_day_live_monitoring_metric.get("available", False):
+        current_day_live_monitoring_metric = compute_current_day_table_mae(current_day_table)
+    if db_path.exists() and not is_test_mode:
+        try:
+            db_metric = compute_current_day_completed_interval_mae(
+                db_path=db_path,
+                site=cfg.site,
+                target_day_local=current_day_target_local,
+                local_tz=args.local_timezone,
+                prior_prediction_tables=current_day_prior_prediction_tables,
+            )
+            if db_metric.get("available", False):
+                current_day_live_monitoring_metric = db_metric
+        except Exception as exc:
+            print(f"Cached dashboard stage: live current-day MAE lookup skipped: {exc}")
+
+    current_day_direction_csv_src: Path | None = None
+    current_day_direction_spider_png_src: Path | None = None
+    current_day_direction_csv = out_dir / "current_day_eval_speed_by_direction.csv"
+    current_day_direction_spider_png = out_dir / "current_day_direction_spider.png"
+    if current_day_direction_csv.exists():
+        current_day_direction_csv_src = current_day_direction_csv
+        save_current_day_direction_performance_spider_plot(current_day_direction_csv, current_day_direction_spider_png)
+    elif db_path.exists() and not is_test_mode:
+        try:
+            if save_current_day_direction_performance_csv(db_path=db_path, cfg=cfg, direction_csv=current_day_direction_csv):
+                current_day_direction_csv_src = current_day_direction_csv
+                save_current_day_direction_performance_spider_plot(current_day_direction_csv, current_day_direction_spider_png)
+        except Exception as exc:
+            print(f"Cached dashboard stage: current-day direction performance skipped: {exc}")
+    if current_day_direction_spider_png.exists():
+        current_day_direction_spider_png_src = current_day_direction_spider_png
+
+    save_current_day_plot(
+        current_day_table,
+        current_day_plot_path,
+        args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        prior_prediction_tables=current_day_prior_prediction_tables,
+        live_monitoring_metric=current_day_live_monitoring_metric,
+    )
+    save_current_day_plot(
+        current_day_table,
+        current_day_plot_mobile_path,
+        args.local_timezone,
+        prediction_generated_at_utc=prediction_generated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        prior_prediction_tables=current_day_prior_prediction_tables,
+        live_monitoring_metric=current_day_live_monitoring_metric,
+        mobile=True,
+    )
+
+    daily_mae_csv_src: Path | None = None
+    daily_mae_png_src: Path | None = None
+    daily_mae_png_mobile_src: Path | None = None
+    daily_mae_csv = out_dir / "daily_mae_history.csv"
+    if daily_mae_csv.exists():
+        daily_mae_csv_src = daily_mae_csv
+        daily_mae_png_src = out_dir / "daily_mae_history.png"
+        daily_mae_png_mobile_src = out_dir / "daily_mae_history_mobile.png"
+        save_daily_mae_plot(daily_mae_csv_src, daily_mae_png_src, local_tz=args.local_timezone, last_months=3)
+        save_daily_mae_plot(daily_mae_csv_src, daily_mae_png_mobile_src, local_tz=args.local_timezone, last_months=3)
+
+    gate_eval_history_csv = out_dir / "model_gate_eval_history.csv"
+    gate_eval_history_png = out_dir / "model_gate_eval_history.png"
+    gate_eval_history_csv_src: Path | None = gate_eval_history_csv if gate_eval_history_csv.exists() else None
+    if gate_eval_history_csv_src is None:
+        artifact_history_csv = model_artifact_dir / "model_gate_eval_history.csv"
+        if artifact_history_csv.exists():
+            gate_eval_history_csv_src = artifact_history_csv
+
+    gate_eval_details_csv_src: Path | None = None
+    for details_dir in [out_dir / "model_gate_eval_details", model_artifact_dir / "model_gate_eval_details"]:
+        if details_dir.exists():
+            detail_files = sorted(details_dir.glob("*_model_gate_eval_speed.csv"))
+            if detail_files:
+                gate_eval_details_csv_src = detail_files[-1]
+                break
+
+    gate_eval_history_png_src: Path | None = None
+    if gate_eval_history_csv_src is not None:
+        save_model_gate_eval_history_plot(
+            gate_eval_history_csv_src,
+            gate_eval_history_png,
+            local_tz=args.local_timezone,
+            eval_details_csv=gate_eval_details_csv_src,
+            db_path=db_path if db_path.exists() else None,
+            site=cfg.site,
+        )
+        gate_eval_history_png_src = gate_eval_history_png
+    elif gate_eval_history_png.exists():
+        gate_eval_history_png_src = gate_eval_history_png
+
+    gate_eval_direction_csv_src: Path | None = None
+    stable_direction_csv = out_dir / "model_gate_eval_speed_by_direction.csv"
+    if stable_direction_csv.exists():
+        gate_eval_direction_csv_src = stable_direction_csv
+    else:
+        for details_dir in [out_dir / "model_gate_eval_details", model_artifact_dir / "model_gate_eval_details"]:
+            if details_dir.exists():
+                direction_files = sorted(details_dir.glob("*_model_gate_eval_speed_by_direction.csv"))
+                if direction_files:
+                    gate_eval_direction_csv_src = direction_files[-1]
+                    break
+    gate_eval_direction_spider_png_src: Path | None = None
+    if gate_eval_direction_csv_src is not None:
+        gate_eval_direction_spider_png = out_dir / "model_gate_direction_spider.png"
+        save_wind_direction_performance_spider_plot(gate_eval_direction_csv_src, gate_eval_direction_spider_png)
+        if gate_eval_direction_spider_png.exists():
+            gate_eval_direction_spider_png_src = gate_eval_direction_spider_png
+
+    web_publish = None
+    git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
+    if not is_test_mode:
+        web_publish = publish_web_dashboard(
+            web_out_dir=Path(args.web_out_dir),
+            local_tz=args.local_timezone,
+            web_refresh_seconds=args.web_refresh_seconds,
+            next_day_png=plot_path,
+            next_day_png_mobile=plot_path_mobile,
+            next_day_csv=cached["paths"]["next_day_predictions_csv"],
+            current_day_png=current_day_plot_path,
+            current_day_png_mobile=current_day_plot_mobile_path,
+            current_day_csv=current_day_table_path,
+            daily_mae_png=daily_mae_png_src,
+            daily_mae_png_mobile=daily_mae_png_mobile_src,
+            daily_mae_csv=daily_mae_csv_src,
+            gate_eval_png=gate_eval_history_png_src,
+            gate_eval_csv=gate_eval_history_csv_src,
+            direction_spider_png=gate_eval_direction_spider_png_src,
+            direction_spider_csv=gate_eval_direction_csv_src,
+            current_day_direction_spider_png=current_day_direction_spider_png_src,
+            current_day_direction_spider_csv=current_day_direction_csv_src,
+            current_day_prior_prediction_tables=current_day_prior_prediction_tables,
+            prediction_generated_at_utc=prediction_generated_at_utc,
+            prediction_updated_at_utc=prediction_updated_at_utc,
+            model_trained_at_utc=model_last_trained_at_utc,
+            harmonie_time_utc=harmonie_time_utc,
+            harmonie_time_kind=harmonie_time_kind,
+            companion_app_base_url=args.companion_app_base_url,
+        )
+        if args.git_auto_push_pages:
+            repo_root = Path(__file__).resolve().parents[1]
+            git_publish = auto_push_dashboard_changes(
+                repo_root=repo_root,
+                web_out_dir=Path(args.web_out_dir),
+                remote=args.git_remote,
+                branch=args.git_branch,
+            )
+
+    refreshed_metadata = dict(metadata)
+    refreshed_metadata.update(
+        {
+            "stage_mode": "plots_only" if args.plots_only else "cached_dashboard",
+            "stage_plan": stage_plan,
+            "plots_only": bool(args.plots_only),
+            "skip_prediction": True,
+            "skip_training": True,
+            "use_existing_artifacts": bool(args.use_existing_artifacts),
+            "plot_refreshed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "output_artifact_dir": str(out_dir.resolve()),
+            "model_artifact_dir": str(model_artifact_dir.resolve()),
+            "web_dashboard_dir": None if web_publish is None else str(Path(args.web_out_dir).resolve()),
+            "web_dashboard_files": web_publish,
+            "web_dashboard_git_publish": git_publish,
+            "prediction_plot_png": str(plot_path),
+            "current_day_plot_png": str(current_day_plot_path),
+            "model_gate_eval_history_png": None if gate_eval_history_png_src is None else str(gate_eval_history_png_src),
+            "model_gate_direction_spider_png": None if gate_eval_direction_spider_png_src is None else str(gate_eval_direction_spider_png_src),
+            "current_day_direction_spider_png": None if current_day_direction_spider_png_src is None else str(current_day_direction_spider_png_src),
+            "current_day_live_monitoring_metric": current_day_live_monitoring_metric,
+            "intraday_model_last_trained_at_utc": intraday_model_last_trained_at_utc,
+        }
+    )
+    metadata_path = cached["paths"]["metadata_json"]
+    metadata_path.write_text(json.dumps(refreshed_metadata, indent=2), encoding="utf-8")
+
+    print("Cached dashboard stage complete.")
+    print(f"Prediction plot saved to: {plot_path}")
+    print(f"Current-day plot saved to: {current_day_plot_path}")
+    if web_publish is not None:
+        print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
+    if args.git_auto_push_pages:
+        if git_publish.get("pushed"):
+            print(
+                "Web dashboard pushed to git: "
+                f"{git_publish.get('remote')}/{git_publish.get('branch')} @ {git_publish.get('commit')}"
+            )
+        else:
+            print(f"Web dashboard git push skipped: {git_publish.get('reason')}")
+
+
 def auto_push_dashboard_changes(
     repo_root: Path,
     web_out_dir: Path,
@@ -5923,6 +6374,7 @@ def auto_push_dashboard_changes(
 
 def main() -> None:
     args = parse_args()
+    stage_plan = normalize_stage_flags(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_artifact_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else out_dir
@@ -5933,6 +6385,12 @@ def main() -> None:
     print(f"Model artifact directory: {model_artifact_dir.resolve()}")
     if args.model_artifact_dir is None:
         print("Model artifact directory defaults to output artifact directory for backward compatibility.")
+    print(
+        "Stage plan | "
+        f"training={'run' if stage_plan['training'] else 'skip'} | "
+        f"prediction={'run' if stage_plan['prediction'] else 'skip'} | "
+        "dashboard=run"
+    )
 
     cfg = DatasetConfig(
         site=args.site,
@@ -5940,6 +6398,20 @@ def main() -> None:
         window_hours=args.window_hours,
         target_hours=args.target_hours,
     )
+    if args.skip_prediction:
+        try:
+            run_dashboard_stage_from_cached_artifacts(
+                args=args,
+                out_dir=out_dir,
+                model_artifact_dir=model_artifact_dir,
+                db_path=db_path,
+                cfg=cfg,
+                stage_plan=stage_plan,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(str(exc)) from None
+        return
+
     device = pick_torch_device()
     refresh_info = {
         "need_refresh": False,
@@ -7362,6 +7834,10 @@ def main() -> None:
         "site": args.site,
         "forecast_model": args.model,
         "skip_training": bool(args.skip_training),
+        "skip_prediction": bool(args.skip_prediction),
+        "plots_only": bool(args.plots_only),
+        "use_existing_artifacts": bool(args.use_existing_artifacts),
+        "stage_plan": stage_plan,
         "window_hours": args.window_hours,
         "target_hours": args.target_hours,
         "n_samples_all_speed": n_samples_all_speed,

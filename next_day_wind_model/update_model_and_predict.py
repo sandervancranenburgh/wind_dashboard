@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
         "--current-day-interval-minutes",
         type=int,
         default=6,
-        help="Sampling interval (minutes) for current-day plot/MAE using raw observations.",
+        help="Sampling interval (minutes) for current-day forecast/prediction plot grid.",
     )
     parser.add_argument(
         "--skip-data-refresh-check",
@@ -1583,6 +1583,66 @@ def _measured_actual_trend_values(time_local: pd.Series, actual_values: np.ndarr
     return out.to_numpy(dtype=float)
 
 
+def _build_current_day_plot_frame(
+    dense_times: pd.DatetimeIndex,
+    forecast_columns: dict[str, np.ndarray],
+    actual_day_raw: pd.DataFrame,
+    *,
+    now_local: datetime | pd.Timestamp,
+    future_start: datetime | pd.Timestamp,
+) -> pd.DataFrame:
+    """
+    Build the current-day plotting frame without forcing observations onto the
+    forecast grid.
+    """
+    actual_columns = {
+        "actual_wind_speed": "actual_avg",
+        "actual_wind_min": "actual_min",
+        "actual_wind_max": "actual_max",
+        "actual_wind_dir_deg": "actual_dir",
+    }
+    now_ts = pd.Timestamp(now_local)
+    future_start_ts = pd.Timestamp(future_start)
+    dense_times = pd.DatetimeIndex(dense_times).sort_values()
+    if dense_times.empty:
+        raise ValueError("Current-day plot requires at least one forecast grid timestamp.")
+
+    if actual_day_raw is None or actual_day_raw.empty:
+        actual_frame = pd.DataFrame(columns=actual_columns.values(), index=pd.DatetimeIndex([], tz=dense_times.tz))
+    else:
+        actual_frame = actual_day_raw.copy()
+        actual_frame = actual_frame[actual_frame.index <= now_ts]
+        actual_frame = actual_frame[~actual_frame.index.duplicated(keep="last")].sort_index()
+
+    actual_times = pd.DatetimeIndex(actual_frame.index)
+    plot_times = dense_times.union(actual_times).sort_values()
+    is_forecast_grid = plot_times.isin(dense_times)
+    is_actual_observation = plot_times.isin(actual_times)
+
+    table_data: dict[str, object] = {
+        "time_local": plot_times,
+        "is_forecast_grid": is_forecast_grid,
+        "is_actual_observation": is_actual_observation,
+    }
+    for col, values in forecast_columns.items():
+        table_data[col] = pd.Series(np.asarray(values, dtype=np.float32), index=dense_times).reindex(plot_times).to_numpy(dtype=np.float32)
+    for out_col, raw_col in actual_columns.items():
+        if raw_col in actual_frame.columns:
+            table_data[out_col] = (
+                pd.to_numeric(actual_frame[raw_col], errors="coerce")
+                .reindex(plot_times)
+                .to_numpy(dtype=np.float32)
+            )
+        else:
+            table_data[out_col] = np.full(len(plot_times), np.nan, dtype=np.float32)
+
+    table = pd.DataFrame(table_data)
+    table["is_future"] = table["time_local"] >= future_start_ts
+    table["hour_local"] = table["time_local"].dt.strftime("%H")
+    table["minute_local"] = table["time_local"].dt.minute
+    return table
+
+
 def _parse_iso_utc(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -2197,50 +2257,26 @@ def build_current_day_table(
         dense_times,
     )
 
-    # Actual measurements at higher cadence (latest known values up to now).
-    actual_day_raw = obs_raw_local[(obs_raw_local.index >= day_start_local) & (obs_raw_local.index <= now_local)]
-    def forward_fill_actual(col: str) -> np.ndarray:
-        if col not in actual_day_raw.columns:
-            return np.full(len(dense_times), np.nan, dtype=np.float32)
-        return (
-            actual_day_raw[col]
-            .reindex(actual_day_raw.index.union(dense_times))
-            .sort_index()
-            .ffill()
-            .reindex(dense_times)
-            .to_numpy(dtype=np.float32)
-        )
-
-    actual_speed_dense = forward_fill_actual("actual_avg")
-    actual_min_dense = forward_fill_actual("actual_min")
-    actual_max_dense = forward_fill_actual("actual_max")
-    actual_dir_dense = forward_fill_actual("actual_dir")
-    actual_speed_dense = np.where(dense_times <= now_local, actual_speed_dense, np.nan).astype(np.float32)
-    actual_min_dense = np.where(dense_times <= now_local, actual_min_dense, np.nan).astype(np.float32)
-    actual_max_dense = np.where(dense_times <= now_local, actual_max_dense, np.nan).astype(np.float32)
-    actual_dir_dense = np.where(dense_times <= now_local, actual_dir_dense, np.nan).astype(np.float32)
-
-    table = pd.DataFrame(
+    # Actual measurements keep their source timestamps; forecast/prediction
+    # values remain on the configured dense forecast grid.
+    actual_day_raw = obs_raw_local[(obs_raw_local.index >= day_start_local) & (obs_raw_local.index <= now_local)].copy()
+    future_start = now_hour_local + timedelta(hours=1)
+    table = _build_current_day_plot_frame(
+        dense_times,
         {
-            "time_local": dense_times,
             "forecast_wind_speed": fc_speed_dense,
             "forecast_wind_min": fc_min_dense,
             "forecast_wind_max": fc_max_dense,
             "forecast_wind_dir_deg": fc_dir_dense,
-            "actual_wind_speed": actual_speed_dense,
-            "actual_wind_min": actual_min_dense,
-            "actual_wind_max": actual_max_dense,
-            "actual_wind_dir_deg": actual_dir_dense,
             "lstm_pred_wind_speed_full": lstm_full_dense,
             "lstm_pred_wind_dir_deg_full": lstm_dir_full_dense,
             "lstm_pred_wind_speed": rem_dense_speed,
             "lstm_pred_wind_dir_deg": rem_dense_dir,
-        }
+        },
+        actual_day_raw,
+        now_local=now_local,
+        future_start=future_start,
     )
-    future_start = now_hour_local + timedelta(hours=1)
-    table["is_future"] = table["time_local"] >= future_start
-    table["hour_local"] = table["time_local"].dt.strftime("%H")
-    table["minute_local"] = table["time_local"].dt.minute
     return table, issued_hourly_predictions
 
 
@@ -2314,6 +2350,16 @@ def save_current_day_plot(
             else:
                 frame = frame[frame["time_local"] >= issue_anchor].copy()
         frame = frame[frame["time_local"] >= issue_anchor].copy()
+        if "is_forecast_grid" in frame.columns:
+            is_forecast_grid = (
+                frame["is_forecast_grid"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin(["true", "1", "yes"])
+            )
+            if bool(is_forecast_grid.any()):
+                frame = frame[is_forecast_grid].copy()
         if frame.empty:
             return None
         frame = frame.sort_values("time_local").drop_duplicates(subset=["time_local"], keep="last").reset_index(drop=True)
@@ -2503,10 +2549,16 @@ def save_current_day_plot(
     meta_text_y = 1.19 if mobile else 1.16
     metric_box_y = 1.29 if mobile else 1.24
     fig, ax = plt.subplots(figsize=fig_size)
+
+    def _plot_valid_line(x_values: np.ndarray, y_values: np.ndarray, **kwargs) -> None:
+        valid = ~np.isnan(y_values)
+        if np.any(valid):
+            ax.plot(x_values[valid], y_values[valid], **kwargs)
+
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     _draw_sufficient_wind_threshold(ax)
     if np.any(~np.isnan(actual_min)):
-        ax.plot(
+        _plot_valid_line(
             x,
             actual_min,
             color="magenta",
@@ -2517,7 +2569,7 @@ def save_current_day_plot(
             zorder=4.6,
         )
     if np.any(~np.isnan(actual_max)):
-        ax.plot(
+        _plot_valid_line(
             x,
             actual_max,
             color="magenta",
@@ -2527,7 +2579,7 @@ def save_current_day_plot(
             label="_nolegend_",
             zorder=4.6,
         )
-    ax.plot(
+    _plot_valid_line(
         x,
         actual_avg,
         marker="o",
@@ -2538,7 +2590,7 @@ def save_current_day_plot(
         zorder=5,
     )
     if has_actual_trend:
-        ax.plot(
+        _plot_valid_line(
             x,
             actual_trend,
             color="#b000b8",
@@ -2678,7 +2730,7 @@ def save_current_day_plot(
         if current_branch_boundary_idx is None and len(branch_positions) > 0:
             current_branch_boundary_idx = int(branch_positions[0])
 
-    ax.plot(
+    _plot_valid_line(
         x,
         harmonie_current_high,
         color="#666666",
@@ -2687,7 +2739,7 @@ def save_current_day_plot(
         label="_nolegend_",
         zorder=2.4,
     )
-    ax.plot(
+    _plot_valid_line(
         x,
         harmonie_current,
         color="#555555",
@@ -2696,7 +2748,7 @@ def save_current_day_plot(
         zorder=2.6,
     )
 
-    ax.plot(
+    _plot_valid_line(
         x,
         superlocal_current,
         color=SUPERLOCAL_FORECAST_COLOR,
@@ -2788,7 +2840,7 @@ def save_current_day_plot(
         fontsize=legend_fs,
     )
     hour_tick_mask = table["time_local"].dt.minute.eq(0)
-    tick_pos = np.where(hour_tick_mask.to_numpy())[0]
+    tick_pos = x[hour_tick_mask.to_numpy()]
     tick_lbl = table.loc[hour_tick_mask, "time_local"].dt.strftime("%H").to_list()
     ax.set_xticks(tick_pos, tick_lbl, rotation=0)
     ax.tick_params(axis="both", labelsize=tick_fs)
@@ -3693,6 +3745,13 @@ def compute_current_day_table_mae(table: pd.DataFrame) -> dict:
     if any(col not in table.columns for col in required_cols):
         return empty_summary
     frame = table.copy()
+    if "time_local" not in frame.columns:
+        return empty_summary
+    frame["time_local"] = pd.to_datetime(frame["time_local"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["time_local"]).copy()
+    if frame.empty:
+        return empty_summary
+
     actual = pd.to_numeric(frame["actual_wind_speed"], errors="coerce")
     harmonie = pd.to_numeric(frame["forecast_wind_speed"], errors="coerce")
     if "lstm_pred_wind_speed_full" in frame.columns:
@@ -3702,7 +3761,7 @@ def compute_current_day_table_mae(table: pd.DataFrame) -> dict:
     else:
         return empty_summary
 
-    valid = actual.notna() & harmonie.notna() & superlocal.notna()
+    measurement_mask = actual.notna()
     if "is_future" in frame.columns:
         is_future = (
             frame["is_future"]
@@ -3711,14 +3770,28 @@ def compute_current_day_table_mae(table: pd.DataFrame) -> dict:
             .str.lower()
             .isin(["true", "1", "yes"])
         )
-        valid &= ~is_future
-    if not bool(valid.any()):
+        measurement_mask &= ~is_future
+    if not bool(measurement_mask.any()):
         return empty_summary
 
-    model_abs = np.abs(superlocal[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
-    harmonie_abs = np.abs(harmonie[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
-    model_sq = np.square(superlocal[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
-    harmonie_sq = np.square(harmonie[valid].to_numpy(dtype=float) - actual[valid].to_numpy(dtype=float))
+    time_index = pd.DatetimeIndex(frame["time_local"])
+    measurement_times = time_index[measurement_mask.to_numpy()]
+    actual_values = actual[measurement_mask].to_numpy(dtype=float)
+    harmonie_curve = pd.Series(harmonie.to_numpy(dtype=float), index=time_index).dropna().sort_index()
+    superlocal_curve = pd.Series(superlocal.to_numpy(dtype=float), index=time_index).dropna().sort_index()
+    harmonie_values = _interp_series_at_times(harmonie_curve, measurement_times)
+    superlocal_values = _interp_series_at_times(superlocal_curve, measurement_times)
+    valid = (~np.isnan(actual_values)) & (~np.isnan(harmonie_values)) & (~np.isnan(superlocal_values))
+    if not np.any(valid):
+        return empty_summary
+
+    actual_values = actual_values[valid]
+    harmonie_values = harmonie_values[valid]
+    superlocal_values = superlocal_values[valid]
+    model_abs = np.abs(superlocal_values - actual_values)
+    harmonie_abs = np.abs(harmonie_values - actual_values)
+    model_sq = np.square(superlocal_values - actual_values)
+    harmonie_sq = np.square(harmonie_values - actual_values)
     finite = (
         ~np.isnan(model_abs)
         & ~np.isnan(harmonie_abs)

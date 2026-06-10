@@ -484,6 +484,136 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(len(speed_coords), 2)
         self.assertNotIn("trend_points", plot)
 
+    def test_current_day_plot_frame_keeps_three_minute_measured_rows(self) -> None:
+        model_dir = str(Path(__file__).resolve().parents[1])
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
+        from next_day_wind_model import update_model_and_predict as updater
+
+        dense_times = updater.pd.date_range(
+            "2026-01-15 08:00", periods=3, freq="6min", tz="Europe/Amsterdam"
+        )
+        actual_times = updater.pd.date_range(
+            "2026-01-15 08:00", periods=5, freq="3min", tz="Europe/Amsterdam"
+        )
+        actual_raw = updater.pd.DataFrame(
+            {
+                "actual_avg": [10.0, 11.0, 12.0, 13.0, 14.0],
+                "actual_min": [9.0, 10.0, 11.0, 12.0, 13.0],
+                "actual_max": [12.0, 13.0, 14.0, 15.0, 16.0],
+                "actual_dir": [220.0, 221.0, 222.0, 223.0, 224.0],
+            },
+            index=actual_times,
+        )
+        forecast_columns = {
+            "forecast_wind_speed": updater.np.array([10.0, 11.0, 12.0], dtype=updater.np.float32),
+            "forecast_wind_min": updater.np.array([9.0, 10.0, 11.0], dtype=updater.np.float32),
+            "forecast_wind_max": updater.np.array([12.0, 13.0, 14.0], dtype=updater.np.float32),
+            "forecast_wind_dir_deg": updater.np.array([220.0, 221.0, 222.0], dtype=updater.np.float32),
+            "lstm_pred_wind_speed_full": updater.np.array([10.5, 11.5, 12.5], dtype=updater.np.float32),
+            "lstm_pred_wind_dir_deg_full": updater.np.array([220.0, 221.0, 222.0], dtype=updater.np.float32),
+            "lstm_pred_wind_speed": updater.np.array([updater.np.nan, 11.5, 12.5], dtype=updater.np.float32),
+            "lstm_pred_wind_dir_deg": updater.np.array([updater.np.nan, 221.0, 222.0], dtype=updater.np.float32),
+        }
+
+        table = updater._build_current_day_plot_frame(
+            dense_times,
+            forecast_columns,
+            actual_raw,
+            now_local=actual_times[-1],
+            future_start=dense_times[-1] + updater.pd.Timedelta(hours=1),
+        )
+
+        measured_times = table.loc[table["actual_wind_speed"].notna(), "time_local"]
+        measured_deltas = measured_times.diff().dropna().dt.total_seconds().to_list()
+        self.assertEqual(measured_deltas, [180.0, 180.0, 180.0, 180.0])
+        forecast_times = table.loc[table["is_forecast_grid"], "time_local"]
+        forecast_deltas = forecast_times.diff().dropna().dt.total_seconds().to_list()
+        self.assertEqual(forecast_deltas, [360.0, 360.0])
+        self.assertEqual(int(table["is_actual_observation"].sum()), 5)
+
+    def test_current_day_plot_frame_keeps_six_minute_measured_rows_when_source_is_six_minute(self) -> None:
+        model_dir = str(Path(__file__).resolve().parents[1])
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
+        from next_day_wind_model import update_model_and_predict as updater
+
+        dense_times = updater.pd.date_range(
+            "2026-01-15 08:00", periods=4, freq="6min", tz="Europe/Amsterdam"
+        )
+        actual_raw = updater.pd.DataFrame(
+            {
+                "actual_avg": [10.0, 11.0, 12.0, 13.0],
+                "actual_min": [9.0, 10.0, 11.0, 12.0],
+                "actual_max": [12.0, 13.0, 14.0, 15.0],
+                "actual_dir": [220.0, 221.0, 222.0, 223.0],
+            },
+            index=dense_times,
+        )
+        forecast_columns = {
+            col: updater.np.arange(len(dense_times), dtype=updater.np.float32)
+            for col in [
+                "forecast_wind_speed",
+                "forecast_wind_min",
+                "forecast_wind_max",
+                "forecast_wind_dir_deg",
+                "lstm_pred_wind_speed_full",
+                "lstm_pred_wind_dir_deg_full",
+                "lstm_pred_wind_speed",
+                "lstm_pred_wind_dir_deg",
+            ]
+        }
+
+        table = updater._build_current_day_plot_frame(
+            dense_times,
+            forecast_columns,
+            actual_raw,
+            now_local=dense_times[-1],
+            future_start=dense_times[-1] + updater.pd.Timedelta(hours=1),
+        )
+
+        measured_times = table.loc[table["actual_wind_speed"].notna(), "time_local"]
+        measured_deltas = measured_times.diff().dropna().dt.total_seconds().to_list()
+        self.assertEqual(measured_deltas, [360.0, 360.0, 360.0])
+        self.assertEqual(len(table), len(dense_times))
+
+    def test_current_day_table_mae_scores_three_minute_actual_rows(self) -> None:
+        model_dir = str(Path(__file__).resolve().parents[1])
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
+        from next_day_wind_model import update_model_and_predict as updater
+
+        dense_times = updater.pd.date_range(
+            "2026-01-15 08:00", periods=3, freq="6min", tz="Europe/Amsterdam"
+        )
+        actual_times = updater.pd.date_range(
+            "2026-01-15 08:00", periods=5, freq="3min", tz="Europe/Amsterdam"
+        )
+        actual_raw = updater.pd.DataFrame(
+            {"actual_avg": [10.0, 10.5, 11.0, 11.5, 12.0]},
+            index=actual_times,
+        )
+        table = updater._build_current_day_plot_frame(
+            dense_times,
+            {
+                "forecast_wind_speed": updater.np.array([10.0, 11.0, 12.0], dtype=updater.np.float32),
+                "forecast_wind_min": updater.np.array([9.0, 10.0, 11.0], dtype=updater.np.float32),
+                "forecast_wind_max": updater.np.array([12.0, 13.0, 14.0], dtype=updater.np.float32),
+                "forecast_wind_dir_deg": updater.np.array([220.0, 221.0, 222.0], dtype=updater.np.float32),
+                "lstm_pred_wind_speed_full": updater.np.array([10.0, 11.0, 12.0], dtype=updater.np.float32),
+                "lstm_pred_wind_dir_deg_full": updater.np.array([220.0, 221.0, 222.0], dtype=updater.np.float32),
+                "lstm_pred_wind_speed": updater.np.array([updater.np.nan, 11.0, 12.0], dtype=updater.np.float32),
+                "lstm_pred_wind_dir_deg": updater.np.array([updater.np.nan, 221.0, 222.0], dtype=updater.np.float32),
+            },
+            actual_raw,
+            now_local=actual_times[-1],
+            future_start=dense_times[-1] + updater.pd.Timedelta(hours=1),
+        )
+
+        metric = updater.compute_current_day_table_mae(table)
+        self.assertTrue(metric["available"])
+        self.assertEqual(metric["measurement_point_count"], 5)
+
     def test_current_day_actual_trend_uses_measured_rows_only(self) -> None:
         model_dir = str(Path(__file__).resolve().parents[1])
         if model_dir not in sys.path:

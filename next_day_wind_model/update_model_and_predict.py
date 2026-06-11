@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea, VPacker
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import torch
@@ -2408,7 +2409,10 @@ def save_current_day_plot(
             return False
         return bool(np.nanmax(diffs) > float(tolerance))
 
+    plot_tz = ZoneInfo(local_tz)
     table = table.copy()
+    table["time_local"] = pd.to_datetime(table["time_local"], utc=True, errors="coerce").dt.tz_convert(plot_tz)
+    table = table.dropna(subset=["time_local"]).copy()
     table = table[
         (table["time_local"].dt.hour >= 8)
         & ((table["time_local"].dt.hour < 22) | ((table["time_local"].dt.hour == 22) & (table["time_local"].dt.minute == 0)))
@@ -2416,9 +2420,14 @@ def save_current_day_plot(
     if table.empty:
         raise ValueError("No rows available in 08:00-22:00 range for current-day plotting.")
 
-    x = np.arange(len(table))
-    x_lookup = {ts: idx for idx, ts in enumerate(table["time_local"])}
-    first_dt = table["time_local"].iloc[0]
+    time_index = pd.DatetimeIndex(table["time_local"])
+    x = mdates.date2num(time_index.to_pydatetime()).astype(float)
+
+    def _date_x_values(times: pd.Series | pd.DatetimeIndex) -> np.ndarray:
+        dt_index = pd.DatetimeIndex(times)
+        return mdates.date2num(dt_index.to_pydatetime()).astype(float)
+
+    first_dt = time_index[0]
     day_label = _format_static_day_label(first_dt)
 
     fc_low = table["forecast_wind_min"].to_numpy(dtype=float)
@@ -2570,7 +2579,7 @@ def save_current_day_plot(
         if np.any(valid):
             ax.plot(x_values[valid], y_values[valid], **kwargs)
 
-    _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
+    _apply_speed_background(ax, y_upper, x_left=float(x[0]), x_right=float(x[-1]))
     _draw_sufficient_wind_threshold(ax)
     if np.any(~np.isnan(actual_min)):
         _plot_valid_line(
@@ -2600,7 +2609,7 @@ def save_current_day_plot(
         marker="o",
         markersize=2.2,
         color="magenta",
-        linewidth=2.2,
+        linewidth=1.6,
         label="_nolegend_",
         zorder=5,
     )
@@ -2637,7 +2646,7 @@ def save_current_day_plot(
             if active_overlay.empty:
                 continue
 
-            active_x = np.array([x_lookup.get(ts, np.nan) for ts in active_overlay["time_local"]], dtype=float)
+            active_x = _date_x_values(active_overlay["time_local"])
 
             superlocal_y = pd.to_numeric(active_overlay["lstm_pred_wind_speed"], errors="coerce").to_numpy(dtype=float)
             superlocal_valid = (~np.isnan(active_x)) & (~np.isnan(superlocal_y))
@@ -2668,7 +2677,7 @@ def save_current_day_plot(
             ].copy()
             if harmonie_overlay.empty:
                 continue
-            harmonie_x = np.array([x_lookup.get(ts, np.nan) for ts in harmonie_overlay["time_local"]], dtype=float)
+            harmonie_x = _date_x_values(harmonie_overlay["time_local"])
             harmonie_y = pd.to_numeric(harmonie_overlay["forecast_wind_speed"], errors="coerce").to_numpy(dtype=float)
             harmonie_valid = (~np.isnan(harmonie_x)) & (~np.isnan(harmonie_y))
             if np.any(harmonie_valid):
@@ -2693,40 +2702,52 @@ def save_current_day_plot(
     # The solid current comparison is anchored to the latest active Harmonie
     # update. We plot the Super local branch issued at that same anchor so the
     # solid lines represent one fair frozen head-to-head pair.
-    current_branch_x = np.array([x_lookup.get(ts, np.nan) for ts in current_comparison_frame["time_local"]], dtype=float)
-    harmonie_current = np.full(len(table), np.nan, dtype=float)
-    harmonie_current_high = np.full(len(table), np.nan, dtype=float)
-    harmonie_current_low = np.full(len(table), np.nan, dtype=float)
-    superlocal_current = np.full(len(table), np.nan, dtype=float)
-    current_branch_boundary_idx: int | None = x_lookup.get(current_harmonie_anchor)
-    current_valid = ~np.isnan(current_branch_x)
+    current_branch_x = _date_x_values(current_comparison_frame["time_local"])
+    current_valid = np.isfinite(current_branch_x)
+    harmonie_current = pd.to_numeric(
+        current_comparison_frame["forecast_wind_speed"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    harmonie_high_vals = pd.to_numeric(
+        current_comparison_frame["forecast_wind_max"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    harmonie_low_vals = pd.to_numeric(
+        current_comparison_frame["forecast_wind_min"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    harmonie_current_high = np.where(np.isnan(harmonie_high_vals), harmonie_current, harmonie_high_vals)
+    harmonie_current_low = np.where(np.isnan(harmonie_low_vals), harmonie_current, harmonie_low_vals)
+    superlocal_current = pd.to_numeric(
+        current_comparison_frame["lstm_pred_wind_speed"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
     if np.any(current_valid):
-        branch_positions = current_branch_x[current_valid].astype(int)
-        harmonie_vals = pd.to_numeric(
-            current_comparison_frame.loc[current_valid, "forecast_wind_speed"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        harmonie_high_vals = pd.to_numeric(
-            current_comparison_frame.loc[current_valid, "forecast_wind_max"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        harmonie_low_vals = pd.to_numeric(
-            current_comparison_frame.loc[current_valid, "forecast_wind_min"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        superlocal_vals = pd.to_numeric(
-            current_comparison_frame.loc[current_valid, "lstm_pred_wind_speed"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        harmonie_current[branch_positions] = harmonie_vals
-        harmonie_current_high[branch_positions] = np.where(np.isnan(harmonie_high_vals), harmonie_vals, harmonie_high_vals)
-        harmonie_current_low[branch_positions] = np.where(np.isnan(harmonie_low_vals), harmonie_vals, harmonie_low_vals)
-        superlocal_current[branch_positions] = superlocal_vals
-        if current_branch_boundary_idx is None and len(branch_positions) > 0:
-            current_branch_boundary_idx = int(branch_positions[0])
+        current_branch_x = current_branch_x[current_valid]
+        harmonie_current = harmonie_current[current_valid]
+        harmonie_current_high = harmonie_current_high[current_valid]
+        harmonie_current_low = harmonie_current_low[current_valid]
+        superlocal_current = superlocal_current[current_valid]
+        order = np.argsort(current_branch_x)
+        current_branch_x = current_branch_x[order]
+        harmonie_current = harmonie_current[order]
+        harmonie_current_high = harmonie_current_high[order]
+        harmonie_current_low = harmonie_current_low[order]
+        superlocal_current = superlocal_current[order]
+    else:
+        current_branch_x = np.array([], dtype=float)
+        harmonie_current = np.array([], dtype=float)
+        harmonie_current_high = np.array([], dtype=float)
+        harmonie_current_low = np.array([], dtype=float)
+        superlocal_current = np.array([], dtype=float)
+    current_branch_boundary_x: float | None = float(
+        mdates.date2num(pd.Timestamp(current_harmonie_anchor).to_pydatetime())
+    )
+    if len(current_branch_x) > 0 and not (x[0] <= current_branch_boundary_x <= x[-1]):
+        current_branch_boundary_x = float(current_branch_x[0])
 
     _plot_valid_line(
-        x,
+        current_branch_x,
         harmonie_current_high,
         color="#666666",
         linewidth=1.2,
@@ -2735,7 +2756,7 @@ def save_current_day_plot(
         zorder=2.4,
     )
     _plot_valid_line(
-        x,
+        current_branch_x,
         harmonie_current,
         color="#555555",
         linewidth=2.2,
@@ -2744,7 +2765,7 @@ def save_current_day_plot(
     )
 
     _plot_valid_line(
-        x,
+        current_branch_x,
         superlocal_current,
         color=SUPERLOCAL_FORECAST_COLOR,
         linewidth=2.6,
@@ -2752,15 +2773,18 @@ def save_current_day_plot(
         zorder=3,
     )
 
-    def _first_valid_index(values: np.ndarray) -> int | None:
-        valid_idx = np.where(~np.isnan(values))[0]
-        return int(valid_idx[0]) if len(valid_idx) else None
+    def _first_valid_point(x_values: np.ndarray, y_values: np.ndarray) -> tuple[float, float] | None:
+        valid_idx = np.where(~np.isnan(y_values))[0]
+        if len(valid_idx) == 0:
+            return None
+        idx = int(valid_idx[0])
+        return float(x_values[idx]), float(y_values[idx])
 
-    harmonie_start_idx = _first_valid_index(harmonie_current)
-    if harmonie_start_idx is not None:
+    harmonie_start = _first_valid_point(current_branch_x, harmonie_current)
+    if harmonie_start is not None:
         ax.scatter(
-            [float(harmonie_start_idx)],
-            [float(harmonie_current[harmonie_start_idx])],
+            [harmonie_start[0]],
+            [harmonie_start[1]],
             s=54 if mobile else 46,
             marker="s",
             color="#555555",
@@ -2769,11 +2793,11 @@ def save_current_day_plot(
             zorder=3.6,
             label="_nolegend_",
         )
-    superlocal_start_idx = _first_valid_index(superlocal_current)
-    if superlocal_start_idx is not None:
+    superlocal_start = _first_valid_point(current_branch_x, superlocal_current)
+    if superlocal_start is not None:
         ax.scatter(
-            [float(superlocal_start_idx)],
-            [float(superlocal_current[superlocal_start_idx])],
+            [superlocal_start[0]],
+            [superlocal_start[1]],
             s=58 if mobile else 50,
             marker="o",
             color=SUPERLOCAL_FORECAST_COLOR,
@@ -2792,7 +2816,7 @@ def save_current_day_plot(
             [0],
             [0],
             color="magenta",
-            linewidth=2.2,
+            linewidth=1.6,
             marker="o",
             markersize=4.2 if mobile else 3.6,
         ),
@@ -2834,12 +2858,17 @@ def save_current_day_plot(
         borderaxespad=0.0,
         fontsize=legend_fs,
     )
-    hour_tick_mask = table["time_local"].dt.minute.eq(0)
-    tick_pos = x[hour_tick_mask.to_numpy()]
-    tick_lbl = table.loc[hour_tick_mask, "time_local"].dt.strftime("%H").to_list()
-    ax.set_xticks(tick_pos, tick_lbl, rotation=0)
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=plot_tz))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H", tz=plot_tz))
+    ax.xaxis.set_minor_locator(mticker.NullLocator())
+    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
     ax.tick_params(axis="both", labelsize=tick_fs)
-    ax.set_xlim(-0.05, len(table) - 1.0 + 0.02)
+    xlim_left = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=8)
+    xlim_right = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=22)
+    ax.set_xlim(
+        float(mdates.date2num(xlim_left.to_pydatetime())),
+        float(mdates.date2num(xlim_right.to_pydatetime())),
+    )
     ax.set_ylim(y_lower, y_upper)
 
     superlocal_color = SUPERLOCAL_FORECAST_COLOR
@@ -2853,25 +2882,27 @@ def save_current_day_plot(
     actual_idx = np.where(~np.isnan(actual_avg))[0]
     if len(actual_idx) > 0:
         latest_actual_idx = int(actual_idx[-1])
+        latest_actual_x = float(x[latest_actual_idx])
         latest_actual_value = float(actual_avg[latest_actual_idx])
         # Mark "now" at the latest available measured point on the dense timeline.
-        ax.axvline(float(latest_actual_idx), color="gray", linestyle="--", linewidth=1.0, zorder=0.8)
+        ax.axvline(latest_actual_x, color="gray", linestyle="--", linewidth=1.0, zorder=0.8)
+        latest_is_near_right_edge = latest_actual_x >= float(x[-1]) - (30.0 / (24.0 * 60.0))
         ax.annotate(
             f"{int(round(latest_actual_value))} kts",
-            xy=(latest_actual_idx, latest_actual_value),
-            xytext=(-8, -12) if latest_actual_idx >= len(table) - 3 else (6, -12),
+            xy=(latest_actual_x, latest_actual_value),
+            xytext=(-8, -12) if latest_is_near_right_edge else (6, -12),
             textcoords="offset points",
-            ha="right" if latest_actual_idx >= len(table) - 3 else "left",
+            ha="right" if latest_is_near_right_edge else "left",
             va="top",
             fontsize=max(mae_fs - 1, 8),
             color=measured_color,
             zorder=8,
             clip_on=True,
         )
-        if current_branch_boundary_idx is not None:
+        if current_branch_boundary_x is not None:
             ax.annotate(
                 f"active anchor {current_harmonie_anchor.strftime('%H:%M')}",
-                xy=(float(current_branch_boundary_idx), y_upper),
+                xy=(current_branch_boundary_x, y_upper),
                 xytext=(0, 4),
                 textcoords="offset points",
                 ha="center",
@@ -2990,17 +3021,17 @@ def save_current_day_plot(
     # Direction arrows below axis for forecast, LSTM (remaining where available, else full-day context), and actual.
     y_base_axes = -0.115 if mobile else -0.14
     arrow_len_axes = 0.058 if mobile else 0.065
-    if len(table) >= 2:
-        step_min = max(
-            1,
-            int(round((table["time_local"].iloc[1] - table["time_local"].iloc[0]).total_seconds() / 60.0)),
-        )
-    else:
-        step_min = 6
-    points_per_hour = max(1.0, 60.0 / step_min)
-    arrow_dx_scale = 0.22 * points_per_hour
-    arrow_rows = table[table["time_local"].dt.minute.eq(0)]
-    for i, row in arrow_rows.iterrows():
+    arrow_dx_scale = 0.22 / 24.0
+    arrow_mask = (
+        table["time_local"].dt.minute.eq(0)
+        & table["time_local"].dt.second.eq(0)
+        & table["time_local"].dt.microsecond.eq(0)
+    )
+    if "is_forecast_grid" in table.columns:
+        arrow_mask = arrow_mask & table["is_forecast_grid"].astype(bool)
+    arrow_rows = table[arrow_mask].drop_duplicates(subset=["time_local"], keep="last")
+    for _, row in arrow_rows.iterrows():
+        row_x = float(mdates.date2num(pd.Timestamp(row["time_local"]).to_pydatetime()))
         fdir = row["forecast_wind_dir_deg"]
         ldir = row["lstm_pred_wind_dir_deg"]
         adir = row["actual_wind_dir_deg"]
@@ -3014,8 +3045,8 @@ def save_current_day_plot(
             dy = arrow_len_axes * np.cos(theta)
             ax.annotate(
                 "",
-                xy=(i + dx, y_base_axes + dy),
-                xytext=(i, y_base_axes),
+                xy=(row_x + dx, y_base_axes + dy),
+                xytext=(row_x, y_base_axes),
                 xycoords=ax.get_xaxis_transform(),
                 textcoords=ax.get_xaxis_transform(),
                 arrowprops={"arrowstyle": "-|>", "color": color, "lw": 1.6, "shrinkA": 0, "shrinkB": 0},

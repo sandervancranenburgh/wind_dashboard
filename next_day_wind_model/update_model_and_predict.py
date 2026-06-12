@@ -1599,6 +1599,87 @@ def _measured_actual_trend_values(time_local: pd.Series, actual_values: np.ndarr
     return out.to_numpy(dtype=float)
 
 
+def _time_rolling_mean_values(
+    time_local: pd.Series | pd.DatetimeIndex,
+    values: np.ndarray | pd.Series,
+    *,
+    window: str = "30min",
+    min_periods: int = 3,
+) -> np.ndarray:
+    time_index = pd.DatetimeIndex(time_local)
+    out = pd.Series(np.nan, index=time_index, dtype=float)
+    if len(time_index) == 0:
+        return out.to_numpy(dtype=float)
+
+    series = pd.Series(pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float), index=time_index)
+    measured_series = series.dropna().sort_index()
+    if measured_series.empty:
+        return out.to_numpy(dtype=float)
+
+    trend = measured_series.rolling(window, min_periods=min_periods).mean()
+    out.loc[trend.index] = trend
+    return out.to_numpy(dtype=float)
+
+
+def compute_power_based_wind_variability(
+    time_local: pd.Series | pd.DatetimeIndex,
+    mean_values: np.ndarray | pd.Series,
+    min_values: np.ndarray | pd.Series | None = None,
+    max_values: np.ndarray | pd.Series | None = None,
+    *,
+    fallback_window: str = "30min",
+    min_mean_speed: float = 0.1,
+) -> np.ndarray:
+    time_index = pd.DatetimeIndex(time_local)
+    if len(time_index) == 0:
+        return np.array([], dtype=float)
+
+    frame = pd.DataFrame(
+        {
+            "mean": pd.to_numeric(pd.Series(mean_values), errors="coerce").to_numpy(dtype=float),
+            "min": (
+                pd.to_numeric(pd.Series(min_values), errors="coerce").to_numpy(dtype=float)
+                if min_values is not None
+                else np.full(len(time_index), np.nan, dtype=float)
+            ),
+            "max": (
+                pd.to_numeric(pd.Series(max_values), errors="coerce").to_numpy(dtype=float)
+                if max_values is not None
+                else np.full(len(time_index), np.nan, dtype=float)
+            ),
+        },
+        index=time_index,
+    ).sort_index()
+
+    direct_valid = (
+        frame["mean"].abs().gt(float(min_mean_speed))
+        & frame["min"].notna()
+        & frame["max"].notna()
+    )
+    direct = pd.Series(np.nan, index=frame.index, dtype=float)
+    direct.loc[direct_valid] = (
+        (np.square(frame.loc[direct_valid, "max"]) - np.square(frame.loc[direct_valid, "min"]))
+        / np.square(frame.loc[direct_valid, "mean"])
+    )
+
+    measured_mean = frame["mean"].dropna()
+    fallback = pd.Series(np.nan, index=frame.index, dtype=float)
+    if not measured_mean.empty:
+        rolling = measured_mean.rolling(fallback_window, min_periods=2)
+        rolling_mean = rolling.mean()
+        rolling_min = rolling.min()
+        rolling_max = rolling.max()
+        fallback_valid = rolling_mean.abs().gt(float(min_mean_speed))
+        fallback_values = pd.Series(np.nan, index=rolling_mean.index, dtype=float)
+        fallback_values.loc[fallback_valid] = (
+            (np.square(rolling_max.loc[fallback_valid]) - np.square(rolling_min.loc[fallback_valid]))
+            / np.square(rolling_mean.loc[fallback_valid])
+        )
+        fallback.loc[fallback_values.index] = fallback_values
+
+    return direct.combine_first(fallback).reindex(time_index).to_numpy(dtype=float)
+
+
 def _build_current_day_plot_frame(
     dense_times: pd.DatetimeIndex,
     forecast_columns: dict[str, np.ndarray],
@@ -2452,6 +2533,21 @@ def save_current_day_plot(
     )
     has_actual_trend = bool(np.any(~np.isnan(actual_trend)))
     has_actual_minmax = bool(np.any(~np.isnan(actual_min)) or np.any(~np.isnan(actual_max)))
+    wind_variability = compute_power_based_wind_variability(
+        table["time_local"],
+        actual_avg,
+        actual_min,
+        actual_max,
+        fallback_window="30min",
+    )
+    has_wind_variability = bool(np.any(~np.isnan(wind_variability)))
+    wind_variability_trend = _time_rolling_mean_values(
+        table["time_local"],
+        wind_variability,
+        window="30min",
+        min_periods=3,
+    )
+    has_wind_variability_trend = bool(np.any(~np.isnan(wind_variability_trend)))
 
     current_issue_dt = _parse_iso_utc(prediction_generated_at_utc)
     if current_issue_dt is None:
@@ -2562,7 +2658,7 @@ def save_current_day_plot(
             f"harmonie_max_clipped={harmonie_max_diagnostic > y_upper}"
         )
 
-    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
+    fig_size = (8.4, 10.4) if mobile else (14, 8.8)
     title_fs = 14 if mobile else None
     title_pad = 12 if mobile else 20
     label_fs = 12 if mobile else None
@@ -2572,7 +2668,14 @@ def save_current_day_plot(
     mae_fs = 11 if mobile else 10
     meta_text_y = 1.19 if mobile else 1.16
     metric_box_y = 1.29 if mobile else 1.24
-    fig, ax = plt.subplots(figsize=fig_size)
+    subplot_hspace = 0.20 if mobile else 0.17
+    fig, (ax, variability_ax, direction_ax) = plt.subplots(
+        3,
+        1,
+        figsize=fig_size,
+        sharex=True,
+        gridspec_kw={"height_ratios": [5.0, 1.12, 0.48], "hspace": subplot_hspace},
+    )
 
     def _plot_valid_line(x_values: np.ndarray, y_values: np.ndarray, **kwargs) -> None:
         valid = ~np.isnan(y_values)
@@ -2808,7 +2911,7 @@ def save_current_day_plot(
         )
 
     ax.set_title(day_label, fontsize=title_fs, pad=title_pad)
-    ax.set_xlabel("Time", fontsize=label_fs, labelpad=0)
+    ax.set_xlabel("")
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
     order_map = {
@@ -2858,18 +2961,110 @@ def save_current_day_plot(
         borderaxespad=0.0,
         fontsize=legend_fs,
     )
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=plot_tz))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H", tz=plot_tz))
-    ax.xaxis.set_minor_locator(mticker.NullLocator())
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
-    ax.tick_params(axis="both", labelsize=tick_fs)
     xlim_left = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=8)
     xlim_right = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=22)
-    ax.set_xlim(
-        float(mdates.date2num(xlim_left.to_pydatetime())),
-        float(mdates.date2num(xlim_right.to_pydatetime())),
-    )
+    xlim_left_num = float(mdates.date2num(xlim_left.to_pydatetime()))
+    xlim_right_num = float(mdates.date2num(xlim_right.to_pydatetime()))
+    for axis in (ax, variability_ax, direction_ax):
+        axis.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=plot_tz))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H", tz=plot_tz))
+        axis.xaxis.set_minor_locator(mticker.NullLocator())
+        axis.xaxis.set_minor_formatter(mticker.NullFormatter())
+        axis.tick_params(axis="both", labelsize=tick_fs)
+        axis.set_xlim(xlim_left_num, xlim_right_num)
+    ax.tick_params(axis="x", labelbottom=False)
+    variability_ax.tick_params(axis="x", labelbottom=True)
+    direction_ax.tick_params(axis="x", labelbottom=False, bottom=False)
     ax.set_ylim(y_lower, y_upper)
+
+    variability_y_lower = 0.5
+    variability_y_upper = 2.0
+    variability_threshold = 1.2
+    variability_raw_color = "#cc33cc"
+    variability_trend_color = "#b000b8"
+    variability_gradient = np.linspace(0.0, 1.0, 256, dtype=float).reshape(256, 1)
+    variability_cmap = plt.matplotlib.colors.LinearSegmentedColormap.from_list(
+        "wind_variability_threshold_bg",
+        [
+            (0.00, "#4fb477"),
+            (0.40, "#78bd64"),
+            (0.46, "#efd45a"),
+            (0.51, "#eda24f"),
+            (0.54, "#df6a65"),
+            (1.00, "#d8567c"),
+        ],
+    )
+    variability_ax.imshow(
+        variability_gradient,
+        extent=[xlim_left_num, xlim_right_num, variability_y_lower, variability_y_upper],
+        origin="lower",
+        aspect="auto",
+        cmap=variability_cmap,
+        alpha=0.32,
+        zorder=0,
+        interpolation="bicubic",
+    )
+    variability_ax.axhline(
+        variability_threshold,
+        color="#1f5f5b",
+        linewidth=1.35 if mobile else 1.25,
+        alpha=0.82,
+        zorder=1.2,
+    )
+    if has_wind_variability:
+        variability_valid = ~np.isnan(wind_variability)
+        variability_ax.plot(
+            x[variability_valid],
+            wind_variability[variability_valid],
+            color=variability_raw_color,
+            linewidth=0.9 if mobile else 0.8,
+            alpha=0.74,
+            zorder=2.1,
+        )
+    if has_wind_variability_trend:
+        variability_trend_valid = ~np.isnan(wind_variability_trend)
+        variability_ax.plot(
+            x[variability_trend_valid],
+            wind_variability_trend[variability_trend_valid],
+            color=variability_trend_color,
+            linewidth=2.1 if mobile else 2.0,
+            alpha=0.9,
+            zorder=2.8,
+        )
+    variability_label_values = wind_variability_trend if has_wind_variability_trend else wind_variability
+    variability_label_color = variability_trend_color if has_wind_variability_trend else variability_raw_color
+    variability_label_valid = np.where(np.isfinite(variability_label_values))[0]
+    if len(variability_label_valid) > 0:
+        variability_label_idx = int(variability_label_valid[-1])
+        variability_label_x = float(x[variability_label_idx])
+        variability_label_y = float(variability_label_values[variability_label_idx])
+        variability_label_near_right_edge = variability_label_x >= xlim_right_num - (30.0 / (24.0 * 60.0))
+        variability_ax.annotate(
+            f"{variability_label_y:.2f}",
+            xy=(variability_label_x, variability_label_y),
+            xytext=(-8, 7) if variability_label_near_right_edge else (6, 7),
+            textcoords="offset points",
+            ha="right" if variability_label_near_right_edge else "left",
+            va="bottom",
+            fontsize=max(mae_fs - 1, 8),
+            color=variability_label_color,
+            fontweight="bold",
+            zorder=4.5,
+            clip_on=True,
+        )
+    variability_ax.set_ylim(variability_y_lower, variability_y_upper)
+    variability_ax.set_yticks([0.5, 1.0, 1.5, 2.0])
+    variability_ax.set_ylabel("Wind variability", fontsize=10 if mobile else 9, labelpad=5)
+    variability_ax.set_xlabel("")
+    variability_ax.grid(axis="y", color="#667780", alpha=0.22, linewidth=0.8)
+    variability_ax.set_axisbelow(True)
+    direction_ax.set_ylim(0.0, 1.0)
+    direction_ax.set_yticks([])
+    direction_ax.set_ylabel("")
+    direction_ax.set_xlabel("")
+    direction_ax.grid(False)
+    for spine_name in ("left", "right", "top", "bottom"):
+        direction_ax.spines[spine_name].set_visible(False)
 
     superlocal_color = SUPERLOCAL_FORECAST_COLOR
     measured_color = "#cc33cc"
@@ -2886,6 +3081,8 @@ def save_current_day_plot(
         latest_actual_value = float(actual_avg[latest_actual_idx])
         # Mark "now" at the latest available measured point on the dense timeline.
         ax.axvline(latest_actual_x, color="gray", linestyle="--", linewidth=1.0, zorder=0.8)
+        variability_ax.axvline(latest_actual_x, color="gray", linestyle="--", linewidth=0.9, zorder=1.1)
+        direction_ax.axvline(latest_actual_x, color="gray", linestyle="--", linewidth=0.8, zorder=1.1)
         latest_is_near_right_edge = latest_actual_x >= float(x[-1]) - (30.0 / (24.0 * 60.0))
         ax.annotate(
             f"{int(round(latest_actual_value))} kts",
@@ -3018,9 +3215,9 @@ def save_current_day_plot(
         clip_on=False,
     )
 
-    # Direction arrows below axis for forecast, LSTM (remaining where available, else full-day context), and actual.
-    y_base_axes = -0.115 if mobile else -0.14
-    arrow_len_axes = 0.058 if mobile else 0.065
+    # Direction arrows for forecast, LSTM (remaining where available, else full-day context), and actual.
+    y_base = 0.26
+    arrow_len = 0.22 if mobile else 0.24
     arrow_dx_scale = 0.22 / 24.0
     arrow_mask = (
         table["time_local"].dt.minute.eq(0)
@@ -3042,24 +3239,27 @@ def save_current_day_plot(
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = arrow_dx_scale * np.sin(theta)
-            dy = arrow_len_axes * np.cos(theta)
-            ax.annotate(
+            dy = arrow_len * np.cos(theta)
+            direction_ax.annotate(
                 "",
-                xy=(row_x + dx, y_base_axes + dy),
-                xytext=(row_x, y_base_axes),
-                xycoords=ax.get_xaxis_transform(),
-                textcoords=ax.get_xaxis_transform(),
+                xy=(row_x + dx, y_base + dy),
+                xytext=(row_x, y_base),
+                xycoords=direction_ax.transData,
+                textcoords=direction_ax.transData,
                 arrowprops={"arrowstyle": "-|>", "color": color, "lw": 1.6, "shrinkA": 0, "shrinkB": 0},
                 clip_on=False,
                 zorder=z,
             )
 
     layout_top = 0.78 if mobile else 0.82
-    layout_bottom = 0.20 if mobile else 0.19
-    xlabel_y = -0.21 if mobile else -0.23
-    fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
-    fig.subplots_adjust(bottom=layout_bottom, top=layout_top)
-    ax.xaxis.set_label_coords(0.5, xlabel_y)
+    layout_bottom = 0.08 if mobile else 0.075
+    fig.subplots_adjust(
+        left=0.11 if mobile else 0.07,
+        right=0.985 if mobile else 0.99,
+        bottom=layout_bottom,
+        top=layout_top,
+        hspace=subplot_hspace,
+    )
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -5618,8 +5818,26 @@ def publish_web_dashboard(
 
     generated_local = datetime.now(ZoneInfo(local_tz))
     generated_local_str = generated_local.strftime("%d %B %Y %H:%M:%S %Z")
+    static_plot_generated_at_utc = datetime.now(timezone.utc).isoformat()
+    static_plot_generated_at_json = json.dumps(static_plot_generated_at_utc)
     cache_bust = int(datetime.now(timezone.utc).timestamp())
     refresh = max(60, int(web_refresh_seconds))
+    static_refresh_interval_ms = refresh * 1000
+    static_refresh_metadata = {
+        "static_plot_generated_at_utc": static_plot_generated_at_utc,
+        "prediction_generated_at_utc": prediction_generated_at_utc,
+        "prediction_updated_at_utc": prediction_updated_at_utc,
+        "model_last_trained_at_utc": model_trained_at_utc,
+        "generated_at_utc": static_plot_generated_at_utc,
+        "static_images": [
+            name
+            for name in ["current_day_predictions.png", "current_day_predictions_mobile.png"]
+            if name in copied
+        ],
+    }
+    static_refresh_metadata_path = web_out_dir / "metadata_update.json"
+    static_refresh_metadata_path.write_text(json.dumps(static_refresh_metadata, indent=2), encoding="utf-8")
+    copied["metadata_update.json"] = str(static_refresh_metadata_path)
     companion_base = (companion_app_base_url or "").rstrip("/")
     companion_links = ""
     if companion_base:
@@ -5630,11 +5848,12 @@ def publish_web_dashboard(
       <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperience%2Fnew">New submission</a>
       <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperiences">My sessions</a>
     </nav>"""
-    current_day_mobile_src = (
-        f"current_day_predictions_mobile.png?v={cache_bust}"
+    current_day_mobile_base = (
+        "current_day_predictions_mobile.png"
         if "current_day_predictions_mobile.png" in copied
-        else f"current_day_predictions.png?v={cache_bust}"
+        else "current_day_predictions.png"
     )
+    current_day_mobile_src = f"{current_day_mobile_base}?v={cache_bust}"
     next_day_mobile_src = (
         f"next_day_predictions_mobile.png?v={cache_bust}"
         if "next_day_predictions_mobile.png" in copied
@@ -5790,7 +6009,8 @@ def publish_web_dashboard(
       <p class="desc">Measured wind speed up to now, plus the latest Harmonie and super-local prediction for the remaining hours of today.</p>
             <div
                 class="interactive-block"
-                data-interactive-wind-block="true"
+                data-interactive-wind-block="false"
+                data-static-default="true"
                 data-plot-id="current-day-interactive-plot"
                 data-controls-id="current-day-interactive-controls"
                 data-details-id="current-day-interactive-details"
@@ -5802,8 +6022,8 @@ def publish_web_dashboard(
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="current-day-fallback">
-        <source media="(max-width: 768px)" srcset="{current_day_mobile_src}">
-        <img src="current_day_predictions.png?v={cache_bust}" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="{current_day_mobile_src}" data-static-refresh-src="{current_day_mobile_base}">
+        <img src="current_day_predictions.png?v={cache_bust}" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
@@ -5844,7 +6064,87 @@ def publish_web_dashboard(
             if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {{
                 window.WindDashboardInteractive.initInteractiveWindDashboard();
             }}
+            initStaticPlotRefresh();
         }});
+
+        function initStaticPlotRefresh() {{
+            var metadataUrl = "metadata_update.json";
+            var pollIntervalMs = {static_refresh_interval_ms};
+            var lastStaticPlotVersion = {static_plot_generated_at_json};
+
+            function metadataVersion(metadata) {{
+                if (!metadata) {{
+                    return "";
+                }}
+                return String(
+                    metadata.static_plot_generated_at_utc ||
+                    metadata.plot_refreshed_at_utc ||
+                    metadata.prediction_updated_at_utc ||
+                    metadata.prediction_generated_at_utc ||
+                    metadata.generated_at_utc ||
+                    ""
+                );
+            }}
+
+            function cacheBustedUrl(baseSrc, version) {{
+                return String(baseSrc).split("?")[0] + "?v=" + encodeURIComponent(version);
+            }}
+
+            function refreshStaticImages(version) {{
+                document.querySelectorAll("#current-day-fallback [data-static-refresh-src]").forEach(function (element) {{
+                    var baseSrc = element.getAttribute("data-static-refresh-src");
+                    if (!baseSrc || element.getAttribute("data-static-refresh-version") === version) {{
+                        return;
+                    }}
+                    var nextUrl = cacheBustedUrl(baseSrc, version);
+                    if (element.tagName.toLowerCase() === "source") {{
+                        if (element.getAttribute("srcset") !== nextUrl) {{
+                            element.setAttribute("srcset", nextUrl);
+                        }}
+                    }} else if (element.getAttribute("src") !== nextUrl) {{
+                        element.setAttribute("src", nextUrl);
+                    }}
+                    element.setAttribute("data-static-refresh-version", version);
+                }});
+            }}
+
+            function pollMetadata() {{
+                return fetch(metadataUrl + "?v=" + Date.now(), {{ cache: "no-store" }})
+                    .then(function (response) {{
+                        if (!response.ok) {{
+                            throw new Error("metadata fetch failed: " + response.status);
+                        }}
+                        return response.json();
+                    }})
+                    .then(function (metadata) {{
+                        var nextVersion = metadataVersion(metadata);
+                        if (!nextVersion) {{
+                            return;
+                        }}
+                        if (!lastStaticPlotVersion) {{
+                            lastStaticPlotVersion = nextVersion;
+                            return;
+                        }}
+                        if (nextVersion !== lastStaticPlotVersion) {{
+                            lastStaticPlotVersion = nextVersion;
+                            refreshStaticImages(nextVersion);
+                        }}
+                    }})
+                    .catch(function (error) {{
+                        if (window.console && typeof window.console.debug === "function") {{
+                            window.console.debug("Static plot metadata refresh skipped", error);
+                        }}
+                    }});
+            }}
+
+            function scheduleNextPoll() {{
+                window.setTimeout(function () {{
+                    pollMetadata().then(scheduleNextPoll, scheduleNextPoll);
+                }}, pollIntervalMs);
+            }}
+
+            pollMetadata().then(scheduleNextPoll, scheduleNextPoll);
+        }}
     </script>
 </body>
 </html>

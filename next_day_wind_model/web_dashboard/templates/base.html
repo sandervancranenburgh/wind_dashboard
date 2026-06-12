@@ -70,6 +70,9 @@
     .submissions-page { max-width: min(1500px, calc(100vw - 32px)); }
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; max-width: 820px; }
     .form-row-full { grid-column: 1 / -1; }
+    .form-date-row, .form-rating-row, .form-perceived-row { grid-column: 1 / -1; max-width: 390px; }
+    .form-time-start { grid-column: 1; }
+    .form-time-end { grid-column: 2; }
     .form-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
     .page-header-actions {
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -140,6 +143,8 @@
     .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
     .legend-line.superlocal { border-top-color: #f28e2b; }
     .legend-line.harmonie { border-top-color: #777; }
+    .legend-line.variability-raw { border-top-width: 2px; opacity: 0.56; }
+    .legend-line.variability-trend { border-top-color: #b000b8; }
     pre { white-space: pre-wrap; overflow-x: auto; background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
     @media (max-width: 768px) {
       body { margin: 10px; }

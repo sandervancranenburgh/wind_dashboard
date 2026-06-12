@@ -17,6 +17,11 @@
     .detail-list dd { margin: 0; }
     .wind-summary { display: grid; grid-template-columns: max-content max-content; gap: 3px 18px; align-items: baseline; }
     .wind-summary .value { font-variant-numeric: tabular-nums; }
+    .rating-display { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+    .rating-value { color: #555; font-variant-numeric: tabular-nums; }
+    .rating-stars { display: inline-flex; gap: 1px; font-size: 16px; line-height: 1; letter-spacing: 0; }
+    .rating-stars .filled { color: #f5b400; }
+    .rating-stars .empty { color: #cfd4da; }
     .wind-plot { margin: 10px 0 0 0; max-width: 900px; }
     .wind-plot svg { width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
     .wind-plot figcaption { display: flex; gap: 14px; align-items: center; color: #555; margin-top: 8px; flex-wrap: wrap; }
@@ -24,6 +29,8 @@
     .legend-line.gust { border-top-style: dashed; opacity: 0.68; }
     .legend-line.superlocal { border-top-color: #f28e2b; }
     .legend-line.harmonie { border-top-color: #777; }
+    .legend-line.variability-raw { border-top-width: 2px; opacity: 0.56; }
+    .legend-line.variability-trend { border-top-color: #b000b8; }
     .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
     @media (max-width: 768px) {
       body { margin: 10px; }
@@ -41,7 +48,18 @@
       <dt>Spot</dt><dd>{{ row.spot }}</dd>
       <dt>Time</dt><dd>{{ row.start_time }} to {{ row.end_time }}</dd>
       <dt>Submitted by</dt><dd>{{ row.submitted_by }}</dd>
-      <dt>SessionRating</dt><dd>{{ row.session_rating }}/5</dd>
+      <dt>SessionRating</dt>
+      <dd>
+        <span class="rating-display" aria-label="{{ row.session_rating }} out of 5" title="{{ row.session_rating }} out of 5">
+          <span class="rating-value">{{ '%.1f'|format(row.session_rating) }}</span>
+          <span class="rating-stars" aria-hidden="true">
+            {% for value in range(1, 6) %}
+              <span class="{{ 'filled' if value <= row.session_rating else 'empty' }}">&#9733;</span>
+            {% endfor %}
+          </span>
+        </span>
+      </dd>
+      <dt>Perceived variability</dt><dd>{{ perceived_wind_variability_labels.get(row.perceived_wind_variability, 'Not specified') }}</dd>
       <dt>WingSize</dt><dd>{{ row.wing_size }} m2</dd>
       <dt>FoilSize</dt><dd>{{ row.foil_size }} cm2</dd>
       <dt>RiderReview</dt><dd>{{ row.rider_review }}</dd>
@@ -54,7 +72,7 @@
             <span>max avg speed</span><span class="value">{{ ('%.1f kts'|format(row.max_measured_wind_speed)) if row.max_measured_wind_speed is not none else 'n/a' }}</span>
             <span>min avg speed</span><span class="value">{{ ('%.1f kts'|format(row.min_measured_wind_speed)) if row.min_measured_wind_speed is not none else 'n/a' }}</span>
             <span>max gust</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('max_wind_gust'))) if measured_summary.get('max_wind_gust') is not none else 'n/a' }}</span>
-            <span>wind variability</span><span class="value">{{ ('%.1f kts'|format(measured_summary.get('wind_variability'))) if measured_summary.get('wind_variability') is not none else 'n/a' }}</span>
+            <span>Wind variability</span><span class="value">{{ ('%.2f'|format(measured_summary.get('wind_variability'))) if measured_summary.get('wind_variability') is not none else 'n/a' }}</span>
             <span>avg direction</span><span class="value">{{ row.mean_measured_direction_display or 'n/a' }}</span>
           </div>
         {% else %}
@@ -134,6 +152,57 @@
       </figure>
     {% else %}
       <p class="desc">Measured wind data are unavailable for this session.</p>
+    {% endif %}
+    {% if wind_variability_plot.available %}
+      <h2>Wind variability</h2>
+      <figure class="wind-plot">
+        <svg viewBox="0 0 {{ wind_variability_plot.width }} {{ wind_variability_plot.height }}" role="img" aria-label="Measured wind variability during the session">
+          <defs>
+            <linearGradient id="publicSessionWindVariabilityBg" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stop-color="#4fb477" stop-opacity="0.34"></stop>
+              <stop offset="40%" stop-color="#78bd64" stop-opacity="0.32"></stop>
+              <stop offset="46%" stop-color="#efd45a" stop-opacity="0.34"></stop>
+              <stop offset="51%" stop-color="#eda24f" stop-opacity="0.34"></stop>
+              <stop offset="56%" stop-color="#df6a65" stop-opacity="0.32"></stop>
+              <stop offset="100%" stop-color="#d8567c" stop-opacity="0.34"></stop>
+            </linearGradient>
+            <clipPath id="publicSessionWindVariabilityClip">
+              <rect x="{{ wind_variability_plot.pad_left }}" y="{{ wind_variability_plot.pad_top }}" width="{{ wind_variability_plot.plot_width }}" height="{{ wind_variability_plot.plot_height }}"></rect>
+            </clipPath>
+          </defs>
+          <rect x="{{ wind_variability_plot.pad_left }}" y="{{ wind_variability_plot.pad_top }}" width="{{ wind_variability_plot.plot_width }}" height="{{ wind_variability_plot.plot_height }}" fill="url(#publicSessionWindVariabilityBg)"></rect>
+          {% for tick in wind_variability_plot.y_ticks %}
+            <line x1="{{ wind_variability_plot.pad_left }}" y1="{{ tick.y }}" x2="{{ wind_variability_plot.plot_right }}" y2="{{ tick.y }}" stroke="#ffffff" stroke-opacity="0.58"></line>
+            <text x="6" y="{{ tick.label_y }}" font-size="11" fill="#555">{{ tick.label }}</text>
+          {% endfor %}
+          <text x="{{ wind_variability_plot.pad_left }}" y="12" font-size="11" fill="#555">Wind variability</text>
+          <line x1="{{ wind_variability_plot.pad_left }}" y1="{{ wind_variability_plot.threshold_y }}" x2="{{ wind_variability_plot.plot_right }}" y2="{{ wind_variability_plot.threshold_y }}" stroke="#1f5f5b" stroke-width="1.4" stroke-opacity="0.85"></line>
+          <text x="{{ wind_variability_plot.plot_right - 6 }}" y="{{ wind_variability_plot.threshold_label_y }}" font-size="11" fill="#1f5f5b" font-weight="700" text-anchor="end">1.2</text>
+          <line x1="{{ wind_variability_plot.pad_left }}" y1="{{ wind_variability_plot.pad_top }}" x2="{{ wind_variability_plot.pad_left }}" y2="{{ wind_variability_plot.axis_y }}" stroke="#777"></line>
+          <line x1="{{ wind_variability_plot.pad_left }}" y1="{{ wind_variability_plot.axis_y }}" x2="{{ wind_variability_plot.plot_right }}" y2="{{ wind_variability_plot.axis_y }}" stroke="#777"></line>
+          {% for tick in wind_variability_plot.hour_ticks %}
+            <line x1="{{ tick.x }}" y1="{{ wind_variability_plot.pad_top }}" x2="{{ tick.x }}" y2="{{ wind_variability_plot.axis_y }}" stroke="#ffffff" stroke-opacity="0.38"></line>
+            <line x1="{{ tick.x }}" y1="{{ wind_variability_plot.axis_y }}" x2="{{ tick.x }}" y2="{{ wind_variability_plot.axis_y + 5 }}" stroke="#777"></line>
+            <text x="{{ tick.x }}" y="{{ wind_variability_plot.axis_y + 20 }}" font-size="11" fill="#555" text-anchor="middle">{{ tick.label }}</text>
+          {% endfor %}
+          {% if wind_variability_plot.raw_points %}
+            <polyline points="{{ wind_variability_plot.raw_points }}" fill="none" stroke="#cc33cc" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindVariabilityClip)" opacity="0.56"></polyline>
+          {% endif %}
+          {% if wind_variability_plot.trend_points %}
+            <polyline points="{{ wind_variability_plot.trend_points }}" fill="none" stroke="#b000b8" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#publicSessionWindVariabilityClip)" opacity="0.92"></polyline>
+          {% endif %}
+          {% if wind_variability_plot.latest_label %}
+            <rect x="58" y="26" width="126" height="24" rx="4" fill="#ffffff" opacity="0.72"></rect>
+            <text x="66" y="42" font-size="12" fill="#111">{{ wind_variability_plot.latest_label }}</text>
+          {% endif %}
+        </svg>
+        <figcaption>
+          <span class="legend-line variability-raw"></span> raw variability
+          {% if wind_variability_plot.trend_points %}
+            <span class="legend-line variability-trend"></span> 30-min avg
+          {% endif %}
+        </figcaption>
+      </figure>
     {% endif %}
   </main>
 </body>

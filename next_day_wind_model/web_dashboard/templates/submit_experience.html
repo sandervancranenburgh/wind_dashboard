@@ -19,11 +19,11 @@
             {% endfor %}
           </select>
         </div>
-        <div>
+        <div class="form-date-row">
           <label for="Date">Date *</label>
           <input id="Date" name="Date" type="date" value="{{ form_values.Date }}" required>
         </div>
-        <div>
+        <div class="form-time-start">
           <label for="StartTime">StartTime *</label>
           <select id="StartTime" name="StartTime" required>
             {% for value in hour_options %}
@@ -31,7 +31,7 @@
             {% endfor %}
           </select>
         </div>
-        <div>
+        <div class="form-time-end">
           <label for="EndTime">EndTime *</label>
           <select id="EndTime" name="EndTime" required>
             {% for value in hour_options %}
@@ -39,7 +39,7 @@
             {% endfor %}
           </select>
         </div>
-        <div>
+        <div class="form-rating-row">
           <label>SessionRating *</label>
           <div class="stars">
             {% for value in [5, 4, 3, 2, 1] %}
@@ -47,6 +47,15 @@
               <label for="rating-{{ value }}">&#9733;</label>
             {% endfor %}
           </div>
+        </div>
+        <div class="form-perceived-row">
+          <label for="PerceivedWindVariability">Perceived wind variability *</label>
+          <select id="PerceivedWindVariability" name="PerceivedWindVariability" required>
+            <option value="" disabled {% if not form_values.PerceivedWindVariability %}selected{% endif %}>Choose variability</option>
+            {% for value, label in perceived_wind_variability_options %}
+              <option value="{{ value }}" {% if form_values.PerceivedWindVariability == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
         </div>
         <div class="form-row-full">
           <label for="RiderReview">RiderReview</label>

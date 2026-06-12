@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import db_store
@@ -45,6 +46,7 @@ class RiderPortalTest(unittest.TestCase):
         visibility: str | None = None,
         measured_summary: dict[str, float] | None = None,
         rider_review: str | None = None,
+        perceived_wind_variability: str | None = "moderate",
     ) -> int:
         start_ms, end_ms = portal._local_session_bounds(day, "12:00", "14:00")
         experience = {
@@ -57,6 +59,7 @@ class RiderPortalTest(unittest.TestCase):
             "start_ts": start_ms,
             "end_ts": end_ms,
             "session_rating": 4,
+            "perceived_wind_variability": perceived_wind_variability,
             "rider_review": f"Review by {rider}" if rider_review is None else rider_review,
             "rider_weight": 80,
             "wing_size": 5,
@@ -84,6 +87,7 @@ class RiderPortalTest(unittest.TestCase):
             "StartTime": "12:00",
             "EndTime": "14:00",
             "SessionRating": "4",
+            "PerceivedWindVariability": "moderate",
             "RiderReview": "Form review",
             "RiderWeight": "80",
             "WingSize": "5",
@@ -388,10 +392,10 @@ class RiderPortalTest(unittest.TestCase):
         conn.close()
 
         self.assertEqual(measured["status"], "ok")
-        self.assertGreater(measured["summary"]["wind_variability"], 4.0)
+        self.assertAlmostEqual(measured["summary"]["wind_variability"], 0.962673611111111)
         self.assertEqual(
             measured["summary"]["wind_variability_kind"],
-            "mean_15min_rolling_sample_standard_deviation",
+            db_store.POWER_WIND_VARIABILITY_KIND,
         )
         sparse_conn = db_store.connect_db(self.temp_dir.name)
         sparse = db_store.get_measured_wind_for_session(
@@ -401,7 +405,7 @@ class RiderPortalTest(unittest.TestCase):
             start_ms + 3 * 60 * 1000,
         )
         sparse_conn.close()
-        self.assertIsNone(sparse["summary"]["wind_variability"])
+        self.assertAlmostEqual(sparse["summary"]["wind_variability"], 0.986328125)
         self.assertTrue(all("measured_wind_min" in record for record in measured["plot_records"]))
         self.assertTrue(all("measured_wind_max" in record for record in measured["plot_records"]))
         plot_timestamps = [record["timestamp"] for record in measured["plot_records"]]
@@ -424,6 +428,212 @@ class RiderPortalTest(unittest.TestCase):
         self.assertTrue(plot["max_points"])
         self.assertNotIn("trend_points", plot)
         self.assertIn("threshold_y", plot)
+
+    def test_objective_variability_mean_power_metric_used_in_detail_and_overview(self) -> None:
+        start_ms, end_ms = portal._local_session_bounds("2026-01-16", "12:00", "13:00")
+        records = [
+            {"timestamp": start_ms, "measured_wind_speed": 10.0, "measured_wind_min": 8.0, "measured_wind_max": 13.0},
+            {"timestamp": start_ms + 3 * 60 * 1000, "measured_wind_speed": 12.0, "measured_wind_min": 10.0, "measured_wind_max": 15.0},
+            {"timestamp": start_ms + 6 * 60 * 1000, "measured_wind_speed": 14.0, "measured_wind_min": 11.0, "measured_wind_max": 16.0},
+        ]
+        measured = {
+            "status": "ok",
+            "records": records,
+            "plot_records": records,
+            "summary": {
+                "point_count": len(records),
+                "avg_wind_speed": 12.0,
+                "max_wind_speed": 14.0,
+                "min_wind_speed": 10.0,
+                "max_wind_gust": 16.0,
+            },
+        }
+        conn = db_store.connect_db(self.temp_dir.name)
+        experience_id = db_store.create_surf_experience(
+            conn,
+            {
+                "user_id": self.user_id,
+                "rider": "Objective Rider",
+                "spot": "Valkenburgse meer",
+                "date": "2026-01-16",
+                "start_time": "12:00",
+                "end_time": "13:00",
+                "start_ts": start_ms,
+                "end_ts": end_ms,
+                "session_rating": 4,
+                "perceived_wind_variability": "very_gusty",
+                "rider_review": "Objective review",
+                "rider_weight": 80,
+                "wing_size": 5,
+                "foil_size": 1200,
+                "rider_notes": "Notes",
+                "visibility": "public",
+                "measured_wind": measured,
+            },
+        )
+        detail_row = db_store.get_surf_experience(conn, self.user_id, experience_id)
+        overview_row = next(row for row in db_store.list_surf_experiences(conn, self.user_id) if row["id"] == experience_id)
+        conn.close()
+
+        expected = sum([1.05, 125.0 / 144.0, 135.0 / 196.0]) / 3.0
+        self.assertAlmostEqual(detail_row["measured_wind"]["summary"]["wind_variability"], expected)
+        self.assertEqual(detail_row["measured_wind"]["summary"]["wind_variability_kind"], db_store.POWER_WIND_VARIABILITY_KIND)
+        self.assertAlmostEqual(overview_row["wind_variability"], expected)
+        self.assertEqual(overview_row["perceived_wind_variability"], "very_gusty")
+
+        with portal.app.test_request_context(f"/experiences/{experience_id}"):
+            portal.session["user_id"] = self.user_id
+            detail = portal.render_template(
+                "submission_detail.html",
+                row=detail_row,
+                wind_plot={"available": False},
+                wind_variability_plot={"available": False},
+                current_day_archive_plot=None,
+            ).encode()
+        self.assertIn(f"{expected:.2f}".encode(), detail)
+        self.assertNotIn(f"{expected:.2f} kts".encode(), detail)
+        self.assertIn(b"Very gusty", detail)
+
+    def test_session_plots_use_europe_amsterdam_summer_time_labels(self) -> None:
+        start_ms, end_ms = portal._local_session_bounds("2026-06-09", "12:30", "15:00")
+        self.assertEqual(datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%H:%M"), "10:30")
+        self.assertEqual(datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%H:%M"), "13:00")
+
+        records = [
+            {
+                "timestamp": start_ms + index * 30 * 60 * 1000,
+                "measured_wind_speed": 12.0 + index,
+                "measured_wind_min": 9.0 + index,
+                "measured_wind_max": 15.0 + index,
+                "measured_wind_direction": 225.0,
+            }
+            for index in range(6)
+        ]
+        row = {
+            "date": "2026-06-09",
+            "start_time": "12:30",
+            "end_time": "15:00",
+            "measured_wind": {"records": records, "plot_records": records},
+        }
+
+        measured_plot = portal._measured_wind_plot(row)
+        variability_plot = portal._measured_wind_variability_plot(row)
+
+        self.assertEqual(measured_plot["hour_ticks"], variability_plot["hour_ticks"])
+        self.assertEqual([tick["label"] for tick in measured_plot["hour_ticks"]], ["12:30", "13:00", "13:30", "14:00", "14:30", "15:00"])
+        self.assertEqual(float(measured_plot["hour_ticks"][0]["x"]), measured_plot["pad_left"])
+        self.assertEqual(float(variability_plot["hour_ticks"][0]["x"]), variability_plot["pad_left"])
+
+    def test_measured_wind_variability_plot_uses_power_based_rolling_window(self) -> None:
+        start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
+        records = [
+            {
+                "timestamp": start_ms + index * 3 * 60 * 1000,
+                "measured_wind_speed": speed,
+                "measured_wind_min": speed - 2.0,
+                "measured_wind_max": speed + 3.0,
+            }
+            for index, speed in enumerate([8.0, 16.0, 8.0, 16.0, 12.0])
+        ]
+        measured = {
+            "records": records,
+            "plot_records": records[::2],
+            "summary": {},
+        }
+
+        plot = portal._measured_wind_variability_plot(
+            {
+                "date": "2026-01-15",
+                "start_time": "12:00",
+                "end_time": "13:00",
+                "measured_wind": measured,
+            }
+        )
+
+        self.assertTrue(plot["available"])
+        self.assertEqual(plot["min_value"], 0.5)
+        self.assertEqual(plot["max_value"], 2.0)
+        self.assertEqual(plot["window_minutes"], 30)
+        self.assertEqual(plot["min_periods"], 3)
+        self.assertEqual(len(plot["raw_points"].split()), 5)
+        self.assertEqual(len(plot["trend_points"].split()), 3)
+        self.assertEqual(plot["latest_label"], "Variability: 0.96")
+
+    def test_variability_plot_textbox_uses_session_mean_not_latest_trend(self) -> None:
+        start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
+        records = [
+            {
+                "timestamp": start_ms,
+                "measured_wind_speed": 10.0,
+                "measured_wind_min": 1.0,
+                "measured_wind_max": 20.0,
+            }
+        ]
+        records.extend(
+            {
+                "timestamp": start_ms + index * 3 * 60 * 1000,
+                "measured_wind_speed": 10.0,
+                "measured_wind_min": 9.0,
+                "measured_wind_max": 11.0,
+            }
+            for index in range(1, 12)
+        )
+        measured = {"records": records, "plot_records": records, "summary": {}}
+        row = {
+            "date": "2026-01-15",
+            "start_time": "12:00",
+            "end_time": "13:00",
+            "measured_wind": measured,
+        }
+
+        session_mean = db_store.measured_wind_power_variability_mean(measured)
+        latest_trend = 0.4
+        plot = portal._measured_wind_variability_plot(row)
+
+        self.assertAlmostEqual(session_mean, 0.6991666666666667)
+        self.assertNotEqual(f"Variability: {session_mean:.2f}", f"Variability: {latest_trend:.2f}")
+        self.assertEqual(plot["latest_label"], f"Variability: {session_mean:.2f}")
+        self.assertNotEqual(plot["latest_label"], f"Variability: {latest_trend:.2f}")
+
+        measured["summary"] = {"max_wind_gust": 20.0, "wind_variability": session_mean}
+        detail_row = {
+            "date": "2026-01-15",
+            "spot": "Valkenburgse meer",
+            "start_time": "12:00",
+            "end_time": "13:00",
+            "avg_forecast_temperature": 10.0,
+            "session_rating": 4,
+            "perceived_wind_variability": "moderate",
+            "rider": "Test Rider",
+            "rider_weight": 80,
+            "wing_size": 5,
+            "foil_size": 1200,
+            "rider_review": "Good",
+            "rider_notes": "",
+            "measured_wind_status": "ok",
+            "measured_wind": measured,
+            "avg_measured_wind_speed": 10.0,
+            "max_measured_wind_speed": 10.0,
+            "min_measured_wind_speed": 10.0,
+            "mean_measured_direction_display": "SW (225 deg)",
+            "visibility": "private",
+            "is_owner": True,
+            "submitted_by": "Test Public Rider",
+            "rider_display": "Test Rider",
+        }
+        with portal.app.test_request_context("/experiences/1"):
+            portal.session["user_id"] = 1
+            detail = portal.render_template(
+                "submission_detail.html",
+                row=detail_row,
+                wind_plot={"available": False},
+                wind_variability_plot=plot,
+                current_day_archive_plot=None,
+            ).encode()
+        formatted_mean = f"{session_mean:.2f}".encode()
+        self.assertGreaterEqual(detail.count(formatted_mean), 2)
+        self.assertIn(f"Variability: {session_mean:.2f}".encode(), detail)
+        self.assertNotIn(f"Variability: {latest_trend:.2f}".encode(), detail)
 
     def test_measured_report_keeps_six_minute_source_cadence_when_that_is_all_available(self) -> None:
         start_ms, end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
@@ -641,6 +851,7 @@ class RiderPortalTest(unittest.TestCase):
             "end_time": "13:00",
             "avg_forecast_temperature": 10.0,
             "session_rating": 4,
+            "perceived_wind_variability": "gusty",
             "rider": "Test Rider",
             "rider_weight": 80,
             "wing_size": 5,
@@ -664,13 +875,16 @@ class RiderPortalTest(unittest.TestCase):
                 "submission_detail.html",
                 row=row,
                 wind_plot={"available": False},
+                wind_variability_plot={"available": False},
                 current_day_archive_plot=None,
             ).encode()
 
-        for label in (b"avg speed", b"max avg speed", b"min avg speed", b"max gust", b"wind variability", b"avg direction"):
+        for label in (b"avg speed", b"max avg speed", b"min avg speed", b"max gust", b"Wind variability", b"avg direction"):
             self.assertIn(label, detail)
-        for value in (b"14.4 kts", b"20.0 kts", b"9.0 kts", b"30.0 kts", b"1.8 kts", b"SW (208 deg)"):
+        for value in (b"14.4 kts", b"20.0 kts", b"9.0 kts", b"30.0 kts", b"1.80", b"SW (208 deg)", b"Gusty"):
             self.assertIn(value, detail)
+        self.assertIn(b'aria-label="4 out of 5"', detail)
+        self.assertNotIn(b"<dt>SessionRating</dt><dd>4/5</dd>", detail)
         self.assertIn(b"Make this submission public to share it.", detail)
         self.assertNotIn(b'class="share-icon-button"', detail)
         self.assertNotIn(b'class="primary share-button"', detail)
@@ -678,6 +892,64 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b'class="form-actions"', detail)
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
         self.assertEqual(detail.count(b'href="/experience/new"'), 1)
+
+    def test_submission_detail_places_wind_variability_before_archive_plot(self) -> None:
+        row = {
+            "date": "2026-01-15",
+            "spot": "Valkenburgse meer",
+            "start_time": "12:00",
+            "end_time": "13:00",
+            "avg_forecast_temperature": 10.0,
+            "session_rating": 4,
+            "perceived_wind_variability": "gusty",
+            "rider": "Test Rider",
+            "rider_weight": 80,
+            "wing_size": 5,
+            "foil_size": 1200,
+            "rider_review": "Good",
+            "rider_notes": "",
+            "measured_wind_status": "ok",
+            "measured_wind": {"summary": {"max_wind_gust": 30.0, "wind_variability": 1.8}},
+            "avg_measured_wind_speed": 14.4,
+            "max_measured_wind_speed": 20.0,
+            "min_measured_wind_speed": 9.0,
+            "mean_measured_direction_display": "SW (208 deg)",
+            "visibility": "private",
+            "is_owner": True,
+            "submitted_by": "Test Public Rider",
+            "rider_display": "Test Rider",
+        }
+        with portal.app.test_request_context("/experiences/1"):
+            portal.session["user_id"] = 1
+            detail = portal.render_template(
+                "submission_detail.html",
+                row=row,
+                wind_plot={"available": False},
+                wind_variability_plot={
+                    "available": True,
+                    "width": 820,
+                    "height": 178,
+                    "pad_left": 48,
+                    "pad_top": 18,
+                    "plot_right": 798,
+                    "axis_y": 132,
+                    "plot_width": 750,
+                    "plot_height": 114,
+                    "raw_points": "48.0,80.0 85.5,70.0",
+                    "trend_points": "85.5,70.0",
+                    "hour_ticks": [{"x": "48.0", "label": "12:00"}],
+                    "y_ticks": [{"y": "132.0", "label_y": "136.0", "label": "0.5"}],
+                    "threshold_y": "78.8",
+                    "threshold_label_y": "73.8",
+                    "latest_label": "Variability: 1.45",
+                },
+                current_day_archive_plot={"url": "/current-day-plot-archive/example_current_day_predictions.png"},
+            ).encode()
+
+        self.assertLess(detail.index(b"<h2>Measured wind</h2>"), detail.index(b"<h2>Wind variability</h2>"))
+        self.assertLess(detail.index(b"<h2>Wind variability</h2>"), detail.index(b"<h2>Measured wind full day from archive</h2>"))
+        self.assertIn(b"Variability: 1.45", detail)
+        self.assertIn(b"30-min avg", detail)
 
     def test_visibility_defaults_and_form_validation(self) -> None:
         default_private_id = self._create_submission(self.user_id, "Default Private", "2026-01-10")
@@ -689,7 +961,9 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(db_store.get_surf_experience(conn, self.user_id, invalid_private_id)["visibility"], "private")
         self.assertEqual(db_store.get_surf_experience(conn, self.user_id, public_id)["visibility"], "public")
         visibility_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "visibility")
+        perceived_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "perceived_wind_variability")
         self.assertEqual(visibility_column[4], "'private'")
+        self.assertEqual(perceived_column[2], "TEXT")
         conn.close()
 
         missing_visibility, missing_errors = portal._validate_experience_form(self._valid_form())
@@ -697,7 +971,17 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(missing_errors, [])
         public_form, public_errors = portal._validate_experience_form(self._valid_form("public"))
         self.assertEqual(public_form["visibility"], "public")
+        self.assertEqual(public_form["perceived_wind_variability"], "moderate")
         self.assertEqual(public_errors, [])
+        gusty_form = self._valid_form()
+        gusty_form["PerceivedWindVariability"] = "gusty"
+        gusty_experience, gusty_errors = portal._validate_experience_form(gusty_form)
+        self.assertEqual(gusty_errors, [])
+        self.assertEqual(gusty_experience["perceived_wind_variability"], "gusty")
+        invalid_perceived_form = self._valid_form()
+        invalid_perceived_form["PerceivedWindVariability"] = "wild"
+        _, invalid_perceived_errors = portal._validate_experience_form(invalid_perceived_form)
+        self.assertIn("PerceivedWindVariability must be one of the allowed options.", invalid_perceived_errors)
         half_hour_form = self._valid_form()
         half_hour_form["StartTime"] = "15:30"
         half_hour_form["EndTime"] = "17:30"
@@ -776,6 +1060,7 @@ class RiderPortalTest(unittest.TestCase):
         visibility_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "visibility")
         share_token_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "share_token")
         shared_at_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "shared_at")
+        perceived_column = next(row for row in conn.execute("PRAGMA table_info(surf_experiences)") if row[1] == "perceived_wind_variability")
         public_username_column = next(row for row in conn.execute("PRAGMA table_info(user_profiles)") if row[1] == "public_username")
         self.assertEqual(visibility_column[3], 1)
         self.assertEqual(visibility_column[4], "'private'")
@@ -783,6 +1068,8 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(public_username_column[2], "TEXT")
         self.assertEqual(share_token_column[2], "TEXT")
         self.assertEqual(shared_at_column[2], "TEXT")
+        self.assertEqual(perceived_column[2], "TEXT")
+        self.assertIsNone(conn.execute("SELECT perceived_wind_variability FROM surf_experiences WHERE id = 1").fetchone()[0])
         self.assertIsNone(conn.execute("SELECT share_token FROM surf_experiences WHERE id = 1").fetchone()[0])
         self.assertEqual(conn.execute("SELECT username FROM users WHERE id = 7").fetchone()[0], "legacy-login")
         self.assertEqual(conn.execute("SELECT rider_name, public_username FROM user_profiles WHERE user_id = 7").fetchone(), ("Existing private name", None))
@@ -807,12 +1094,25 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"addEventListener(\"change\", () => syncEndOptions(true))", new_page.data)
         self.assertIn(b"Private RiderNotes", new_page.data)
         self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
+        self.assertIn(b'<div class="form-date-row">', new_page.data)
+        self.assertIn(b'<div class="form-time-start">', new_page.data)
+        self.assertIn(b'<div class="form-time-end">', new_page.data)
+        self.assertIn(b'<div class="form-rating-row">', new_page.data)
+        self.assertIn(b'<div class="form-perceived-row">', new_page.data)
+        self.assertIn(b'<select id="PerceivedWindVariability" name="PerceivedWindVariability" required>', new_page.data)
+        self.assertIn(b'<label for="PerceivedWindVariability">Perceived wind variability *</label>', new_page.data)
+        self.assertNotIn(b'<label for="PerceivedWindVariability">Perceived variability *</label>', new_page.data)
+        self.assertIn(b'<option value="gusty"', new_page.data)
+        self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartTime"'))
+        self.assertLess(new_page.data.index(b'id="StartTime"'), new_page.data.index(b'id="EndTime"'))
+        self.assertLess(new_page.data.index(b'name="SessionRating"'), new_page.data.index(b'id="PerceivedWindVariability"'))
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
         private_form = self._valid_form()
         private_form["StartTime"] = "12:30"
         private_form["EndTime"] = "14:00"
+        private_form["PerceivedWindVariability"] = "gusty"
         private_form["_csrf_token"] = csrf_token
         private_response = self.client.post("/experience/new", data=private_form)
         self.assertEqual(private_response.status_code, 302)
@@ -836,11 +1136,37 @@ class RiderPortalTest(unittest.TestCase):
             "SELECT rider_notes FROM surf_experiences WHERE date = ?",
             ("2026-01-20",),
         ).fetchone()
+        private_perceived_row = conn.execute(
+            "SELECT perceived_wind_variability FROM surf_experiences WHERE date = ?",
+            ("2026-01-20",),
+        ).fetchone()
         conn.close()
         self.assertEqual(visibility_by_date["2026-01-20"], "private")
         self.assertEqual(visibility_by_date["2026-01-21"], "public")
         self.assertEqual(private_time_row, ("12:30", "14:00", 90 * 60 * 1000))
         self.assertEqual(private_notes_row, ("Form notes",))
+        self.assertEqual(private_perceived_row, ("gusty",))
+
+    def test_perceived_variability_sort_uses_ordinal_order(self) -> None:
+        self._set_profile(self.user_id, "Ordinal Rider", "Ordinal Private")
+        submissions = [
+            ("Very Gusty Rider", "2026-03-01", "very_gusty"),
+            ("Moderate Rider", "2026-03-02", "moderate"),
+            ("Very Steady Rider", "2026-03-03", "very_steady"),
+            ("Gusty Rider", "2026-03-04", "gusty"),
+            ("Steady Rider", "2026-03-05", "steady"),
+        ]
+        ids = {
+            value: self._create_submission(self.user_id, rider, day, "public", perceived_wind_variability=value)
+            for rider, day, value in submissions
+        }
+
+        self._set_user(self.user_id)
+        response = self.client.get("/experiences?scope=all&sort=perceived_wind_variability&dir=asc")
+        self.assertEqual(response.status_code, 200)
+        ordered_ids = [ids[value] for value in ["very_steady", "steady", "moderate", "gusty", "very_gusty"]]
+        positions = [response.data.index(f'href="/experiences/{experience_id}"'.encode()) for experience_id in ordered_ids]
+        self.assertEqual(positions, sorted(positions))
 
     def test_submission_scopes_and_detail_access_control(self) -> None:
         self._set_profile(self.user_id, "Zulu Rider", "Owner Private Name")
@@ -852,6 +1178,7 @@ class RiderPortalTest(unittest.TestCase):
             "2026-02-02",
             "public",
             {"wind_variability": 1.8, "point_count": 3},
+            perceived_wind_variability="gusty",
         )
         other_private = self._create_submission(self.other_user_id, "Other Private", "2026-02-03", "private")
         other_public = self._create_submission(
@@ -860,6 +1187,7 @@ class RiderPortalTest(unittest.TestCase):
             "2026-02-04",
             "public",
             {"wind_variability": 2.4, "point_count": 3},
+            perceived_wind_variability="steady",
         )
 
         self._set_user(self.user_id)
@@ -905,6 +1233,18 @@ class RiderPortalTest(unittest.TestCase):
         all_by_variability = self.client.get("/experiences?scope=all&sort=wind_variability&dir=asc")
         self.assertEqual(all_by_variability.status_code, 200)
         self.assertIn(b"sort=wind_variability", all_by_variability.data)
+        self.assertIn(b"Measured variability", all_submissions.data)
+        self.assertNotIn(b">Variability</a>", all_submissions.data)
+        self.assertLess(all_submissions.data.index(b"Perceived variability"), all_submissions.data.index(b"Measured variability"))
+        self.assertIn(b"Steady", all_submissions.data)
+        self.assertIn(b"Gusty", all_submissions.data)
+        all_by_perceived = self.client.get("/experiences?scope=all&sort=perceived_wind_variability&dir=asc")
+        self.assertEqual(all_by_perceived.status_code, 200)
+        self.assertIn(b"sort=perceived_wind_variability", all_by_perceived.data)
+        self.assertLess(
+            all_by_perceived.data.index(f'href="/experiences/{other_public}"'.encode()),
+            all_by_perceived.data.index(f'href="/experiences/{own_public}"'.encode()),
+        )
 
         conn = db_store.connect_db(self.temp_dir.name)
         other_public_row = next(
@@ -915,6 +1255,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIsNone(other_public_row["rider"])
         self.assertEqual(other_public_row["submitted_by"], "Alpha Rider")
         self.assertEqual(other_public_row["rider_notes"], "")
+        self.assertEqual(other_public_row["perceived_wind_variability"], "steady")
         self.assertIsNotNone(other_public_detail_row)
         self.assertIsNone(other_public_detail_row["rider"])
         self.assertEqual(other_public_detail_row["submitted_by"], "Alpha Rider")
@@ -943,6 +1284,7 @@ class RiderPortalTest(unittest.TestCase):
         other_public_detail = self.client.get(f"/experiences/{other_public}")
         self.assertEqual(other_public_detail.status_code, 200)
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", other_public_detail.data)
+        self.assertIn(b"<dt>Perceived variability</dt><dd>Steady</dd>", other_public_detail.data)
         self.assertNotIn(b'class="share-icon-button"', other_public_detail.data)
         self.assertNotIn(f'action="/experiences/{other_public}/share"'.encode(), other_public_detail.data)
         self.assertNotIn(b"other-rider", other_public_detail.data)
@@ -970,6 +1312,9 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"<dt>Submitted by</dt><dd>Alpha Rider</dd>", public_share.data)
         self.assertIn(b"<dt>Spot</dt><dd>Valkenburgse meer</dd>", public_share.data)
         self.assertIn(b"<dt>RiderReview</dt><dd>Review by Other Public</dd>", public_share.data)
+        self.assertIn(b"<dt>Perceived variability</dt><dd>Steady</dd>", public_share.data)
+        self.assertIn(b'aria-label="4 out of 5"', public_share.data)
+        self.assertNotIn(b"<dt>SessionRating</dt><dd>4/5</dd>", public_share.data)
         self.assertIn(b"Measured wind", public_share.data)
         self.assertNotIn(b"other-rider", public_share.data)
         self.assertNotIn(b"<dt>Rider</dt>", public_share.data)

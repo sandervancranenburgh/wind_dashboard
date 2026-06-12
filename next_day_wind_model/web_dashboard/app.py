@@ -52,6 +52,15 @@ SPOT_OPTIONS = [
 WING_SIZE_OPTIONS = [2, 3, 4, 5, 6, 7, 8]
 FOIL_SIZE_OPTIONS = list(range(700, 2501, 100))
 SESSION_TIME_OPTIONS = [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
+PERCEIVED_WIND_VARIABILITY_OPTIONS = [
+    ("very_steady", "Very steady"),
+    ("steady", "Steady"),
+    ("moderate", "Moderate"),
+    ("gusty", "Gusty"),
+    ("very_gusty", "Very gusty"),
+]
+PERCEIVED_WIND_VARIABILITY_LABELS = dict(PERCEIVED_WIND_VARIABILITY_OPTIONS)
+PERCEIVED_WIND_VARIABILITY_VALUES = set(PERCEIVED_WIND_VARIABILITY_LABELS)
 SORT_OPTIONS = {
     "date",
     "visibility",
@@ -66,6 +75,7 @@ SORT_OPTIONS = {
     "max_measured_wind_speed",
     "min_measured_wind_speed",
     "max_measured_wind_gust",
+    "perceived_wind_variability",
     "wind_variability",
     "mean_measured_direction",
     "avg_forecast_temperature",
@@ -186,6 +196,7 @@ def inject_globals():
         "csrf_token": _csrf_token,
         "companion_app_base_url": COMPANION_APP_BASE_URL,
         "forecast_dashboard_base_url": FORECAST_DASHBOARD_BASE_URL,
+        "perceived_wind_variability_labels": PERCEIVED_WIND_VARIABILITY_LABELS,
     }
 
 
@@ -287,6 +298,7 @@ def _experience_form_defaults() -> dict[str, Any]:
         "StartTime": start_time,
         "EndTime": "14:00",
         "SessionRating": "3",
+        "PerceivedWindVariability": "moderate",
         "RiderReview": "",
         "RiderWeight": "" if profile.get("rider_weight") is None else str(profile.get("rider_weight")),
         "WingSize": "5",
@@ -308,6 +320,7 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
     wing_size = _parse_int(form.get("WingSize"), "WingSize", errors)
     foil_size = _parse_int(form.get("FoilSize"), "FoilSize", errors)
     visibility = (form.get("Visibility") or "private").strip().lower()
+    perceived_wind_variability = (form.get("PerceivedWindVariability") or "").strip().lower()
 
     if not rider:
         errors.append("Rider is required.")
@@ -333,6 +346,8 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
         errors.append("FoilSize must be one of the allowed options.")
     if visibility not in {"private", "public"}:
         errors.append("Visibility must be private or public.")
+    if perceived_wind_variability not in PERCEIVED_WIND_VARIABILITY_VALUES:
+        errors.append("PerceivedWindVariability must be one of the allowed options.")
 
     start_ts, end_ts = _local_session_bounds(day, start_time, end_time)
     if start_ts is None or end_ts is None:
@@ -348,6 +363,7 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
             "start_ts": start_ts,
             "end_ts": end_ts,
             "session_rating": rating,
+            "perceived_wind_variability": perceived_wind_variability,
             "rider_review": form.get("RiderReview", "").strip(),
             "rider_weight": rider_weight,
             "wing_size": wing_size,
@@ -367,6 +383,7 @@ def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "StartTime": row.get("start_time") or "12:00",
         "EndTime": row.get("end_time") or "14:00",
         "SessionRating": "" if row.get("session_rating") is None else str(row.get("session_rating")),
+        "PerceivedWindVariability": row.get("perceived_wind_variability") or "",
         "RiderReview": row.get("rider_review") or "",
         "RiderWeight": "" if row.get("rider_weight") is None else str(row.get("rider_weight")),
         "WingSize": "" if row.get("wing_size") is None else str(row.get("wing_size")),
@@ -413,6 +430,169 @@ def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, 
     return {
         "filename": path.name,
         "url": url_for("current_day_archive_asset", filename=path.name),
+    }
+
+
+def _measured_wind_variability_plot(row: dict[str, Any]) -> dict[str, Any]:
+    measured = row.get("measured_wind") or {}
+    records = measured.get("records") or measured.get("plot_records") or []
+    session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])
+    if session_start_ms is None or session_end_ms is None or session_end_ms <= session_start_ms:
+        session_start_ms = None
+        session_end_ms = None
+
+    points = []
+    for record in records:
+        speed = record.get("measured_wind_speed")
+        minimum = record.get("measured_wind_min")
+        maximum = record.get("measured_wind_max")
+        timestamp = record.get("timestamp")
+        try:
+            ts_value = int(timestamp)
+        except (TypeError, ValueError):
+            continue
+        if session_start_ms is not None and not session_start_ms <= ts_value <= session_end_ms:
+            continue
+        try:
+            speed_value = None if speed is None else float(speed)
+            min_value = None if minimum is None else float(minimum)
+            max_value = None if maximum is None else float(maximum)
+        except (TypeError, ValueError):
+            speed_value = None
+            min_value = None
+            max_value = None
+        points.append(
+            {
+                "timestamp": ts_value,
+                "speed": speed_value,
+                "minimum": min_value,
+                "maximum": max_value,
+            }
+        )
+
+    points.sort(key=lambda point: point["timestamp"])
+    if len(points) < 3:
+        return {"available": False}
+
+    window_ms = 30 * 60 * 1000
+    min_periods = 3
+    min_mean_speed = 0.1
+    raw_values: list[dict[str, float | int | None]] = []
+    for point in points:
+        if point["speed"] is None or point["minimum"] is None or point["maximum"] is None:
+            raw_values.append({"timestamp": point["timestamp"], "value": None})
+            continue
+        mean_speed = float(point["speed"])
+        min_speed = float(point["minimum"])
+        max_speed = float(point["maximum"])
+        if abs(mean_speed) <= min_mean_speed:
+            raw_values.append({"timestamp": point["timestamp"], "value": None})
+            continue
+        variability = ((max_speed * max_speed) - (min_speed * min_speed)) / (mean_speed * mean_speed)
+        raw_values.append({"timestamp": point["timestamp"], "value": variability})
+
+    trend_values: list[dict[str, float | int | None]] = []
+    trend_left = 0
+    for right, point in enumerate(raw_values):
+        while raw_values[trend_left]["timestamp"] < point["timestamp"] - window_ms:
+            trend_left += 1
+        window_values = [
+            float(candidate["value"])
+            for candidate in raw_values[trend_left : right + 1]
+            if candidate["value"] is not None
+        ]
+        trend_values.append(
+            {
+                "timestamp": point["timestamp"],
+                "value": (sum(window_values) / len(window_values)) if len(window_values) >= min_periods else None,
+            }
+        )
+
+    if not any(point["value"] is not None for point in raw_values):
+        return {"available": False}
+
+    min_ts = session_start_ms if session_start_ms is not None else min(point["timestamp"] for point in points)
+    max_ts = session_end_ms if session_end_ms is not None else max(point["timestamp"] for point in points)
+    if max_ts <= min_ts:
+        max_ts = min_ts + 3_600_000
+
+    width = 820
+    height = 178
+    pad_left = 48
+    pad_right = 22
+    pad_top = 18
+    axis_y = 132
+    plot_width = width - pad_left - pad_right
+    plot_height = axis_y - pad_top
+    min_value = 0.5
+    max_value = 2.0
+    threshold = 1.2
+
+    def to_x(timestamp_ms: int | float) -> float:
+        return pad_left + ((float(timestamp_ms) - min_ts) / (max_ts - min_ts)) * plot_width
+
+    def to_y(value: float) -> float:
+        return pad_top + (1.0 - ((value - min_value) / (max_value - min_value))) * plot_height
+
+    def polyline(series: list[dict[str, float | int | None]]) -> str:
+        coords = []
+        for point in series:
+            value = point["value"]
+            if value is None:
+                continue
+            coords.append(f"{to_x(float(point['timestamp'])):.1f},{to_y(float(value)):.1f}")
+        return " ".join(coords)
+
+    start_local = datetime.fromtimestamp(min_ts / 1000, tz=LOCAL_TZ)
+    end_local = datetime.fromtimestamp(max_ts / 1000, tz=LOCAL_TZ)
+    tick_dt = start_local.replace(second=0, microsecond=0)
+    minute_remainder = tick_dt.minute % 30
+    if minute_remainder:
+        tick_dt += timedelta(minutes=30 - minute_remainder)
+    if tick_dt < start_local:
+        tick_dt += timedelta(minutes=30)
+    hour_ticks = []
+    while tick_dt <= end_local:
+        tick_ts = int(tick_dt.astimezone(timezone.utc).timestamp() * 1000)
+        hour_ticks.append({"x": f"{to_x(tick_ts):.1f}", "label": tick_dt.strftime("%H:%M")})
+        tick_dt += timedelta(minutes=30)
+    if not hour_ticks:
+        hour_ticks = [
+            {"x": f"{to_x(min_ts):.1f}", "label": start_local.strftime("%H:%M")},
+            {"x": f"{to_x(max_ts):.1f}", "label": end_local.strftime("%H:%M")},
+        ]
+
+    y_ticks = [
+        {"y": f"{to_y(value):.1f}", "label_y": f"{to_y(value) + 4.0:.1f}", "label": f"{value:.1f}"}
+        for value in (0.5, 1.0, 1.5, 2.0)
+    ]
+    threshold_y = to_y(threshold)
+    session_variability = db_store.measured_wind_power_variability_mean(measured)
+    if session_variability is None:
+        raw_numeric_values = [float(point["value"]) for point in raw_values if point["value"] is not None]
+        session_variability = None if not raw_numeric_values else sum(raw_numeric_values) / len(raw_numeric_values)
+
+    return {
+        "available": True,
+        "width": width,
+        "height": height,
+        "pad_left": pad_left,
+        "pad_top": pad_top,
+        "plot_right": pad_left + plot_width,
+        "axis_y": axis_y,
+        "plot_width": plot_width,
+        "plot_height": plot_height,
+        "raw_points": polyline(raw_values),
+        "trend_points": polyline(trend_values),
+        "hour_ticks": hour_ticks,
+        "y_ticks": y_ticks,
+        "threshold_y": f"{threshold_y:.1f}",
+        "threshold_label_y": f"{threshold_y - 5.0:.1f}",
+        "latest_label": None if session_variability is None else f"Variability: {session_variability:.2f}",
+        "min_value": min_value,
+        "max_value": max_value,
+        "window_minutes": 30,
+        "min_periods": min_periods,
     }
 
 
@@ -797,6 +977,7 @@ def new_experience():
         hour_options=SESSION_TIME_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
+        perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
     )
 
 
@@ -832,6 +1013,7 @@ def edit_experience(experience_id: int):
         hour_options=SESSION_TIME_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
+        perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
     )
 
 
@@ -923,6 +1105,7 @@ def experience_detail(experience_id: int):
         "submission_detail.html",
         row=row,
         wind_plot=_measured_wind_plot(row, predictions),
+        wind_variability_plot=_measured_wind_variability_plot(row),
         current_day_archive_plot=_current_day_archive_plot_for_submission(row["date"]),
     )
 
@@ -943,6 +1126,7 @@ def public_experience_share(share_token: str):
         "submission_public.html",
         row=row,
         wind_plot=_measured_wind_plot(row, predictions),
+        wind_variability_plot=_measured_wind_variability_plot(row),
     )
 
 

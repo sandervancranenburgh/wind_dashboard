@@ -28,6 +28,7 @@ SPOT_TO_SITE = {
 }
 SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
     "visibility": "TEXT NOT NULL DEFAULT 'private'",
+    "perceived_wind_variability": "TEXT",
     "min_measured_wind_speed": "REAL",
     "mean_measured_direction": "REAL",
     "mean_measured_direction_label": "TEXT",
@@ -2006,6 +2007,46 @@ def _extract_observation_measurement(
     return _as_float(value)
 
 
+POWER_WIND_VARIABILITY_KIND = "mean_pointwise_power_force_range"
+
+
+def _measured_wind_records_for_variability(measured: Any) -> list[dict[str, Any]]:
+    if isinstance(measured, dict):
+        records = measured.get("records") or measured.get("plot_records") or []
+    elif isinstance(measured, list):
+        records = measured
+    else:
+        records = []
+    return [record for record in records if isinstance(record, dict)]
+
+
+def measured_wind_power_variability_values(measured: Any) -> list[float]:
+    values: list[float] = []
+    for record in _measured_wind_records_for_variability(measured):
+        mean_speed = _as_float(record.get("measured_wind_speed"))
+        min_speed = _as_float(record.get("measured_wind_min"))
+        max_speed = _as_float(record.get("measured_wind_max"))
+        if mean_speed is None or min_speed is None or max_speed is None or abs(mean_speed) <= 0.1:
+            continue
+        values.append(((max_speed * max_speed) - (min_speed * min_speed)) / (mean_speed * mean_speed))
+    return values
+
+
+def measured_wind_power_variability_mean(measured: Any) -> Optional[float]:
+    values = measured_wind_power_variability_values(measured)
+    return None if not values else sum(values) / len(values)
+
+
+def _normalise_measured_wind_summary(measured: dict[str, Any]) -> dict[str, Any]:
+    summary = measured.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        measured["summary"] = summary
+    summary["wind_variability"] = measured_wind_power_variability_mean(measured)
+    summary["wind_variability_kind"] = POWER_WIND_VARIABILITY_KIND
+    return measured
+
+
 def _wind_direction_label(direction_deg: Optional[float]) -> Optional[str]:
     if direction_deg is None:
         return None
@@ -2286,19 +2327,7 @@ def get_measured_wind_for_session(
         cos_sum = sum(math.cos(math.radians(value)) for value in directions)
         avg_dir = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
 
-    rolling_standard_deviations = []
-    for index, record in enumerate(records):
-        window_start = int(record["timestamp"]) - 15 * 60 * 1000
-        window_speeds = [
-            float(candidate["measured_wind_speed"])
-            for candidate in records[: index + 1]
-            if int(candidate["timestamp"]) >= window_start and candidate["measured_wind_speed"] is not None
-        ]
-        if len(window_speeds) < 3:
-            continue
-        window_mean = sum(window_speeds) / len(window_speeds)
-        variance = sum((value - window_mean) ** 2 for value in window_speeds) / (len(window_speeds) - 1)
-        rolling_standard_deviations.append(math.sqrt(variance))
+    power_variability_mean = measured_wind_power_variability_mean(records)
 
     summary = {
         "point_count": len(records),
@@ -2307,12 +2336,8 @@ def get_measured_wind_for_session(
         "max_wind_speed_kind": "average_wind",
         "max_wind_gust": None if not gusts else max(gusts),
         "min_wind_speed": None if not speeds else min(speeds),
-        "wind_variability": (
-            None
-            if not rolling_standard_deviations
-            else sum(rolling_standard_deviations) / len(rolling_standard_deviations)
-        ),
-        "wind_variability_kind": "mean_15min_rolling_sample_standard_deviation",
+        "wind_variability": power_variability_mean,
+        "wind_variability_kind": POWER_WIND_VARIABILITY_KIND,
         "mean_wind_dir": avg_dir,
         "mean_wind_dir_label": _wind_direction_label(avg_dir),
     }
@@ -2331,6 +2356,8 @@ def get_measured_wind_for_session(
 def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any]) -> int:
     now = _now_ms()
     measured = experience["measured_wind"]
+    if isinstance(measured, dict):
+        measured = _normalise_measured_wind_summary(measured)
     summary = measured.get("summary") or {}
     forecast_temperature = get_forecast_temperature_for_session(
         conn,
@@ -2348,9 +2375,10 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             measured_wind_point_count, avg_measured_wind_speed, max_measured_wind_speed,
             min_measured_wind_speed, avg_measured_wind_dir, mean_measured_direction,
             mean_measured_direction_label, avg_forecast_temperature,
-            min_forecast_temperature, max_forecast_temperature, visibility
+            min_forecast_temperature, max_forecast_temperature, visibility,
+            perceived_wind_variability
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(experience["user_id"]),
@@ -2382,6 +2410,7 @@ def create_surf_experience(conn: sqlite3.Connection, experience: Dict[str, Any])
             temperature_summary.get("min_temperature"),
             temperature_summary.get("max_temperature"),
             _submission_visibility(experience.get("visibility")),
+            experience.get("perceived_wind_variability") or None,
         ),
     )
     conn.commit()
@@ -2410,7 +2439,8 @@ def update_surf_experience(
             wing_size = ?,
             foil_size = ?,
             rider_notes = ?,
-            visibility = ?
+            visibility = ?,
+            perceived_wind_variability = ?
         WHERE id = ?
           AND user_id = ?
         """,
@@ -2429,6 +2459,7 @@ def update_surf_experience(
             int(experience["foil_size"]),
             experience.get("rider_notes") or None,
             _submission_visibility(experience.get("visibility")),
+            experience.get("perceived_wind_variability") or None,
             int(experience_id),
             int(user_id),
         ),
@@ -2593,7 +2624,8 @@ def list_surf_experiences(
         "max_measured_wind_speed": "e.max_measured_wind_speed",
         "min_measured_wind_speed": "e.min_measured_wind_speed",
         "max_measured_wind_gust": "CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL)",
-        "wind_variability": "CAST(json_extract(e.measured_wind_data_json, '$.summary.wind_variability') AS REAL)",
+        "wind_variability": "e.date",
+        "perceived_wind_variability": "e.date",
         "mean_measured_direction": "e.mean_measured_direction",
         "avg_forecast_temperature": "e.avg_forecast_temperature",
     }
@@ -2611,7 +2643,8 @@ def list_surf_experiences(
                CAST(json_extract(e.measured_wind_data_json, '$.summary.max_wind_gust') AS REAL),
                CAST(json_extract(e.measured_wind_data_json, '$.summary.wind_variability') AS REAL),
                COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
-               e.mean_measured_direction_label, e.avg_forecast_temperature
+               e.mean_measured_direction_label, e.avg_forecast_temperature,
+               e.perceived_wind_variability, e.measured_wind_data_json
         FROM surf_experiences AS e
         LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
         WHERE {where_clause}
@@ -2619,10 +2652,28 @@ def list_surf_experiences(
         """,
         (int(user_id),),
     ).fetchall()
+    perceived_order = {
+        None: 99,
+        "": 99,
+        "very_steady": 0,
+        "steady": 1,
+        "moderate": 2,
+        "gusty": 3,
+        "very_gusty": 4,
+    }
     experiences = []
     for row in rows:
         mean_direction = row[22]
         mean_direction_label = row[23] or _wind_direction_label(mean_direction)
+        perceived_variability = row[25]
+        measured_raw = row[26] or "{}"
+        try:
+            measured = json.loads(measured_raw)
+        except json.JSONDecodeError:
+            measured = {"status": "unavailable", "records": [], "summary": {}}
+        if isinstance(measured, dict):
+            measured = _normalise_measured_wind_summary(measured)
+        objective_variability = measured_wind_power_variability_mean(measured)
         is_owner = int(row[1]) == int(user_id)
         experiences.append(
             {
@@ -2649,13 +2700,30 @@ def list_surf_experiences(
                 "max_measured_wind_speed": row[18],
                 "min_measured_wind_speed": row[19],
                 "max_measured_wind_gust": row[20],
-                "wind_variability": row[21],
+                "wind_variability": objective_variability,
+                "perceived_wind_variability": perceived_variability,
                 "mean_measured_direction": mean_direction,
                 "mean_measured_direction_label": mean_direction_label,
                 "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
                 "avg_forecast_temperature": row[24],
             }
         )
+    if sort_key == "wind_variability":
+        present = [item for item in experiences if item["wind_variability"] is not None]
+        missing = [item for item in experiences if item["wind_variability"] is None]
+        present.sort(
+            key=lambda item: (item["wind_variability"], item["date"], item["start_time"], item["id"]),
+            reverse=direction == "DESC",
+        )
+        experiences = present + missing
+    elif sort_key == "perceived_wind_variability":
+        present = [item for item in experiences if item.get("perceived_wind_variability")]
+        missing = [item for item in experiences if not item.get("perceived_wind_variability")]
+        present.sort(
+            key=lambda item: (perceived_order.get(item.get("perceived_wind_variability") or "", 99), item["date"], item["start_time"], item["id"]),
+            reverse=direction == "DESC",
+        )
+        experiences = present + missing
     return experiences
 
 
@@ -2678,7 +2746,7 @@ def _get_surf_experience(
                COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
                e.mean_measured_direction_label, e.avg_forecast_temperature,
                e.min_forecast_temperature, e.max_forecast_temperature,
-               e.share_token, e.shared_at
+               e.perceived_wind_variability, e.share_token, e.shared_at
         FROM surf_experiences AS e
         LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
         WHERE {access_clause}
@@ -2693,6 +2761,8 @@ def _get_surf_experience(
         measured = json.loads(measured_raw)
     except json.JSONDecodeError:
         measured = {"status": "unavailable", "records": [], "summary": {}}
+    if isinstance(measured, dict):
+        measured = _normalise_measured_wind_summary(measured)
     mean_direction = row[22]
     mean_direction_label = row[23] or _wind_direction_label(mean_direction)
     is_owner = int(row[1]) == int(user_id)
@@ -2727,8 +2797,9 @@ def _get_surf_experience(
         "avg_forecast_temperature": row[24],
         "min_forecast_temperature": row[25],
         "max_forecast_temperature": row[26],
-        "share_token": row[27] if is_owner else None,
-        "shared_at": row[28] if is_owner else None,
+        "perceived_wind_variability": row[27],
+        "share_token": row[28] if is_owner else None,
+        "shared_at": row[29] if is_owner else None,
     }
 
 

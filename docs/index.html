@@ -64,7 +64,7 @@
   <header class="page-header">
     <div>
       <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
-      <p class="meta">Last updated: 13 June 2026 17:04:32 CEST</p>
+      <p class="meta">Last updated: 13 June 2026 17:10:30 CEST</p>
     </div>
 
     <nav class="dashboard-actions" aria-label="Rider portal">
@@ -92,15 +92,15 @@
                 data-controls-id="current-day-interactive-controls"
                 data-details-id="current-day-interactive-details"
                 data-fallback-id="current-day-fallback"
-                data-json-url="current_day_interactive_data.json?v=1781363072"
+                data-json-url="current_day_interactive_data.json?v=1781363430"
             >
                 <div class="interactive-controls" id="current-day-interactive-controls"></div>
                 <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="current-day-fallback">
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1781363072" data-static-refresh-src="current_day_predictions_mobile.png">
-        <img src="current_day_predictions.png?v=1781363072" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1781363430" data-static-refresh-src="current_day_predictions_mobile.png">
+        <img src="current_day_predictions.png?v=1781363430" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
@@ -113,15 +113,15 @@
                 data-controls-id="next-day-interactive-controls"
                 data-details-id="next-day-interactive-details"
                 data-fallback-id="next-day-fallback"
-                data-json-url="next_day_interactive_data.json?v=1781363072"
+                data-json-url="next_day_interactive_data.json?v=1781363430"
             >
                 <div class="interactive-controls" id="next-day-interactive-controls"></div>
                 <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
                 <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="next-day-fallback">
-        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1781363072">
-        <img src="next_day_predictions.png?v=1781363072" alt="Next day prediction">
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1781363430">
+        <img src="next_day_predictions.png?v=1781363430" alt="Next day prediction">
       </picture>
     </div>
 
@@ -134,7 +134,7 @@
         <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, SE, NE winds; the largest gain is 2.0 kts for E. For that sector the super-local model overestimates by 0.2 kts on average. The advantage is smallest, or negative, for NW, N, SW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="current_day_direction_spider.png?v=1781363072" alt="Current-day prediction performance by wind direction">
+        <img src="current_day_direction_spider.png?v=1781363430" alt="Current-day prediction performance by wind direction">
       </div>
     </div>
 
@@ -144,7 +144,7 @@
         <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for E, NE, SE, S winds. The advantage is smallest for SW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="model_gate_direction_spider.png?v=1781363072" alt="Next-day prediction performance by wind direction">
+        <img src="model_gate_direction_spider.png?v=1781363430" alt="Next-day prediction performance by wind direction">
       </div>
     </div>
     </section>
@@ -152,7 +152,7 @@
     <div class="card">
       <h2>Model-gate evaluation history</h2>
       <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
-      <img src="model_gate_eval_history.png?v=1781363072" alt="Model gate evaluation history">
+      <img src="model_gate_eval_history.png?v=1781363430" alt="Model gate evaluation history">
     </div>
   </div>
   <p class="overview overview-mobile">
@@ -175,7 +175,7 @@
         function initStaticPlotRefresh() {
             var metadataUrl = "metadata_update.json";
             var pollIntervalMs = 900000;
-            var lastStaticPlotVersion = "2026-06-13T15:04:32.782783+00:00";
+            var lastStaticPlotVersion = "2026-06-13T15:10:30.135929+00:00";
 
             function metadataVersion(metadata) {
                 if (!metadata) {

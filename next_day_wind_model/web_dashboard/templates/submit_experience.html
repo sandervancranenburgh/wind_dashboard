@@ -5,7 +5,7 @@
     <h2>{{ form_title }}</h2>
     <form method="post" action="{{ form_action }}">
       <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-      <div class="form-grid">
+      <div class="experience-form-grid">
         <div>
           <label for="Rider">Rider *</label>
           <input id="Rider" name="Rider" value="{{ form_values.Rider }}" required>
@@ -57,16 +57,9 @@
             {% endfor %}
           </select>
         </div>
-        <div class="form-row-full">
+        <div class="form-span-2">
           <label for="RiderReview">RiderReview</label>
           <textarea id="RiderReview" name="RiderReview">{{ form_values.RiderReview }}</textarea>
-        </div>
-        <div>
-          <label for="RiderWeight">RiderWeight *</label>
-          <div class="unit-field">
-            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
-            <span class="unit">kg</span>
-          </div>
         </div>
         <div>
           <label for="WingSize">WingSize *</label>
@@ -90,12 +83,20 @@
             <span class="unit">cm2</span>
           </div>
         </div>
-        <div class="form-row-full">
+        <div>
+          <label for="RiderWeight">RiderWeight *</label>
+          <div class="unit-field">
+            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
+            <span class="unit">kg</span>
+          </div>
+        </div>
+        <div class="form-empty-cell" aria-hidden="true"></div>
+        <div class="form-span-2">
           <label for="RiderNotes">Private RiderNotes</label>
           <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
           <p class="desc">Only visible to you. Not shown on public submissions.</p>
         </div>
-        <fieldset class="form-row-full">
+        <fieldset class="form-span-2">
           <legend>Visibility</legend>
           <div class="choice-group">
             <label class="choice-option">

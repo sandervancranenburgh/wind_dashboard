@@ -1097,8 +1097,12 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b'<div class="form-date-row">', new_page.data)
         self.assertIn(b'<div class="form-time-start">', new_page.data)
         self.assertIn(b'<div class="form-time-end">', new_page.data)
+        self.assertIn(b'<div class="experience-form-grid">', new_page.data)
         self.assertIn(b'<div class="form-rating-row">', new_page.data)
         self.assertIn(b'<div class="form-perceived-row">', new_page.data)
+        self.assertIn(b'<div class="form-span-2">\n          <label for="RiderReview">RiderReview</label>', new_page.data)
+        self.assertIn(b'<div class="form-empty-cell" aria-hidden="true"></div>', new_page.data)
+        self.assertIn(b'<div class="form-span-2">\n          <label for="RiderNotes">Private RiderNotes</label>', new_page.data)
         self.assertIn(b'<select id="PerceivedWindVariability" name="PerceivedWindVariability" required>', new_page.data)
         self.assertIn(b'<label for="PerceivedWindVariability">Perceived wind variability *</label>', new_page.data)
         self.assertNotIn(b'<label for="PerceivedWindVariability">Perceived variability *</label>', new_page.data)
@@ -1106,6 +1110,10 @@ class RiderPortalTest(unittest.TestCase):
         self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartTime"'))
         self.assertLess(new_page.data.index(b'id="StartTime"'), new_page.data.index(b'id="EndTime"'))
         self.assertLess(new_page.data.index(b'name="SessionRating"'), new_page.data.index(b'id="PerceivedWindVariability"'))
+        self.assertLess(new_page.data.index(b'id="RiderReview"'), new_page.data.index(b'id="WingSize"'))
+        self.assertLess(new_page.data.index(b'id="WingSize"'), new_page.data.index(b'id="FoilSize"'))
+        self.assertLess(new_page.data.index(b'id="FoilSize"'), new_page.data.index(b'id="RiderWeight"'))
+        self.assertLess(new_page.data.index(b'id="RiderWeight"'), new_page.data.index(b'id="RiderNotes"'))
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]

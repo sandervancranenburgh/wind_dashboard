@@ -3422,11 +3422,16 @@ def _resolve_now_local(local_tz: str, test_now_local_hour: int | None) -> dateti
     return now_local
 
 
+def _daily_archive_date_label(local_dt: datetime) -> str:
+    return local_dt.strftime("%Y-%m-%d")
+
+
 def maybe_archive_current_day_plot(
     current_day_plot_path: Path,
     out_dir: Path,
     local_tz: str,
     test_now_local_hour: int | None,
+    current_day_plot_mobile_path: Path | None = None,
 ) -> str | None:
     now_local = _resolve_now_local(local_tz, test_now_local_hour)
     if now_local.hour < 22:
@@ -3434,9 +3439,14 @@ def maybe_archive_current_day_plot(
 
     archive_dir = out_dir / "current_day_plot_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = now_local.strftime("%Y%m%d-%H%M%S")
-    archived_path = archive_dir / f"{stamp}_current_day_predictions.png"
+    date_label = _daily_archive_date_label(now_local)
+    archived_path = archive_dir / f"current_day_predictions_{date_label}.png"
     shutil.copy2(current_day_plot_path, archived_path)
+
+    if current_day_plot_mobile_path is not None and current_day_plot_mobile_path.exists():
+        archived_mobile = archive_dir / f"current_day_predictions_mobile_{date_label}.png"
+        shutil.copy2(current_day_plot_mobile_path, archived_mobile)
+
     return str(archived_path)
 
 
@@ -3453,15 +3463,15 @@ def maybe_archive_next_day_plots(
 
     archive_dir = out_dir / "next_day_plot_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = now_local.strftime("%Y%m%d-%H%M%S")
+    date_label = _daily_archive_date_label(now_local)
 
     archived: dict[str, str] = {}
-    archived_desktop = archive_dir / f"{stamp}_next_day_predictions.png"
+    archived_desktop = archive_dir / f"next_day_predictions_{date_label}.png"
     shutil.copy2(next_day_plot_path, archived_desktop)
     archived["desktop"] = str(archived_desktop)
 
     if next_day_plot_mobile_path is not None and next_day_plot_mobile_path.exists():
-        archived_mobile = archive_dir / f"{stamp}_next_day_predictions_mobile.png"
+        archived_mobile = archive_dir / f"next_day_predictions_mobile_{date_label}.png"
         shutil.copy2(next_day_plot_mobile_path, archived_mobile)
         archived["mobile"] = str(archived_mobile)
     return archived
@@ -7967,6 +7977,7 @@ def main() -> None:
         )
         archived_current_day_plot = maybe_archive_current_day_plot(
             current_day_plot_path=current_day_plot_path,
+            current_day_plot_mobile_path=current_day_plot_path_mobile,
             out_dir=out_dir,
             local_tz=args.local_timezone,
             test_now_local_hour=args.test_now_local_hour,

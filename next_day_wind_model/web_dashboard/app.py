@@ -422,11 +422,16 @@ def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, 
         return None
     if not CURRENT_DAY_PLOT_ARCHIVE_DIR.exists():
         return None
-    prefix = day.strftime("%Y%m%d")
-    matches = sorted(CURRENT_DAY_PLOT_ARCHIVE_DIR.glob(f"{prefix}-*_current_day_predictions.png"))
-    if not matches:
-        return None
-    path = matches[-1]
+
+    stable_path = CURRENT_DAY_PLOT_ARCHIVE_DIR / f"current_day_predictions_{day.isoformat()}.png"
+    if stable_path.exists():
+        path = stable_path
+    else:
+        prefix = day.strftime("%Y%m%d")
+        matches = sorted(CURRENT_DAY_PLOT_ARCHIVE_DIR.glob(f"{prefix}-*_current_day_predictions.png"))
+        if not matches:
+            return None
+        path = matches[-1]
     return {
         "filename": path.name,
         "url": url_for("current_day_archive_asset", filename=path.name),
@@ -846,7 +851,9 @@ def dashboard_asset(filename: str):
 
 @app.route("/current-day-plot-archive/<path:filename>")
 def current_day_archive_asset(filename: str):
-    if "/" in filename or not filename.endswith("_current_day_predictions.png"):
+    old_archive_name = re.fullmatch(r"\d{8}-\d{6}_current_day_predictions\.png", filename)
+    daily_archive_name = re.fullmatch(r"current_day_predictions(?:_mobile)?_\d{4}-\d{2}-\d{2}\.png", filename)
+    if "/" in filename or not (old_archive_name or daily_archive_name):
         abort(404)
     return send_from_directory(CURRENT_DAY_PLOT_ARCHIVE_DIR, filename)
 

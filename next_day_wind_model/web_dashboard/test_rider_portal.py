@@ -893,6 +893,44 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
         self.assertEqual(detail.count(b'href="/experience/new"'), 1)
 
+    def test_current_day_archive_lookup_supports_daily_and_timestamped_names(self) -> None:
+        archive_dir = Path(self.temp_dir.name) / "current_day_plot_archive"
+        archive_dir.mkdir()
+        old_early = archive_dir / "20260115-220000_current_day_predictions.png"
+        old_late = archive_dir / "20260115-225959_current_day_predictions.png"
+        daily = archive_dir / "current_day_predictions_2026-01-15.png"
+        daily_mobile = archive_dir / "current_day_predictions_mobile_2026-01-15.png"
+        old_early.write_bytes(b"old early")
+        old_late.write_bytes(b"old late")
+        original_archive_dir = portal.CURRENT_DAY_PLOT_ARCHIVE_DIR
+        portal.CURRENT_DAY_PLOT_ARCHIVE_DIR = archive_dir
+        try:
+            with portal.app.test_request_context():
+                old_match = portal._current_day_archive_plot_for_submission("2026-01-15")
+            self.assertIsNotNone(old_match)
+            self.assertEqual(old_match["filename"], old_late.name)
+
+            daily.write_bytes(b"daily")
+            daily_mobile.write_bytes(b"daily mobile")
+            with portal.app.test_request_context():
+                daily_match = portal._current_day_archive_plot_for_submission("2026-01-15")
+            self.assertIsNotNone(daily_match)
+            self.assertEqual(daily_match["filename"], daily.name)
+
+            for archive_name in [old_late.name, daily.name, daily_mobile.name]:
+                response = self.client.get(f"/current-day-plot-archive/{archive_name}")
+                try:
+                    self.assertEqual(response.status_code, 200)
+                finally:
+                    response.close()
+            invalid_response = self.client.get("/current-day-plot-archive/not_an_archive.png")
+            try:
+                self.assertEqual(invalid_response.status_code, 404)
+            finally:
+                invalid_response.close()
+        finally:
+            portal.CURRENT_DAY_PLOT_ARCHIVE_DIR = original_archive_dir
+
     def test_submission_detail_places_wind_variability_before_archive_plot(self) -> None:
         row = {
             "date": "2026-01-15",

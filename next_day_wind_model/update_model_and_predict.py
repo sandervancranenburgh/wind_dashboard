@@ -7977,7 +7977,7 @@ def main() -> None:
         )
         archived_current_day_plot = maybe_archive_current_day_plot(
             current_day_plot_path=current_day_plot_path,
-            current_day_plot_mobile_path=current_day_plot_path_mobile,
+            current_day_plot_mobile_path=current_day_plot_mobile_path,
             out_dir=out_dir,
             local_tz=args.local_timezone,
             test_now_local_hour=args.test_now_local_hour,

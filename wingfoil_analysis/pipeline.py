@@ -67,12 +67,13 @@ ARTIFACTS = {
 SUPPORTED_EXTENSIONS = {".gpx", ".kml", ".fit"}
 
 DEFAULT_SETTINGS = {
-    "run_speed_threshold_mps": 4.5,
+    "run_speed_threshold_mps": 4.0,
+    "run_continue_threshold_mps": 1.5,
     "min_run_duration_s": 7.0,
     "max_run_gap_s": 2.0,
     "merge_runs_without_stop": True,
     "run_stop_threshold_mps": 1.0,
-    "fall_speed_threshold_mps": 1.0,
+    "fall_speed_threshold_mps": 1.5,
     "fall_window_s": 10.0,
     "min_fall_gap_s": 15.0,
     "water_speed_threshold_mps": 1.0,
@@ -154,6 +155,7 @@ class AnalysisError(Exception):
 @dataclass(frozen=True)
 class AnalysisConfig:
     run_speed_threshold_mps: float
+    run_continue_threshold_mps: float
     min_run_duration_s: float
     max_run_gap_s: float
     merge_runs_without_stop: bool
@@ -183,6 +185,7 @@ def default_analysis_config(**overrides: object) -> AnalysisConfig:
     values = DEFAULT_SETTINGS | overrides
     return AnalysisConfig(
         run_speed_threshold_mps=float(values["run_speed_threshold_mps"]),
+        run_continue_threshold_mps=float(values["run_continue_threshold_mps"]),
         min_run_duration_s=float(values["min_run_duration_s"]),
         max_run_gap_s=float(values["max_run_gap_s"]),
         merge_runs_without_stop=bool(values["merge_runs_without_stop"]),
@@ -199,6 +202,7 @@ def default_analysis_config(**overrides: object) -> AnalysisConfig:
 def config_to_dict(config: AnalysisConfig) -> dict[str, object]:
     return {
         "run_speed_threshold_mps": config.run_speed_threshold_mps,
+        "run_continue_threshold_mps": config.run_continue_threshold_mps,
         "min_run_duration_s": config.min_run_duration_s,
         "max_run_gap_s": config.max_run_gap_s,
         "merge_runs_without_stop": config.merge_runs_without_stop,
@@ -504,6 +508,7 @@ def load_activity(path: Path, smooth_window: int) -> tuple[list[Sample], list[st
 def detect_runs(
     samples: list[Sample],
     run_speed_threshold_mps: float,
+    run_continue_threshold_mps: float,
     min_run_duration_s: float,
     max_gap_s: float,
     merge_runs_without_stop: bool,
@@ -515,24 +520,36 @@ def detect_runs(
     candidate_ranges: list[tuple[int, int]] = []
     start: int | None = None
     last_fast: int | None = None
+    last_continuing: int | None = None
 
     for sample in samples:
         is_fast = sample.smooth_speed_mps >= run_speed_threshold_mps
+        is_continuing = sample.smooth_speed_mps >= run_continue_threshold_mps
         if is_fast:
             if start is None:
                 start = sample.index
             last_fast = sample.index
+            last_continuing = sample.index
             continue
 
-        if start is not None and last_fast is not None:
-            gap_s = (sample.time - samples[last_fast].time).total_seconds()
+        if start is None:
+            continue
+
+        if is_continuing:
+            last_continuing = sample.index
+            continue
+
+        if last_continuing is not None:
+            gap_s = (sample.time - samples[last_continuing].time).total_seconds()
             if gap_s > max_gap_s:
-                candidate_ranges.append((start, last_fast))
+                if last_fast is not None:
+                    candidate_ranges.append((start, last_continuing))
                 start = None
                 last_fast = None
+                last_continuing = None
 
-    if start is not None and last_fast is not None:
-        candidate_ranges.append((start, last_fast))
+    if start is not None and last_fast is not None and last_continuing is not None:
+        candidate_ranges.append((start, last_continuing))
 
     raw_runs: list[Run] = []
     for start_index, end_index in candidate_ranges:
@@ -1796,6 +1813,7 @@ def analyze_activity(
     samples, runs = detect_runs(
         samples,
         run_speed_threshold_mps=config.run_speed_threshold_mps,
+        run_continue_threshold_mps=config.run_continue_threshold_mps,
         min_run_duration_s=config.min_run_duration_s,
         max_gap_s=config.max_run_gap_s,
         merge_runs_without_stop=config.merge_runs_without_stop,
@@ -1963,6 +1981,7 @@ def analyze_session_file(
 def build_config_from_args(args: argparse.Namespace) -> AnalysisConfig:
     return default_analysis_config(
         run_speed_threshold_mps=args.run_speed_threshold_mps,
+        run_continue_threshold_mps=args.run_continue_threshold_mps,
         min_run_duration_s=args.min_run_duration_s,
         max_run_gap_s=args.max_run_gap_s,
         merge_runs_without_stop=args.merge_runs_without_stop,
@@ -2002,7 +2021,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("activity", nargs="?", help="Input GPX, KML, or FIT file")
     parser.add_argument("--input", dest="input_file", help="Input GPX, KML, or FIT file")
     parser.add_argument("-o", "--output-dir", "--out-dir", default="outputs/wingfoil_analysis", help="Directory for JSON, CSV, and SVG artifacts")
-    parser.add_argument("--run-speed-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_speed_threshold_mps"], help="Minimum smoothed speed for foiling/run state")
+    parser.add_argument("--run-speed-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_speed_threshold_mps"], help="Minimum smoothed speed required to start a run")
+    parser.add_argument("--run-continue-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_continue_threshold_mps"], help="Minimum smoothed speed to keep an active run alive")
     parser.add_argument("--min-run-duration-s", type=float, default=DEFAULT_SETTINGS["min_run_duration_s"], help="Minimum duration above threshold to count as a run")
     parser.add_argument("--max-run-gap-s", type=float, default=DEFAULT_SETTINGS["max_run_gap_s"], help="Merge short below-threshold gaps inside a run")
     parser.add_argument(

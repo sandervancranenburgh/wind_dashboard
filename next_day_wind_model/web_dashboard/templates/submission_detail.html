@@ -91,61 +91,11 @@
           <button class="activity-upload-button" type="submit" title="Selecting a new file replaces and re-analyses the current activity.">{{ 'Re-upload' if activity_analysis else 'Upload activity' }}</button>
         </div>
       </form>
-      {% if activity_analysis %}
-        <div class="activity-analysis {{ activity_analysis.status }}">
-          {% if activity_analysis.errors %}
-            <div class="analysis-message error">
-              {% for error in activity_analysis.errors %}<p>{{ error }}</p>{% endfor %}
-            </div>
-          {% endif %}
-          {% if activity_analysis.map_html_url %}
-            <iframe class="activity-analysis-frame" src="{{ activity_analysis.map_html_url }}" title="Activity map for this session" loading="lazy" scrolling="auto"></iframe>
-          {% elif activity_analysis.map_svg_url %}
-            <figure class="activity-artifact"><img src="{{ activity_analysis.map_svg_url }}" alt="Activity map for this session"></figure>
-          {% endif %}
-          {% if activity_analysis.plot_urls %}
-            <div class="activity-plots">
-              {% for plot in activity_analysis.plot_urls %}
-                {% if plot.key != 'map_svg' %}
-                  <figure class="activity-artifact">
-                    <img src="{{ plot.url }}" alt="{{ plot.label }}">
-                    <figcaption>{{ plot.label }}</figcaption>
-                  </figure>
-                {% endif %}
-              {% endfor %}
-            </div>
-          {% endif %}
-          {% if activity_analysis.runs %}
-            <div class="table-wrap activity-runs">
-              <table>
-                <thead><tr><th>Run</th><th>Distance (m)</th><th>Mean speed</th><th>Max speed</th><th>Wind angle</th></tr></thead>
-                <tbody>
-                  {% for run in activity_analysis.runs %}
-                    <tr>
-                      <td>{{ run.run_id }}</td>
-                      <td>{{ run.distance_m }} m</td>
-                      <td>{{ run.mean_speed_kmh }} km/h</td>
-                      <td>{{ run.max_speed_kmh }} km/h</td>
-                      <td>{{ run.wind_angle_class or 'n/a' }}</td>
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-          {% endif %}
-          {% if activity_analysis.warnings %}
-            <div class="analysis-message warning compact">
-              <p><span class="analysis-note-prefix">Note:</span> {{ activity_analysis.warnings[0] }}</p>
-              {% if activity_analysis.warnings|length > 1 %}
-                <details>
-                  <summary>{{ activity_analysis.warnings|length - 1 }} more technical note{{ 's' if activity_analysis.warnings|length > 2 else '' }}</summary>
-                  {% for warning in activity_analysis.warnings[1:] %}<p>{{ warning }}</p>{% endfor %}
-                </details>
-              {% endif %}
-            </div>
-          {% endif %}
-        </div>
-      {% endif %}
+    {% elif activity_analysis %}
+      <h2>Activity analysis</h2>
+    {% endif %}
+    {% if activity_analysis %}
+      {% include "_activity_analysis.html" %}
     {% endif %}
     <h2>Measured wind</h2>
     {% if wind_plot.available %}

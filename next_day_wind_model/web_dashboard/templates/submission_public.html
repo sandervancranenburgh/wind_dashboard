@@ -32,10 +32,30 @@
     .legend-line.variability-raw { border-top-width: 2px; opacity: 0.56; }
     .legend-line.variability-trend { border-top-color: #b000b8; }
     .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
+    .activity-analysis { max-width: 900px; margin: 0 0 18px 0; }
+    .activity-analysis-frame { box-sizing: border-box; width: 100%; height: 760px; border: 1px solid #ddd; border-radius: 8px; background: #07111f; display: block; overflow: auto; }
+    .activity-plots { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .activity-artifact { margin: 12px 0 0 0; }
+    .activity-plots .activity-artifact { margin: 0; }
+    .activity-artifact img { border: 1px solid #ddd; border-radius: 8px; background: #fff; max-width: 100%; object-fit: contain; }
+    .activity-artifact figcaption { color: #555; margin-top: 6px; font-size: 13px; }
+    .activity-runs { margin-top: 12px; overflow-x: auto; }
+    .activity-runs table { border-collapse: collapse; width: 100%; min-width: 620px; }
+    .activity-runs th, .activity-runs td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    .activity-runs th { background: #f6f6f6; }
+    .analysis-message { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin: 8px 0; background: #f8f8f8; }
+    .analysis-message p { margin: 0; }
+    .analysis-message p + p, .analysis-message details p { margin-top: 5px; }
+    .analysis-message summary { cursor: pointer; margin-top: 3px; color: #666; }
+    .analysis-message.error { border-color: #e0b1b1; background: #fff4f4; }
+    .analysis-message.warning { border: 0; background: transparent; color: #666; }
+    .analysis-message.warning.compact { display: block; max-width: 900px; padding: 0; font-size: 12px; line-height: 1.35; }
+    .analysis-note-prefix { color: #555; font-weight: 700; }
     @media (max-width: 768px) {
       body { margin: 10px; }
       h1 { font-size: 24px; }
       .detail-list { grid-template-columns: 1fr; }
+      .activity-plots { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -80,6 +100,10 @@
         {% endif %}
       </dd>
     </dl>
+    {% if activity_analysis %}
+      <h2>Activity analysis</h2>
+      {% include "_activity_analysis.html" %}
+    {% endif %}
     <h2>Measured wind</h2>
     {% if wind_plot.available %}
       <figure class="wind-plot">
@@ -205,5 +229,54 @@
       </figure>
     {% endif %}
   </main>
+  <script>
+    (() => {
+      const frames = Array.from(document.querySelectorAll(".activity-analysis-frame"));
+      if (!frames.length) return;
+      const MIN_FRAME_HEIGHT = 520;
+      const MAX_FRAME_HEIGHT = 1400;
+      const FRAME_PADDING = 8;
+      const appliedHeights = new WeakMap();
+      const clampHeight = (height) => Math.max(MIN_FRAME_HEIGHT, Math.min(Math.ceil(height), MAX_FRAME_HEIGHT));
+      const resizeFrame = (frame, height) => {
+        if (!Number.isFinite(height) || height <= 0) return;
+        const nextHeight = clampHeight(height + FRAME_PADDING);
+        const previousHeight = appliedHeights.get(frame) || 0;
+        if (Math.abs(nextHeight - previousHeight) < 2) return;
+        appliedHeights.set(frame, nextHeight);
+        frame.style.height = `${nextHeight}px`;
+      };
+      const measuredContentHeight = (doc) => {
+        const content = doc.getElementById("analysis-content");
+        if (content) return content.getBoundingClientRect().height;
+        const blocks = [doc.getElementById("map"), doc.querySelector(".dashboard")].filter(Boolean);
+        if (!blocks.length) return 0;
+        return blocks.reduce((bottom, block) => Math.max(bottom, block.offsetTop + block.offsetHeight), 0);
+      };
+      const measureFrame = (frame) => {
+        try {
+          const doc = frame.contentDocument || frame.contentWindow.document;
+          if (doc) resizeFrame(frame, measuredContentHeight(doc));
+        } catch (error) {
+        }
+      };
+      for (const frame of frames) {
+        frame.addEventListener("load", () => {
+          measureFrame(frame);
+          window.setTimeout(() => measureFrame(frame), 350);
+          window.setTimeout(() => measureFrame(frame), 1200);
+        });
+      }
+      window.addEventListener("message", (event) => {
+        if (event.origin !== window.location.origin) return;
+        const payload = event.data || {};
+        if (payload.type !== "wingfoil-analysis-height") return;
+        if (payload.source !== "wingfoil-analysis-map") return;
+        if (payload.measuredElement !== "analysis-content") return;
+        const frame = frames.find((candidate) => candidate.contentWindow === event.source);
+        if (frame) resizeFrame(frame, Number(payload.height));
+      });
+    })();
+  </script>
 </body>
 </html>

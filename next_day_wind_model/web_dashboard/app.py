@@ -668,7 +668,10 @@ def _activity_warnings_for_display(warnings: Any) -> list[str]:
     return display
 
 
-def _activity_analysis_view_model(analysis: dict[str, Any] | None) -> dict[str, Any] | None:
+def _activity_analysis_view_model(
+    analysis: dict[str, Any] | None,
+    artifact_url_builder: Callable[[str], str | None] | None = None,
+) -> dict[str, Any] | None:
     if not analysis:
         return None
     output_dir = _activity_output_dir(int(analysis["experience_id"]))
@@ -678,6 +681,8 @@ def _activity_analysis_view_model(analysis: dict[str, Any] | None) -> dict[str, 
         filename = artifacts.get(key)
         if not _is_safe_artifact_name(filename):
             return None
+        if artifact_url_builder is not None:
+            return artifact_url_builder(str(filename))
         return url_for("experience_activity_artifact", experience_id=analysis["experience_id"], filename=filename)
 
     plot_urls = []
@@ -1453,10 +1458,8 @@ def experience_detail(experience_id: int):
         if session_start_ms is not None and session_end_ms is not None
         else {"status": "unavailable", "records": []}
     )
-    activity_analysis = None
-    if row["is_owner"]:
-        stored_analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, user_id=user_id)
-        activity_analysis = _activity_analysis_view_model(stored_analysis)
+    stored_analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id)
+    activity_analysis = _activity_analysis_view_model(stored_analysis) if (row["is_owner"] or row["visibility"] == "public") else None
     return render_template(
         "submission_detail.html",
         row=row,
@@ -1492,15 +1495,7 @@ def upload_experience_activity(experience_id: int):
     return redirect(url_for("experience_detail", experience_id=experience_id))
 
 
-@app.route("/experiences/<int:experience_id>/activity-artifact/<path:filename>")
-@login_required
-def experience_activity_artifact(experience_id: int, filename: str):
-    conn = get_db()
-    user_id = int(current_user()["id"])
-    row = db_store.get_surf_experience(conn, user_id, experience_id)
-    if row is None:
-        abort(404)
-    analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, user_id=user_id)
+def _send_registered_activity_artifact(experience_id: int, filename: str, analysis: dict[str, Any] | None):
     if analysis is None:
         abort(404)
     if not _is_safe_artifact_name(filename):
@@ -1519,6 +1514,28 @@ def experience_activity_artifact(experience_id: int, filename: str):
     return send_from_directory(output_dir, filename)
 
 
+@app.route("/experiences/<int:experience_id>/activity-artifact/<path:filename>")
+@login_required
+def experience_activity_artifact(experience_id: int, filename: str):
+    conn = get_db()
+    user_id = int(current_user()["id"])
+    row = db_store.get_visible_surf_experience(conn, user_id, experience_id)
+    if row is None:
+        abort(404)
+    analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id)
+    return _send_registered_activity_artifact(experience_id, filename, analysis)
+
+
+@app.route("/share/experience/<share_token>/activity-artifact/<path:filename>")
+def shared_experience_activity_artifact(share_token: str, filename: str):
+    conn = get_db()
+    row = db_store.get_shared_public_surf_experience(conn, share_token)
+    if row is None:
+        abort(404)
+    analysis = db_store.get_surf_experience_activity_analysis(conn, int(row["id"]))
+    return _send_registered_activity_artifact(int(row["id"]), filename, analysis)
+
+
 @app.route("/share/experience/<share_token>")
 def public_experience_share(share_token: str):
     conn = get_db()
@@ -1531,12 +1548,21 @@ def public_experience_share(share_token: str):
         if session_start_ms is not None and session_end_ms is not None
         else {"status": "unavailable", "records": []}
     )
-    # TODO: Decide an explicit public/share-token policy before exposing activity analysis artifacts here.
+    stored_analysis = db_store.get_surf_experience_activity_analysis(conn, int(row["id"]))
+    activity_analysis = _activity_analysis_view_model(
+        stored_analysis,
+        artifact_url_builder=lambda filename: url_for(
+            "shared_experience_activity_artifact",
+            share_token=share_token,
+            filename=filename,
+        ),
+    )
     return render_template(
         "submission_public.html",
         row=row,
         wind_plot=_measured_wind_plot(row, predictions),
         wind_variability_plot=_measured_wind_variability_plot(row),
+        activity_analysis=activity_analysis,
     )
 
 

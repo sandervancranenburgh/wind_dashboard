@@ -103,13 +103,14 @@ class RiderPortalTest(unittest.TestCase):
         (output_path / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
         (output_path / "map.svg").write_text("<svg><title>map</title></svg>", encoding="utf-8")
         (output_path / "map.html").write_text("<html><body>map</body></html>", encoding="utf-8")
-        for name in [
-            "run_distance_distribution.svg",
-            "run_speed_distribution.svg",
-            "run_wind_angle_distribution.svg",
-            "run_speed.svg",
-        ]:
-            (output_path / name).write_text(f"<svg><title>{name}</title></svg>", encoding="utf-8")
+        plot_svg = {
+            "run_distance_distribution.svg": "<svg><text>0-100 m</text><text>100-200 m</text><text>200-300 m</text><text>&gt;300 m</text></svg>",
+            "run_speed_distribution.svg": "<svg><text>&lt;10 km/h</text><text>10-15 km/h</text><text>15-20 km/h</text><text>20-25 km/h</text><text>25-30 km/h</text><text>&gt;30 km/h</text></svg>",
+            "run_wind_angle_distribution.svg": "<svg><title>run_wind_angle_distribution.svg</title></svg>",
+            "run_speed.svg": "<svg><text>Run distance (m)</text><text>Mean speed (km/h)</text><text>700</text><text>30</text></svg>",
+        }
+        for name, content in plot_svg.items():
+            (output_path / name).write_text(content, encoding="utf-8")
         run_rows = [
             "run_id,distance_m,distance_km,mean_speed_kmh,max_speed_kmh,wind_angle_class",
             *[f"{index},{650 + index},{(650 + index) / 1000:.3f},17.5,24.0,crosswind" for index in range(1, 14)],
@@ -1707,7 +1708,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(analysis["errors"], ["Could not parse activity file"])
         self.assertIn("bad track", analysis["warnings"])
 
-    def test_activity_artifacts_are_owner_only_and_share_page_is_unchanged(self) -> None:
+    def test_public_activity_analysis_renders_read_only_and_authorizes_artifacts(self) -> None:
         public_id = self._create_submission(self.user_id, "Owner", "2026-04-05", "public")
         self._set_user(self.user_id)
         self.client.get(f"/experiences/{public_id}")
@@ -1716,23 +1717,94 @@ class RiderPortalTest(unittest.TestCase):
         with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload):
             self.client.post(
                 f"/experiences/{public_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file()},
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("public-session.gpx")},
             )
 
-        self._set_user(self.other_user_id)
-        self.assertEqual(self.client.get(f"/experiences/{public_id}/activity-artifact/map.svg").status_code, 404)
-        other_detail = self.client.get(f"/experiences/{public_id}")
-        self.assertEqual(other_detail.status_code, 200)
-        self.assertNotIn(b"Activity analysis", other_detail.data)
-
         conn = db_store.connect_db(self.temp_dir.name)
+        analysis = db_store.get_surf_experience_activity_analysis(conn, public_id, self.user_id)
         token = db_store.create_or_get_surf_experience_share_token(conn, public_id, self.user_id)
         conn.close()
+        self.assertIsNotNone(analysis)
+
+        self._set_user(self.other_user_id)
+        public_detail = self.client.get(f"/experiences/{public_id}")
+        self.assertEqual(public_detail.status_code, 200)
+        self.assertIn(b"Activity analysis", public_detail.data)
+        self.assertIn(b'class="activity-analysis-frame"', public_detail.data)
+        self.assertIn(f"/experiences/{public_id}/activity-artifact/map.html".encode(), public_detail.data)
+        self.assertIn(b"Distance (m)", public_detail.data)
+        self.assertIn(b"651 m", public_detail.data)
+        self.assertIn(b"663 m", public_detail.data)
+        self.assertEqual(public_detail.data.count(b"crosswind"), 13)
+        self.assertIn(b"Run distance distribution", public_detail.data)
+        self.assertIn(b"Run speed distribution", public_detail.data)
+        self.assertIn(b"Run speed profile", public_detail.data)
+        self.assertIn(b"GPS timestamps were somewhat irregular; speed and distance were reconstructed where needed.", public_detail.data)
+        self.assertNotIn(b"median interval is 0.70s", public_detail.data)
+        self.assertNotIn(b"Upload file", public_detail.data)
+        self.assertNotIn(b"Re-upload", public_detail.data)
+        self.assertNotIn(b"public-session.gpx", public_detail.data)
+        self.assertNotIn(str(analysis["stored_filename"]).encode(), public_detail.data)
+
+        artifact = self.client.get(f"/experiences/{public_id}/activity-artifact/map.svg")
+        self.assertEqual(artifact.status_code, 200)
+        self.assertIn(b"<svg", artifact.data)
+        artifact.close()
+        self.assertEqual(self.client.get(f"/experiences/{public_id}/activity-artifact/../summary.json").status_code, 404)
+        self.assertEqual(self.client.get(f"/experiences/{public_id}/activity-artifact/{analysis['stored_filename']}").status_code, 404)
+
         self._set_user(None)
         public_share = self.client.get(f"/share/experience/{token}")
         self.assertEqual(public_share.status_code, 200)
-        self.assertNotIn(b"Activity analysis", public_share.data)
-        self.assertNotIn(b"activity-artifact", public_share.data)
+        self.assertIn(b"Activity analysis", public_share.data)
+        self.assertIn(b'class="activity-analysis-frame"', public_share.data)
+        self.assertIn(f"/share/experience/{token}/activity-artifact/map.html".encode(), public_share.data)
+        self.assertIn(b"Distance (m)", public_share.data)
+        self.assertIn(b"663 m", public_share.data)
+        self.assertEqual(public_share.data.count(b"crosswind"), 13)
+        self.assertIn(b"Run distance distribution", public_share.data)
+        self.assertIn(b"Run speed distribution", public_share.data)
+        self.assertIn(b"Run speed profile", public_share.data)
+        self.assertNotIn(b"Upload file", public_share.data)
+        self.assertNotIn(b"Re-upload", public_share.data)
+        self.assertNotIn(b"public-session.gpx", public_share.data)
+        self.assertNotIn(str(analysis["stored_filename"]).encode(), public_share.data)
+
+        shared_map = self.client.get(f"/share/experience/{token}/activity-artifact/map.html")
+        self.assertEqual(shared_map.status_code, 200)
+        self.assertIn(b"map", shared_map.data)
+        shared_map.close()
+        shared_distance_plot = self.client.get(f"/share/experience/{token}/activity-artifact/run_distance_distribution.svg")
+        self.assertEqual(shared_distance_plot.status_code, 200)
+        self.assertIn(b"0-100 m", shared_distance_plot.data)
+        shared_distance_plot.close()
+        self.assertEqual(self.client.get(f"/share/experience/{token}/activity-artifact/../summary.json").status_code, 404)
+        self.assertEqual(self.client.get(f"/share/experience/{token}/activity-artifact/{analysis['stored_filename']}").status_code, 404)
+        self.assertEqual(self.client.get("/share/experience/not-a-real-token/activity-artifact/map.svg").status_code, 404)
+
+    def test_private_activity_analysis_remains_hidden_from_public_and_other_users(self) -> None:
+        private_id = self._create_submission(self.user_id, "Owner", "2026-04-06", "private")
+        self._set_user(self.user_id)
+        self.client.get(f"/experiences/{private_id}")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload):
+            self.client.post(
+                f"/experiences/{private_id}/activity-upload",
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("private-session.gpx")},
+            )
+        conn = db_store.connect_db(self.temp_dir.name)
+        analysis = db_store.get_surf_experience_activity_analysis(conn, private_id, self.user_id)
+        conn.close()
+        self.assertIsNotNone(analysis)
+
+        self._set_user(self.other_user_id)
+        self.assertEqual(self.client.get(f"/experiences/{private_id}").status_code, 404)
+        self.assertEqual(self.client.get(f"/experiences/{private_id}/activity-artifact/map.svg").status_code, 404)
+
+        self._set_user(None)
+        self.assertEqual(self.client.get(f"/share/experience/{private_id}").status_code, 404)
+        self.assertEqual(self.client.get(f"/share/experience/{private_id}/activity-artifact/map.svg").status_code, 404)
 
 
 

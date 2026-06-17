@@ -110,11 +110,11 @@ class RiderPortalTest(unittest.TestCase):
             "run_speed.svg",
         ]:
             (output_path / name).write_text(f"<svg><title>{name}</title></svg>", encoding="utf-8")
-        (output_path / "runs.csv").write_text(
-            "run_id,distance_km,mean_speed_kmh,max_speed_kmh,wind_angle_class\n"
-            "1,0.65,17.5,24.0,crosswind\n",
-            encoding="utf-8",
-        )
+        run_rows = [
+            "run_id,distance_m,distance_km,mean_speed_kmh,max_speed_kmh,wind_angle_class",
+            *[f"{index},{650 + index},{(650 + index) / 1000:.3f},17.5,24.0,crosswind" for index in range(1, 14)],
+        ]
+        (output_path / "runs.csv").write_text("\n".join(run_rows) + "\n", encoding="utf-8")
         return {
             "status": "ok",
             "analysis_version": "test-version",
@@ -1641,7 +1641,11 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"1.23 km", detail.data)
         self.assertIn(b'class="activity-analysis-frame"', detail.data)
         self.assertIn(f"/experiences/{experience_id}/activity-artifact/map.html".encode(), detail.data)
-        self.assertIn(b"crosswind", detail.data)
+        self.assertIn(b"Distance (m)", detail.data)
+        self.assertIn(b"651 m", detail.data)
+        self.assertIn(b"663 m", detail.data)
+        self.assertNotIn(b"0.651 km", detail.data)
+        self.assertEqual(detail.data.count(b"crosswind"), 13)
 
         artifact = self.client.get(f"/experiences/{experience_id}/activity-artifact/map.svg")
         self.assertEqual(artifact.status_code, 200)

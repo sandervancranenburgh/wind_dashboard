@@ -118,12 +118,12 @@
           {% if activity_analysis.runs %}
             <div class="table-wrap activity-runs">
               <table>
-                <thead><tr><th>Run</th><th>Distance</th><th>Mean speed</th><th>Max speed</th><th>Wind angle</th></tr></thead>
+                <thead><tr><th>Run</th><th>Distance (m)</th><th>Mean speed</th><th>Max speed</th><th>Wind angle</th></tr></thead>
                 <tbody>
                   {% for run in activity_analysis.runs %}
                     <tr>
                       <td>{{ run.run_id }}</td>
-                      <td>{{ run.distance_km }} km</td>
+                      <td>{{ run.distance_m }} m</td>
                       <td>{{ run.mean_speed_kmh }} km/h</td>
                       <td>{{ run.max_speed_kmh }} km/h</td>
                       <td>{{ run.wind_angle_class or 'n/a' }}</td>

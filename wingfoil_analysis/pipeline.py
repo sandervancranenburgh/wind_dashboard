@@ -1481,59 +1481,85 @@ def blank_svg(width: int, height: int, label: str) -> str:
     )
 
 
-def write_distribution_svg(path: Path, values: list[float], title: str, unit: str, min_count_for_hist: int) -> None:
+RUN_DISTANCE_BINS_M: list[tuple[str, float | None, float | None]] = [
+    ("0-100 m", 0.0, 100.0),
+    ("100-200 m", 100.0, 200.0),
+    ("200-300 m", 200.0, 300.0),
+    (">300 m", 300.0, None),
+]
+
+RUN_MEAN_SPEED_BINS_KMH: list[tuple[str, float | None, float | None]] = [
+    ("<10 km/h", None, 10.0),
+    ("10-15 km/h", 10.0, 15.0),
+    ("15-20 km/h", 15.0, 20.0),
+    ("20-25 km/h", 20.0, 25.0),
+    ("25-30 km/h", 25.0, 30.0),
+    (">30 km/h", 30.0, None),
+]
+
+
+def value_in_bin(value: float, lower: float | None, upper: float | None) -> bool:
+    if lower is not None and value < lower:
+        return False
+    if upper is not None and value >= upper:
+        return False
+    return True
+
+
+def write_binned_distribution_svg(
+    path: Path,
+    values: list[float],
+    title: str,
+    bins: list[tuple[str, float | None, float | None]],
+    x_axis_label: str,
+) -> None:
     width, height = 780, 460
-    margin = {"top": 64, "right": 34, "bottom": 64, "left": 68}
+    margin = {"top": 72, "right": 36, "bottom": 92, "left": 74}
     if not values:
         path.write_text(blank_svg(width, height, f"No {title.lower()} data"), encoding="utf-8")
         return
 
+    counts = [0 for _label, _lower, _upper in bins]
+    for value in values:
+        for index, (_label, lower, upper) in enumerate(bins):
+            if value_in_bin(value, lower, upper):
+                counts[index] += 1
+                break
+
     plot_w = width - margin["left"] - margin["right"]
     plot_h = height - margin["top"] - margin["bottom"]
+    max_count = max(counts) or 1
+    y_tick_count = max_count if max_count <= 5 else 5
+    bar_gap = 14
+    bar_w = (plot_w - bar_gap * (len(bins) - 1)) / len(bins)
+
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{svg_escape(title)}">',
         '<rect width="100%" height="100%" fill="#07111f"/>',
         f'<rect x="18" y="18" width="{width - 36}" height="{height - 36}" rx="8" fill="#0f1c30" stroke="rgba(255,255,255,0.14)"/>',
         f'<text x="{margin["left"]}" y="42" font-family="Inter, system-ui, sans-serif" font-size="22" font-weight="800" fill="#f8fafc">{svg_escape(title)}</text>',
-        f'<line x1="{margin["left"]}" y1="{margin["top"] + plot_h * 0.5:.1f}" x2="{margin["left"] + plot_w}" y2="{margin["top"] + plot_h * 0.5:.1f}" stroke="#243447" stroke-width="1"/>',
+        f'<text x="{margin["left"]}" y="62" font-family="Inter, system-ui, sans-serif" font-size="13" fill="#b8c4d5">Count per labelled bin, {len(values)} runs total</text>',
     ]
 
-    if len(values) >= min_count_for_hist:
-        bins = min(12, max(5, round(math.sqrt(len(values)))))
-        min_v, max_v = min(values), max(values)
-        span = max(max_v - min_v, 1e-9)
-        counts = [0 for _ in range(bins)]
-        for value in values:
-            bucket = min(int((value - min_v) / span * bins), bins - 1)
-            counts[bucket] += 1
-        max_count = max(counts) or 1
-        bar_gap = 6
-        bar_w = (plot_w - bar_gap * (bins - 1)) / bins
-        for i, count in enumerate(counts):
-            bar_h = plot_h * count / max_count
-            x = margin["left"] + i * (bar_w + bar_gap)
-            y = margin["top"] + plot_h - bar_h
-            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="#38bdf8" rx="4"/>')
-        parts.append(axis_label(margin["left"], height - 26, f"{min_v:.1f}-{max_v:.1f} {unit}"))
-        parts.append(axis_label(18, margin["top"] + 18, "count", rotate=True))
-    else:
-        max_v = max(values) or 1.0
-        bar_gap = 8
-        bar_w = min(54, (plot_w - bar_gap * (len(values) - 1)) / len(values))
-        for i, value in enumerate(values):
-            bar_h = plot_h * value / max_v
-            x = margin["left"] + i * (bar_w + bar_gap)
-            y = margin["top"] + plot_h - bar_h
-            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="#34d399" rx="4"/>')
-            parts.append(
-                f'<text x="{x + bar_w / 2:.1f}" y="{height - 34}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#b8c4d5">#{i + 1}</text>'
-            )
-        parts.append(axis_label(margin["left"], height - 26, f"run ({unit})"))
+    for tick in range(y_tick_count + 1):
+        count_value = max_count * tick / y_tick_count if y_tick_count else 0
+        y = margin["top"] + plot_h - (count_value / max_count) * plot_h
+        parts.append(f'<line x1="{margin["left"]}" y1="{y:.1f}" x2="{margin["left"] + plot_w}" y2="{y:.1f}" stroke="#243447" stroke-width="1"/>')
+        parts.append(f'<text x="{margin["left"] - 12}" y="{y + 4:.1f}" text-anchor="end" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#cbd5e1">{count_value:.0f}</text>')
 
-    axis_x1 = margin["left"]
+    for index, ((label, _lower, _upper), count) in enumerate(zip(bins, counts)):
+        bar_h = plot_h * count / max_count if max_count else 0
+        x = margin["left"] + index * (bar_w + bar_gap)
+        y = margin["top"] + plot_h - bar_h
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="#38bdf8" rx="5"/>')
+        parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{max(y - 10, margin["top"] - 6):.1f}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="13" font-weight="800" fill="#f8fafc">{count}</text>')
+        parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{height - 52}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="#cbd5e1">{svg_escape(label)}</text>')
+
     axis_y = margin["top"] + plot_h
-    parts.append(f'<line x1="{axis_x1}" y1="{axis_y}" x2="{margin["left"] + plot_w}" y2="{axis_y}" stroke="#475569" stroke-width="1"/>')
-    parts.append(f'<line x1="{axis_x1}" y1="{margin["top"]}" x2="{axis_x1}" y2="{axis_y}" stroke="#475569" stroke-width="1"/>')
+    parts.append(f'<line x1="{margin["left"]}" y1="{axis_y}" x2="{margin["left"] + plot_w}" y2="{axis_y}" stroke="#64748b" stroke-width="1"/>')
+    parts.append(f'<line x1="{margin["left"]}" y1="{margin["top"]}" x2="{margin["left"]}" y2="{axis_y}" stroke="#64748b" stroke-width="1"/>')
+    parts.append(axis_label(margin["left"] + plot_w / 2 - 70, height - 24, x_axis_label))
+    parts.append(axis_label(22, margin["top"] + 28, "Run count", rotate=True))
     parts.append("</svg>")
     path.write_text("\n".join(parts), encoding="utf-8")
 
@@ -1570,22 +1596,46 @@ def write_run_speed_svg(path: Path, samples: list[Sample], runs: list[Run]) -> N
     plot_h = height - margin["top"] - margin["bottom"]
     max_distance_m = max((distance for profile in profiles for distance, _speed in profile), default=1.0) or 1.0
     max_speed_kmh = max((speed for profile in profiles for _distance, speed in profile), default=1.0) or 1.0
-    tick_count = 6
 
-    def nice_step(max_value: float) -> float:
-        raw_step = max_value / (tick_count - 1)
+    def nice_axis_max(max_value: float, margin_ratio: float = 0.08) -> float:
+        target = max(max_value * (1.0 + margin_ratio), 1.0)
+        exponent = math.floor(math.log10(target)) if target > 0 else 0
+        multipliers = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 7.5, 8.0, 10.0)
+        for power in range(exponent - 1, exponent + 3):
+            base = 10**power
+            for multiplier in multipliers:
+                candidate = multiplier * base
+                if candidate >= target:
+                    return candidate
+        return target
+
+    def nice_tick_step(axis_max: float) -> float:
+        raw_step = axis_max / 6.0
         exponent = math.floor(math.log10(raw_step)) if raw_step > 0 else 0
-        base = 10**exponent
-        for multiplier in (1.0, 2.0, 2.5, 5.0, 10.0):
-            step = multiplier * base
-            if raw_step <= step:
-                return step
-        return 10.0 * base
+        multipliers = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 7.5, 8.0, 10.0)
+        candidates: list[float] = []
+        for power in range(exponent - 1, exponent + 2):
+            base = 10**power
+            candidates.extend(multiplier * base for multiplier in multipliers)
+        step = max((candidate for candidate in candidates if candidate <= raw_step), default=raw_step)
+        if axis_max / step > 10:
+            step = min((candidate for candidate in candidates if candidate > step), default=step)
+        return step
 
-    distance_step_m = nice_step(max_distance_m)
-    speed_step_kmh = nice_step(max_speed_kmh)
-    axis_max_distance_m = distance_step_m * (tick_count - 1)
-    axis_max_speed_kmh = speed_step_kmh * (tick_count - 1)
+    axis_max_distance_m = nice_axis_max(max_distance_m)
+    axis_max_speed_kmh = nice_axis_max(max_speed_kmh)
+    distance_step_m = nice_tick_step(axis_max_distance_m)
+    speed_step_kmh = nice_tick_step(axis_max_speed_kmh)
+
+    def tick_values(axis_max: float, step: float) -> list[float]:
+        values: list[float] = []
+        current = 0.0
+        while current < axis_max - 1e-9:
+            values.append(current)
+            current += step
+        if not values or abs(values[-1] - axis_max) > 1e-9:
+            values.append(axis_max)
+        return values
 
     def point(distance_m: float, speed_kmh: float) -> tuple[float, float]:
         x = margin["left"] + (distance_m / axis_max_distance_m) * plot_w
@@ -1593,29 +1643,24 @@ def write_run_speed_svg(path: Path, samples: list[Sample], runs: list[Run]) -> N
         return x, y
 
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Run speed profiles">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Run speed vs distance">',
         '<rect width="100%" height="100%" fill="#07111f"/>',
         f'<rect x="18" y="18" width="{width - 36}" height="{height - 36}" rx="8" fill="#0f1c30" stroke="rgba(255,255,255,0.14)"/>',
-        f'<text x="{margin["left"]}" y="42" font-family="Inter, system-ui, sans-serif" font-size="22" font-weight="800" fill="#f8fafc">Run speed profiles</text>',
-        f'<text x="{margin["left"]}" y="62" font-family="Inter, system-ui, sans-serif" font-size="13" fill="#b8c4d5">Speed profile for {len(profiles)} detected runs</text>',
+        f'<text x="{margin["left"]}" y="42" font-family="Inter, system-ui, sans-serif" font-size="22" font-weight="800" fill="#f8fafc">Run speed vs distance</text>',
+        f'<text x="{margin["left"]}" y="62" font-family="Inter, system-ui, sans-serif" font-size="13" fill="#b8c4d5">Speed profiles for {len(profiles)} detected runs</text>',
     ]
 
-    for tick in range(tick_count):
-        distance_value = distance_step_m * tick
+    for distance_value in tick_values(axis_max_distance_m, distance_step_m):
         x, _ = point(distance_value, 0.0)
         parts.append(f'<line x1="{x:.1f}" y1="{margin["top"]}" x2="{x:.1f}" y2="{margin["top"] + plot_h}" stroke="#1f2d3f" stroke-width="1"/>')
         parts.append(f'<line x1="{x:.1f}" y1="{margin["top"] + plot_h}" x2="{x:.1f}" y2="{margin["top"] + plot_h + 5}" stroke="#64748b" stroke-width="1"/>')
-        parts.append(
-            f'<text x="{x:.1f}" y="{margin["top"] + plot_h + 24}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#cbd5e1">{distance_value:.0f}</text>'
-        )
+        parts.append(f'<text x="{x:.1f}" y="{margin["top"] + plot_h + 24}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#cbd5e1">{distance_value:.0f}</text>')
 
-        speed_value = speed_step_kmh * tick
+    for speed_value in tick_values(axis_max_speed_kmh, speed_step_kmh):
         _, y = point(0.0, speed_value)
         parts.append(f'<line x1="{margin["left"]}" y1="{y:.1f}" x2="{margin["left"] + plot_w}" y2="{y:.1f}" stroke="#243447" stroke-width="1"/>')
         parts.append(f'<line x1="{margin["left"] - 5}" y1="{y:.1f}" x2="{margin["left"]}" y2="{y:.1f}" stroke="#64748b" stroke-width="1"/>')
-        parts.append(
-            f'<text x="{margin["left"] - 12}" y="{y + 4:.1f}" text-anchor="end" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#cbd5e1">{speed_value:.0f}</text>'
-        )
+        parts.append(f'<text x="{margin["left"] - 12}" y="{y + 4:.1f}" text-anchor="end" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#cbd5e1">{speed_value:.0f}</text>')
 
     for index, profile in enumerate(profiles):
         color = color_for_speed(index, 0, max(len(profiles) - 1, 1))
@@ -1628,8 +1673,8 @@ def write_run_speed_svg(path: Path, samples: list[Sample], runs: list[Run]) -> N
         [
             f'<line x1="{axis_x}" y1="{axis_y}" x2="{margin["left"] + plot_w}" y2="{axis_y}" stroke="#475569" stroke-width="1"/>',
             f'<line x1="{axis_x}" y1="{margin["top"]}" x2="{axis_x}" y2="{axis_y}" stroke="#475569" stroke-width="1"/>',
-            axis_label(margin["left"] + plot_w / 2 - 42, height - 28, "distance [m]"),
-            axis_label(24, margin["top"] + 48, "speed [km/h]", rotate=True),
+            axis_label(margin["left"] + plot_w / 2 - 58, height - 28, "Run distance (m)"),
+            axis_label(24, margin["top"] + 70, "Mean speed (km/h)", rotate=True),
             "</svg>",
         ]
     )
@@ -1866,19 +1911,19 @@ def write_analysis_outputs(result: AnalysisResult, output_dir: str | Path, clear
     write_runs_csv(output_path / "runs.csv", result.runs)
     write_map_svg(output_path / "map.svg", result.samples, result.runs, result.falls)
     write_map_html(output_path / "map.html", result.source_activity, result.samples, result.runs, result.falls, result.wind_context, result.water_time_s)
-    write_distribution_svg(
+    write_binned_distribution_svg(
         output_path / "run_distance_distribution.svg",
         [run.distance_m for run in result.runs],
         "Run distance distribution",
-        "m",
-        result.config.min_count_for_histogram,
+        RUN_DISTANCE_BINS_M,
+        "Run distance (m)",
     )
-    write_distribution_svg(
+    write_binned_distribution_svg(
         output_path / "run_speed_distribution.svg",
         [run.mean_speed_mps * MPS_TO_KMH for run in result.runs],
         "Run mean speed distribution",
-        "km/h",
-        result.config.min_count_for_histogram,
+        RUN_MEAN_SPEED_BINS_KMH,
+        "Mean speed (km/h)",
     )
     write_run_speed_svg(output_path / "run_speed.svg", result.samples, result.runs)
     write_wind_angle_svg(output_path / "run_wind_angle_distribution.svg", result.runs, result.wind_context)

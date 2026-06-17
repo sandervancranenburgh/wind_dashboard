@@ -609,17 +609,27 @@ def _read_activity_runs(analysis: dict[str, Any], output_dir: Path) -> list[dict
     try:
         with runs_path.open("r", newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
+                distance_m = row.get("distance_m") or ""
+                if not distance_m and row.get("distance_km"):
+                    try:
+                        distance_m = str(round(float(row["distance_km"]) * 1000))
+                    except (TypeError, ValueError):
+                        distance_m = ""
+                else:
+                    try:
+                        distance_m = str(round(float(distance_m))) if distance_m else ""
+                    except (TypeError, ValueError):
+                        distance_m = str(distance_m)
                 rows.append(
                     {
                         "run_id": row.get("run_id") or "",
+                        "distance_m": distance_m,
                         "distance_km": row.get("distance_km") or "",
                         "mean_speed_kmh": row.get("mean_speed_kmh") or "",
                         "max_speed_kmh": row.get("max_speed_kmh") or "",
                         "wind_angle_class": row.get("wind_angle_class") or "",
                     }
                 )
-                if len(rows) >= 12:
-                    break
     except OSError:
         return []
     return rows

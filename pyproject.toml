@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wingfoil-analysis"
+version = "0.1.0"
+description = "Wingfoil activity analysis pipeline for GPX, KML, and FIT files"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2",
+  "fitparse>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+wingfoil-analysis = "wingfoil_analysis.pipeline:main"
+
+[tool.setuptools.packages.find]
+include = ["wingfoil_analysis*"]

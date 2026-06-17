@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import csv
 import functools
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
@@ -27,12 +29,14 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.utils import secure_filename
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import db_store
+from wingfoil_analysis import analyze_session_file, build_wind_context
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -81,6 +85,16 @@ SORT_OPTIONS = {
     "avg_forecast_temperature",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ACTIVITY_UPLOAD_EXTENSIONS = {".fit", ".gpx", ".kml"}
+ACTIVITY_UPLOAD_FIELD = "ActivityFile"
+ACTIVITY_ARTIFACT_LABELS = {
+    "map_svg": "Session map",
+    "run_distance_distribution_svg": "Run distance distribution",
+    "run_speed_distribution_svg": "Run speed distribution",
+    "run_wind_angle_distribution_svg": "Run wind angle distribution",
+    "run_speed_profile_svg": "Run speed profile",
+}
+
 
 
 def _load_secret_key() -> str:
@@ -113,6 +127,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("WIND_DASHBOARD_COOKIE_SECURE", "").lower()
     in {"1", "true", "yes"},
+    MAX_CONTENT_LENGTH=int(os.environ.get("WIND_DASHBOARD_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024))),
 )
 
 
@@ -436,6 +451,312 @@ def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, 
         "filename": path.name,
         "url": url_for("current_day_archive_asset", filename=path.name),
     }
+
+
+class ActivityUploadError(ValueError):
+    pass
+
+
+def _activity_upload_root() -> Path:
+    return Path(app.config.get("RIDER_ACTIVITY_UPLOAD_DIR") or (DATA_DIR / "rider_activity_uploads"))
+
+
+def _activity_analysis_root() -> Path:
+    return Path(app.config.get("RIDER_ACTIVITY_ANALYSIS_DIR") or (DATA_DIR / "rider_activity_analysis"))
+
+
+def _activity_upload_dir(experience_id: int) -> Path:
+    return _activity_upload_root() / str(int(experience_id))
+
+
+def _activity_output_dir(experience_id: int) -> Path:
+    return _activity_analysis_root() / str(int(experience_id))
+
+
+def _ensure_child_path(path: Path, root: Path) -> None:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ActivityUploadError("Activity file path is outside the allowed directory.") from exc
+
+
+def _uploaded_activity_file():
+    uploaded = request.files.get(ACTIVITY_UPLOAD_FIELD)
+    if uploaded is None or not (uploaded.filename or "").strip():
+        return None
+    return uploaded
+
+
+def _save_activity_upload(uploaded, experience_id: int) -> dict[str, Any]:
+    original_filename = (uploaded.filename or "").strip()
+    safe_name = secure_filename(original_filename)
+    if not safe_name:
+        raise ActivityUploadError("Choose a FIT, GPX or KML activity file.")
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in ACTIVITY_UPLOAD_EXTENSIONS:
+        raise ActivityUploadError("Activity file must be a FIT, GPX or KML file.")
+
+    upload_dir = _activity_upload_dir(experience_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stored_filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(8)}{suffix}"
+    stored_path = upload_dir / stored_filename
+    _ensure_child_path(stored_path, upload_dir)
+    uploaded.save(stored_path)
+    return {
+        "original_filename": original_filename,
+        "stored_filename": stored_filename,
+        "stored_path": stored_path,
+        "file_type": suffix.lstrip("."),
+    }
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_safe_artifact_name(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    artifact_path = Path(value)
+    return not artifact_path.is_absolute() and artifact_path.name == value and ".." not in artifact_path.parts
+
+
+def _registered_activity_artifacts(payload: dict[str, Any]) -> dict[str, str]:
+    registered: dict[str, str] = {}
+    for key in ("summary_json", "runs_csv", "map_svg", "map_html"):
+        value = payload.get(key)
+        if _is_safe_artifact_name(value):
+            registered[key] = str(value)
+    for group_name in ("artifacts", "plots"):
+        group = payload.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        for key, value in group.items():
+            if _is_safe_artifact_name(value):
+                registered[str(key)] = str(value)
+    return registered
+
+
+def _build_wind_context(row: dict[str, Any]) -> tuple[Any, list[str]]:
+    measured = row.get("measured_wind") or {}
+    summary = measured.get("summary") if isinstance(measured, dict) else {}
+    summary = summary or {}
+    direction = row.get("mean_measured_direction")
+    if direction is None:
+        direction = summary.get("mean_wind_dir")
+    speed = row.get("avg_measured_wind_speed")
+    if speed is None:
+        speed = summary.get("avg_wind_speed")
+
+    warnings: list[str] = []
+    if speed is None and direction is None:
+        warnings.append("Wind context was unavailable for this activity analysis.")
+    wind_context = build_wind_context(
+        wind_direction_deg=direction,
+        wind_speed_kts=speed,
+        spot_name=row.get("spot"),
+    )
+    return wind_context, warnings
+
+
+def _format_stat_value(value: Any, suffix: str = "", digits: int = 1) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if digits <= 0:
+        formatted = f"{number:.0f}"
+    else:
+        formatted = f"{number:.{digits}f}"
+    return f"{formatted} {suffix}".strip()
+
+
+def _activity_summary_items(analysis: dict[str, Any]) -> list[dict[str, str]]:
+    stats = analysis.get("stats") or {}
+    summary = analysis.get("summary") or {}
+    activity = summary.get("activity") if isinstance(summary, dict) else {}
+    activity = activity or {}
+    items = [
+        ("Distance", _format_stat_value(stats.get("distance_km") or activity.get("total_distance_m") and float(activity["total_distance_m"]) / 1000, "km", 2)),
+        ("Max speed", _format_stat_value(stats.get("max_speed_kmh"), "km/h", 1)),
+        ("Avg foil speed", _format_stat_value(stats.get("avg_speed_on_foil_kmh") or activity.get("avg_speed_on_foil_kmh"), "km/h", 1)),
+        ("Runs", _format_stat_value(stats.get("run_count") or (summary.get("runs_summary") or {}).get("count"), "", 0)),
+        ("Falls", _format_stat_value(stats.get("fall_count") or (summary.get("falls_summary") or {}).get("count"), "", 0)),
+        ("Track points", _format_stat_value(stats.get("track_point_count") or activity.get("sample_count"), "", 0)),
+    ]
+    water_time = activity.get("water_time_formatted")
+    if water_time:
+        items.insert(1, ("Water time", str(water_time)))
+    return [{"label": label, "value": value} for label, value in items if value]
+
+
+def _read_activity_runs(analysis: dict[str, Any], output_dir: Path) -> list[dict[str, str]]:
+    runs_name = (analysis.get("artifacts") or {}).get("runs_csv")
+    if not _is_safe_artifact_name(runs_name):
+        return []
+    runs_path = output_dir / str(runs_name)
+    _ensure_child_path(runs_path, output_dir)
+    if not runs_path.is_file():
+        return []
+    rows: list[dict[str, str]] = []
+    try:
+        with runs_path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                rows.append(
+                    {
+                        "run_id": row.get("run_id") or "",
+                        "distance_km": row.get("distance_km") or "",
+                        "mean_speed_kmh": row.get("mean_speed_kmh") or "",
+                        "max_speed_kmh": row.get("max_speed_kmh") or "",
+                        "wind_angle_class": row.get("wind_angle_class") or "",
+                    }
+                )
+                if len(rows) >= 12:
+                    break
+    except OSError:
+        return []
+    return rows
+
+
+def _activity_warning_for_display(warning: Any) -> str:
+    text = str(warning or "").strip()
+    lower = text.lower()
+    if (
+        "timestamps were somewhat irregular" in lower
+        or "timestamps are somewhat irregular" in lower
+        or "timestamps are irregular" in lower
+    ):
+        return "GPS timestamps were somewhat irregular; speed and distance were reconstructed where needed."
+    if "speed had to be reconstructed" in lower:
+        return "GPS speed was missing for some points, so speed was reconstructed from the GPS track."
+    if "distance had to be reconstructed" in lower:
+        return "GPS distance was missing for some points, so distance was reconstructed from the GPS track."
+    return text
+
+
+def _activity_warnings_for_display(warnings: Any) -> list[str]:
+    if isinstance(warnings, str):
+        raw_warnings = [warnings]
+    elif isinstance(warnings, list):
+        raw_warnings = warnings
+    else:
+        raw_warnings = []
+    display: list[str] = []
+    seen: set[str] = set()
+    for warning in raw_warnings:
+        text = _activity_warning_for_display(warning)
+        if text and text not in seen:
+            seen.add(text)
+            display.append(text)
+    return display
+
+
+def _activity_analysis_view_model(analysis: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not analysis:
+        return None
+    output_dir = _activity_output_dir(int(analysis["experience_id"]))
+    artifacts = analysis.get("artifacts") or {}
+
+    def artifact_url(key: str) -> str | None:
+        filename = artifacts.get(key)
+        if not _is_safe_artifact_name(filename):
+            return None
+        return url_for("experience_activity_artifact", experience_id=analysis["experience_id"], filename=filename)
+
+    plot_urls = []
+    for key, label in ACTIVITY_ARTIFACT_LABELS.items():
+        url = artifact_url(key)
+        if url:
+            plot_urls.append({"key": key, "label": label, "url": url})
+    return {
+        "status": analysis.get("status"),
+        "original_filename": analysis.get("original_filename"),
+        "file_type": analysis.get("file_type"),
+        "uploaded_at": analysis.get("uploaded_at"),
+        "analysis_version": analysis.get("analysis_version"),
+        "warnings": _activity_warnings_for_display(analysis.get("warnings")),
+        "errors": analysis.get("errors") or [],
+        "summary_items": _activity_summary_items(analysis),
+        "map_html_url": artifact_url("map_html"),
+        "map_svg_url": artifact_url("map_svg"),
+        "plot_urls": plot_urls,
+        "runs": _read_activity_runs(analysis, output_dir),
+    }
+
+
+def _store_activity_analysis_result(
+    conn,
+    row: dict[str, Any],
+    upload_info: dict[str, Any],
+    payload: dict[str, Any],
+    context_warnings: list[str],
+) -> dict[str, Any]:
+    output_dir = _activity_output_dir(int(row["id"]))
+    status = str(payload.get("status") or "error")
+    artifacts = _registered_activity_artifacts(payload) if status == "ok" else {}
+    summary = {}
+    summary_name = artifacts.get("summary_json")
+    if summary_name:
+        summary_path = output_dir / summary_name
+        _ensure_child_path(summary_path, output_dir)
+        summary = _read_json_file(summary_path)
+
+    warnings = list(context_warnings)
+    payload_warnings = payload.get("warnings") or []
+    if isinstance(payload_warnings, str):
+        payload_warnings = [payload_warnings]
+    warnings.extend(str(item) for item in payload_warnings if item)
+    errors = []
+    if status != "ok":
+        errors.append(str(payload.get("error") or "Activity analysis failed."))
+
+    persisted = {
+        "experience_id": int(row["id"]),
+        "user_id": int(row["user_id"]),
+        "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "original_filename": upload_info.get("original_filename"),
+        "stored_filename": upload_info.get("stored_filename"),
+        "file_type": upload_info.get("file_type") or payload.get("input_type"),
+        "status": status,
+        "summary": summary,
+        "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+        "artifacts": artifacts,
+        "warnings": warnings,
+        "errors": errors,
+        "analysis_version": payload.get("analysis_version"),
+    }
+    db_store.upsert_surf_experience_activity_analysis(conn, persisted)
+    return persisted
+
+
+def _run_activity_analysis_for_upload(conn, row: dict[str, Any], uploaded) -> dict[str, Any]:
+    upload_info = _save_activity_upload(uploaded, int(row["id"]))
+    output_dir = _activity_output_dir(int(row["id"]))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_child_path(output_dir, _activity_analysis_root())
+    wind_context, context_warnings = _build_wind_context(row)
+    try:
+        payload = analyze_session_file(
+            input_file=upload_info["stored_path"],
+            output_dir=output_dir,
+            wind_context=wind_context,
+            raise_on_error=False,
+        )
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "input_type": upload_info.get("file_type"),
+            "error": str(exc),
+            "warnings": [],
+        }
+    return _store_activity_analysis_result(conn, row, upload_info, payload, context_warnings)
 
 
 def _measured_wind_variability_plot(row: dict[str, Any]) -> dict[str, Any]:
@@ -966,11 +1287,25 @@ def new_experience():
             )
             experience["user_id"] = int(current_user()["id"])
             experience["measured_wind"] = measured
-            experience_id = db_store.create_surf_experience(get_db(), experience)
+            conn = get_db()
+            experience_id = db_store.create_surf_experience(conn, experience)
             if measured.get("status") == "ok":
                 flash("Experience submitted with measured wind data attached.", "success")
             else:
                 flash("Experience submitted. Measured wind data was unavailable for that session.", "success")
+            uploaded = _uploaded_activity_file()
+            if uploaded is not None:
+                row = db_store.get_surf_experience(conn, int(current_user()["id"]), experience_id)
+                if row is not None:
+                    try:
+                        analysis = _run_activity_analysis_for_upload(conn, row, uploaded)
+                    except ActivityUploadError as exc:
+                        flash(str(exc), "error")
+                    else:
+                        if analysis.get("status") == "ok":
+                            flash("Activity file analyzed and attached to this submission.", "success")
+                        else:
+                            flash("Activity file was stored, but analysis failed. See the detail page for the error.", "error")
             return redirect(url_for("experience_detail", experience_id=experience_id))
         for error in errors:
             flash(error, "error")
@@ -1108,13 +1443,70 @@ def experience_detail(experience_id: int):
         if session_start_ms is not None and session_end_ms is not None
         else {"status": "unavailable", "records": []}
     )
+    activity_analysis = None
+    if row["is_owner"]:
+        stored_analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, user_id=user_id)
+        activity_analysis = _activity_analysis_view_model(stored_analysis)
     return render_template(
         "submission_detail.html",
         row=row,
         wind_plot=_measured_wind_plot(row, predictions),
         wind_variability_plot=_measured_wind_variability_plot(row),
         current_day_archive_plot=_current_day_archive_plot_for_submission(row["date"]),
+        activity_analysis=activity_analysis,
     )
+
+
+@app.post("/experiences/<int:experience_id>/activity-upload")
+@login_required
+def upload_experience_activity(experience_id: int):
+    _validate_csrf()
+    conn = get_db()
+    user_id = int(current_user()["id"])
+    row = db_store.get_surf_experience(conn, user_id, experience_id)
+    if row is None:
+        abort(404)
+    uploaded = _uploaded_activity_file()
+    if uploaded is None:
+        flash("Choose a FIT, GPX or KML activity file.", "error")
+        return redirect(url_for("experience_detail", experience_id=experience_id))
+    try:
+        analysis = _run_activity_analysis_for_upload(conn, row, uploaded)
+    except ActivityUploadError as exc:
+        flash(str(exc), "error")
+    else:
+        if analysis.get("status") == "ok":
+            flash("Activity file analyzed and attached to this submission.", "success")
+        else:
+            flash("Activity file was stored, but analysis failed. See the error below.", "error")
+    return redirect(url_for("experience_detail", experience_id=experience_id))
+
+
+@app.route("/experiences/<int:experience_id>/activity-artifact/<path:filename>")
+@login_required
+def experience_activity_artifact(experience_id: int, filename: str):
+    conn = get_db()
+    user_id = int(current_user()["id"])
+    row = db_store.get_surf_experience(conn, user_id, experience_id)
+    if row is None:
+        abort(404)
+    analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, user_id=user_id)
+    if analysis is None:
+        abort(404)
+    if not _is_safe_artifact_name(filename):
+        abort(404)
+    registered = set((analysis.get("artifacts") or {}).values())
+    if filename not in registered:
+        abort(404)
+    output_dir = _activity_output_dir(experience_id)
+    artifact_path = output_dir / filename
+    try:
+        _ensure_child_path(artifact_path, output_dir)
+    except ActivityUploadError:
+        abort(404)
+    if not artifact_path.is_file():
+        abort(404)
+    return send_from_directory(output_dir, filename)
 
 
 @app.route("/share/experience/<share_token>")
@@ -1129,6 +1521,7 @@ def public_experience_share(share_token: str):
         if session_start_ms is not None and session_end_ms is not None
         else {"status": "unavailable", "records": []}
     )
+    # TODO: Decide an explicit public/share-token policy before exposing activity analysis artifacts here.
     return render_template(
         "submission_public.html",
         row=row,

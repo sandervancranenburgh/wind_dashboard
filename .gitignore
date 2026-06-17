@@ -35,3 +35,6 @@ old/data/
 old/plots/
 data/raw/
 data/processed/
+
+# Private data
+tests/private_fixtures/

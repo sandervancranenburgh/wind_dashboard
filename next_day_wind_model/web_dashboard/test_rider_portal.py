@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
 import sqlite3
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import db_store
 from next_day_wind_model.web_dashboard import app as portal
@@ -78,6 +81,75 @@ class RiderPortalTest(unittest.TestCase):
         experience_id = db_store.create_surf_experience(conn, experience)
         conn.close()
         return experience_id
+
+    def _activity_file(self, filename: str = "session.gpx"):
+        gpx = b'<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">\n  <trk><name>Test</name><trkseg>\n    <trkpt lat="52.1" lon="4.4"><time>2026-01-20T11:00:00Z</time></trkpt>\n    <trkpt lat="52.1005" lon="4.4005"><time>2026-01-20T11:00:10Z</time></trkpt>\n  </trkseg></trk>\n</gpx>\n'
+        return (io.BytesIO(gpx), filename)
+
+    def _mock_analysis_payload(self, input_file, output_dir, wind_context=None, raise_on_error=False, **_kwargs):
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "activity": {
+                "total_distance_m": 1234.0,
+                "water_time_formatted": "20m 0s",
+                "avg_speed_on_foil_kmh": 18.5,
+                "sample_count": 42,
+            },
+            "runs_summary": {"count": 2},
+            "falls_summary": {"count": 1},
+            "warnings": ["summary warning"],
+        }
+        (output_path / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        (output_path / "map.svg").write_text("<svg><title>map</title></svg>", encoding="utf-8")
+        (output_path / "map.html").write_text("<html><body>map</body></html>", encoding="utf-8")
+        for name in [
+            "run_distance_distribution.svg",
+            "run_speed_distribution.svg",
+            "run_wind_angle_distribution.svg",
+            "run_speed.svg",
+        ]:
+            (output_path / name).write_text(f"<svg><title>{name}</title></svg>", encoding="utf-8")
+        (output_path / "runs.csv").write_text(
+            "run_id,distance_km,mean_speed_kmh,max_speed_kmh,wind_angle_class\n"
+            "1,0.65,17.5,24.0,crosswind\n",
+            encoding="utf-8",
+        )
+        return {
+            "status": "ok",
+            "analysis_version": "test-version",
+            "input_filename": Path(input_file).name,
+            "input_type": Path(input_file).suffix.lower().lstrip("."),
+            "summary_json": "summary.json",
+            "map_html": "map.html",
+            "map_svg": "map.svg",
+            "runs_csv": "runs.csv",
+            "artifacts": {
+                "summary_json": "summary.json",
+                "runs_csv": "runs.csv",
+                "map_svg": "map.svg",
+                "map_html": "map.html",
+                "run_distance_distribution_svg": "run_distance_distribution.svg",
+                "run_speed_distribution_svg": "run_speed_distribution.svg",
+                "run_wind_angle_distribution_svg": "run_wind_angle_distribution.svg",
+                "run_speed_profile_svg": "run_speed.svg",
+            },
+            "plots": {
+                "speed_distribution_svg": "run_speed_distribution.svg",
+                "distance_distribution_svg": "run_distance_distribution.svg",
+                "run_speed_profile_svg": "run_speed.svg",
+                "wind_angle_distribution_svg": "run_wind_angle_distribution.svg",
+            },
+            "stats": {
+                "distance_km": 1.234,
+                "max_speed_kmh": 24.0,
+                "avg_speed_on_foil_kmh": 18.5,
+                "run_count": 2,
+                "fall_count": 1,
+                "track_point_count": 42,
+            },
+            "warnings": ["timestamps are irregular: median interval is 0.70s and some records deviate by more than 2.00s"],
+        }
 
     def _valid_form(self, visibility: str | None = None) -> dict[str, str]:
         form = {
@@ -1132,15 +1204,15 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"addEventListener(\"change\", () => syncEndOptions(true))", new_page.data)
         self.assertIn(b"Private RiderNotes", new_page.data)
         self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
+        self.assertIn(b'<label class="activity-file-trigger" for="ActivityFile">Upload file</label>', new_page.data)
+        self.assertIn(b"No activity file uploaded", new_page.data)
+        self.assertNotIn(b'<label for="ActivityFile">Activity file</label>', new_page.data)
+        self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", new_page.data)
         self.assertIn(b'<div class="form-date-row">', new_page.data)
         self.assertIn(b'<div class="form-time-start">', new_page.data)
         self.assertIn(b'<div class="form-time-end">', new_page.data)
-        self.assertIn(b'<div class="experience-form-grid">', new_page.data)
         self.assertIn(b'<div class="form-rating-row">', new_page.data)
         self.assertIn(b'<div class="form-perceived-row">', new_page.data)
-        self.assertIn(b'<div class="form-span-2">\n          <label for="RiderReview">RiderReview</label>', new_page.data)
-        self.assertIn(b'<div class="form-empty-cell" aria-hidden="true"></div>', new_page.data)
-        self.assertIn(b'<div class="form-span-2">\n          <label for="RiderNotes">Private RiderNotes</label>', new_page.data)
         self.assertIn(b'<select id="PerceivedWindVariability" name="PerceivedWindVariability" required>', new_page.data)
         self.assertIn(b'<label for="PerceivedWindVariability">Perceived wind variability *</label>', new_page.data)
         self.assertNotIn(b'<label for="PerceivedWindVariability">Perceived variability *</label>', new_page.data)
@@ -1148,10 +1220,6 @@ class RiderPortalTest(unittest.TestCase):
         self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartTime"'))
         self.assertLess(new_page.data.index(b'id="StartTime"'), new_page.data.index(b'id="EndTime"'))
         self.assertLess(new_page.data.index(b'name="SessionRating"'), new_page.data.index(b'id="PerceivedWindVariability"'))
-        self.assertLess(new_page.data.index(b'id="RiderReview"'), new_page.data.index(b'id="WingSize"'))
-        self.assertLess(new_page.data.index(b'id="WingSize"'), new_page.data.index(b'id="FoilSize"'))
-        self.assertLess(new_page.data.index(b'id="FoilSize"'), new_page.data.index(b'id="RiderWeight"'))
-        self.assertLess(new_page.data.index(b'id="RiderWeight"'), new_page.data.index(b'id="RiderNotes"'))
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
@@ -1479,6 +1547,189 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"Public review without private name", public_share.data)
         self.assertNotIn(b"private.login@example.com", public_share.data)
         self.assertNotIn(b"Secret Freeform Name", public_share.data)
+
+    def test_activity_upload_requires_authenticated_owner(self) -> None:
+        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-01", "private")
+
+        response = self.client.post(
+            f"/experiences/{experience_id}/activity-upload",
+            data={"ActivityFile": self._activity_file()},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("login=1", response.headers["Location"])
+
+        self._set_user(self.other_user_id)
+        self.client.get("/experience/new")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        other_response = self.client.post(
+            f"/experiences/{experience_id}/activity-upload",
+            data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file()},
+        )
+        self.assertEqual(other_response.status_code, 404)
+
+    def test_invalid_activity_extension_is_rejected(self) -> None:
+        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
+        self._set_user(self.user_id)
+        self.client.get(f"/experiences/{experience_id}")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+
+        with patch.object(portal, "analyze_session_file") as mocked_analysis:
+            response = self.client.post(
+                f"/experiences/{experience_id}/activity-upload",
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("bad.txt")},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Activity file must be a FIT, GPX or KML file.", response.data)
+        mocked_analysis.assert_not_called()
+        conn = db_store.connect_db(self.temp_dir.name)
+        self.assertIsNone(db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id))
+        conn.close()
+
+    def test_existing_submission_activity_upload_persists_and_renders_artifacts(self) -> None:
+        experience_id = self._create_submission(
+            self.user_id,
+            "Owner",
+            "2026-04-03",
+            "private",
+            {"avg_wind_speed": 16.0, "mean_wind_dir": 225.0, "point_count": 4},
+        )
+        self._set_user(self.user_id)
+        self.client.get("/experience/new")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+
+        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload) as mocked_analysis:
+            response = self.client.post(
+                f"/experiences/{experience_id}/activity-upload",
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("my-session.gpx")},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        mocked_analysis.assert_called_once()
+        wind_context = mocked_analysis.call_args.kwargs["wind_context"]
+        self.assertEqual(wind_context.spot_name, "Valkenburgse meer")
+        self.assertEqual(wind_context.wind_speed_kts, 16.0)
+        self.assertEqual(wind_context.wind_direction_deg, 225.0)
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id)
+        conn.close()
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis["status"], "ok")
+        self.assertEqual(analysis["original_filename"], "my-session.gpx")
+        self.assertEqual(analysis["stats"]["run_count"], 2)
+        self.assertEqual(analysis["artifacts"]["map_html"], "map.html")
+        self.assertIn("timestamps are irregular", analysis["warnings"][0])
+
+        detail = self.client.get(f"/experiences/{experience_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn(b"Activity analysis", detail.data)
+        self.assertIn(b"my-session.gpx", detail.data)
+        self.assertIn(b"GPX", detail.data)
+        self.assertIn(b"OK", detail.data)
+        self.assertIn(b"Upload file", detail.data)
+        self.assertNotIn(b"<label for=\"ActivityFile\">Activity file</label>", detail.data)
+        self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", detail.data)
+        self.assertNotIn(b"Current file:", detail.data)
+        self.assertIn(b"GPS timestamps were somewhat irregular; speed and distance were reconstructed where needed.", detail.data)
+        self.assertNotIn(b"median interval is 0.70s", detail.data)
+        self.assertNotIn(b'class="activity-stats"', detail.data)
+        self.assertNotIn(b"1.23 km", detail.data)
+        self.assertIn(b'class="activity-analysis-frame"', detail.data)
+        self.assertIn(f"/experiences/{experience_id}/activity-artifact/map.html".encode(), detail.data)
+        self.assertIn(b"crosswind", detail.data)
+
+        artifact = self.client.get(f"/experiences/{experience_id}/activity-artifact/map.svg")
+        self.assertEqual(artifact.status_code, 200)
+        self.assertIn(b"<svg", artifact.data)
+        artifact.close()
+        self.assertEqual(self.client.get(f"/experiences/{experience_id}/activity-artifact/../summary.json").status_code, 404)
+
+    def test_optional_activity_upload_during_new_submission(self) -> None:
+        self._set_user(self.user_id)
+        self.client.get("/experience/new")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        form = self._valid_form("private")
+        form["_csrf_token"] = csrf_token
+        form["ActivityFile"] = self._activity_file("new-session.kml")
+
+        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload):
+            response = self.client.post("/experience/new", data=form)
+
+        self.assertEqual(response.status_code, 302)
+        conn = db_store.connect_db(self.temp_dir.name)
+        rows = db_store.list_surf_experiences(conn, self.user_id)
+        experience_id = rows[0]["id"]
+        analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id)
+        conn.close()
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis["file_type"], "kml")
+        self.assertEqual(analysis["status"], "ok")
+
+    def test_failed_activity_analysis_is_stored_without_crashing(self) -> None:
+        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-04", "private")
+        self._set_user(self.user_id)
+        self.client.get(f"/experiences/{experience_id}")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+
+        def failed_analysis(*_args, **_kwargs):
+            return {
+                "status": "error",
+                "analysis_version": "test-version",
+                "input_type": "gpx",
+                "error": "Could not parse activity file",
+                "warnings": ["bad track"],
+            }
+
+        with patch.object(portal, "analyze_session_file", side_effect=failed_analysis):
+            response = self.client.post(
+                f"/experiences/{experience_id}/activity-upload",
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("corrupt.gpx")},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Could not parse activity file", response.data)
+        conn = db_store.connect_db(self.temp_dir.name)
+        analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id)
+        conn.close()
+        self.assertEqual(analysis["status"], "error")
+        self.assertEqual(analysis["errors"], ["Could not parse activity file"])
+        self.assertIn("bad track", analysis["warnings"])
+
+    def test_activity_artifacts_are_owner_only_and_share_page_is_unchanged(self) -> None:
+        public_id = self._create_submission(self.user_id, "Owner", "2026-04-05", "public")
+        self._set_user(self.user_id)
+        self.client.get(f"/experiences/{public_id}")
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload):
+            self.client.post(
+                f"/experiences/{public_id}/activity-upload",
+                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file()},
+            )
+
+        self._set_user(self.other_user_id)
+        self.assertEqual(self.client.get(f"/experiences/{public_id}/activity-artifact/map.svg").status_code, 404)
+        other_detail = self.client.get(f"/experiences/{public_id}")
+        self.assertEqual(other_detail.status_code, 200)
+        self.assertNotIn(b"Activity analysis", other_detail.data)
+
+        conn = db_store.connect_db(self.temp_dir.name)
+        token = db_store.create_or_get_surf_experience_share_token(conn, public_id, self.user_id)
+        conn.close()
+        self._set_user(None)
+        public_share = self.client.get(f"/share/experience/{token}")
+        self.assertEqual(public_share.status_code, 200)
+        self.assertNotIn(b"Activity analysis", public_share.data)
+        self.assertNotIn(b"activity-artifact", public_share.data)
+
 
 
 if __name__ == "__main__":

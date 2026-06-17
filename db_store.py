@@ -390,10 +390,39 @@ def init_account_db(conn: sqlite3.Connection) -> None:
     for column_name, column_type in USER_PROFILE_OPTIONAL_COLUMNS.items():
         if column_name not in existing_profile_columns:
             conn.execute(f"ALTER TABLE user_profiles ADD COLUMN {column_name} {column_type}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS surf_experience_activity_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experience_id INTEGER NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            original_filename TEXT,
+            stored_filename TEXT,
+            file_type TEXT,
+            status TEXT NOT NULL,
+            summary_json TEXT,
+            stats_json TEXT,
+            artifacts_json TEXT,
+            warnings_json TEXT,
+            errors_json TEXT,
+            analysis_version TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(experience_id) REFERENCES surf_experiences(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_user_date ON surf_experiences(user_id, date, start_time)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiences_visibility_date ON surf_experiences(visibility, date, start_time)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_experiences_share_token ON surf_experiences(share_token)")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_analysis_experience
+        ON surf_experience_activity_analysis(experience_id)
+        """
+    )
     conn.commit()
 
 
@@ -2834,6 +2863,125 @@ def get_shared_public_surf_experience(conn: sqlite3.Connection, share_token: str
     if row is None:
         return None
     return get_public_surf_experience(conn, int(row[0]))
+
+
+def _json_load_optional(value: Optional[str], fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def _activity_analysis_from_row(row: tuple[Any, ...]) -> Dict[str, Any]:
+    return {
+        "id": int(row[0]),
+        "experience_id": int(row[1]),
+        "user_id": int(row[2]),
+        "uploaded_at": row[3],
+        "original_filename": row[4] or "",
+        "stored_filename": row[5] or "",
+        "file_type": row[6] or "",
+        "status": row[7],
+        "summary": _json_load_optional(row[8], {}),
+        "stats": _json_load_optional(row[9], {}),
+        "artifacts": _json_load_optional(row[10], {}),
+        "warnings": _json_load_optional(row[11], []),
+        "errors": _json_load_optional(row[12], []),
+        "analysis_version": row[13] or "",
+        "updated_at": row[14],
+    }
+
+
+def upsert_surf_experience_activity_analysis(
+    conn: sqlite3.Connection,
+    analysis: Dict[str, Any],
+) -> int:
+    now = _iso_utc_from_ms(_now_ms())
+    uploaded_at = analysis.get("uploaded_at") or now
+    errors = analysis.get("errors")
+    if isinstance(errors, str):
+        errors = [errors]
+    cur = conn.execute(
+        """
+        INSERT INTO surf_experience_activity_analysis(
+            experience_id, user_id, uploaded_at, original_filename, stored_filename,
+            file_type, status, summary_json, stats_json, artifacts_json, warnings_json,
+            errors_json, analysis_version, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(experience_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            uploaded_at = excluded.uploaded_at,
+            original_filename = excluded.original_filename,
+            stored_filename = excluded.stored_filename,
+            file_type = excluded.file_type,
+            status = excluded.status,
+            summary_json = excluded.summary_json,
+            stats_json = excluded.stats_json,
+            artifacts_json = excluded.artifacts_json,
+            warnings_json = excluded.warnings_json,
+            errors_json = excluded.errors_json,
+            analysis_version = excluded.analysis_version,
+            updated_at = excluded.updated_at
+        """,
+        (
+            int(analysis["experience_id"]),
+            int(analysis["user_id"]),
+            uploaded_at,
+            analysis.get("original_filename") or None,
+            analysis.get("stored_filename") or None,
+            analysis.get("file_type") or None,
+            analysis.get("status") or "error",
+            _json_text(analysis.get("summary")),
+            _json_text(analysis.get("stats")),
+            _json_text(analysis.get("artifacts")),
+            _json_text(analysis.get("warnings") or []),
+            _json_text(errors or []),
+            analysis.get("analysis_version") or None,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM surf_experience_activity_analysis WHERE experience_id = ?",
+        (int(analysis["experience_id"]),),
+    ).fetchone()
+    return int(row[0] if row is not None else cur.lastrowid)
+
+
+def get_surf_experience_activity_analysis(
+    conn: sqlite3.Connection,
+    experience_id: int,
+    user_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if user_id is None:
+        row = conn.execute(
+            """
+            SELECT id, experience_id, user_id, uploaded_at, original_filename, stored_filename,
+                   file_type, status, summary_json, stats_json, artifacts_json, warnings_json,
+                   errors_json, analysis_version, updated_at
+            FROM surf_experience_activity_analysis
+            WHERE experience_id = ?
+            """,
+            (int(experience_id),),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, experience_id, user_id, uploaded_at, original_filename, stored_filename,
+                   file_type, status, summary_json, stats_json, artifacts_json, warnings_json,
+                   errors_json, analysis_version, updated_at
+            FROM surf_experience_activity_analysis
+            WHERE experience_id = ?
+              AND user_id = ?
+            """,
+            (int(experience_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    return _activity_analysis_from_row(row)
 
 
 def create_or_get_surf_experience_share_token(

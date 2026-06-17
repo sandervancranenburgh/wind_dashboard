@@ -69,6 +69,84 @@
         {% endif %}
       </dd>
     </dl>
+    {% if row.is_owner and row.id is defined %}
+      <h2>Activity analysis</h2>
+      <form class="activity-upload-form" method="post" action="{{ url_for('upload_experience_activity', experience_id=row.id) }}" enctype="multipart/form-data">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <div class="activity-upload-row">
+          <div class="activity-file-control">
+            <input class="activity-file-native" id="ActivityFile" name="ActivityFile" type="file" accept=".fit,.gpx,.kml" required>
+            <div class="activity-file-box">
+              <label class="activity-file-trigger" for="ActivityFile">Upload file</label>
+              <div class="activity-file-display" id="ActivityFileDisplay" aria-live="polite">
+                {% if activity_analysis %}
+                  <span class="activity-file-name">{{ activity_analysis.original_filename }}</span>
+                  <span class="activity-file-status">{{ activity_analysis.file_type|upper if activity_analysis.file_type else 'Activity' }} &middot; {{ activity_analysis.status|upper }}</span>
+                {% else %}
+                  <span class="activity-file-name muted">No activity file uploaded</span>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+          <button class="activity-upload-button" type="submit" title="Selecting a new file replaces and re-analyses the current activity.">{{ 'Re-upload' if activity_analysis else 'Upload activity' }}</button>
+        </div>
+      </form>
+      {% if activity_analysis %}
+        <div class="activity-analysis {{ activity_analysis.status }}">
+          {% if activity_analysis.errors %}
+            <div class="analysis-message error">
+              {% for error in activity_analysis.errors %}<p>{{ error }}</p>{% endfor %}
+            </div>
+          {% endif %}
+          {% if activity_analysis.map_html_url %}
+            <iframe class="activity-analysis-frame" src="{{ activity_analysis.map_html_url }}" title="Activity map for this session" loading="lazy" scrolling="auto"></iframe>
+          {% elif activity_analysis.map_svg_url %}
+            <figure class="activity-artifact"><img src="{{ activity_analysis.map_svg_url }}" alt="Activity map for this session"></figure>
+          {% endif %}
+          {% if activity_analysis.plot_urls %}
+            <div class="activity-plots">
+              {% for plot in activity_analysis.plot_urls %}
+                {% if plot.key != 'map_svg' %}
+                  <figure class="activity-artifact">
+                    <img src="{{ plot.url }}" alt="{{ plot.label }}">
+                    <figcaption>{{ plot.label }}</figcaption>
+                  </figure>
+                {% endif %}
+              {% endfor %}
+            </div>
+          {% endif %}
+          {% if activity_analysis.runs %}
+            <div class="table-wrap activity-runs">
+              <table>
+                <thead><tr><th>Run</th><th>Distance</th><th>Mean speed</th><th>Max speed</th><th>Wind angle</th></tr></thead>
+                <tbody>
+                  {% for run in activity_analysis.runs %}
+                    <tr>
+                      <td>{{ run.run_id }}</td>
+                      <td>{{ run.distance_km }} km</td>
+                      <td>{{ run.mean_speed_kmh }} km/h</td>
+                      <td>{{ run.max_speed_kmh }} km/h</td>
+                      <td>{{ run.wind_angle_class or 'n/a' }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endif %}
+          {% if activity_analysis.warnings %}
+            <div class="analysis-message warning compact">
+              <p><span class="analysis-note-prefix">Note:</span> {{ activity_analysis.warnings[0] }}</p>
+              {% if activity_analysis.warnings|length > 1 %}
+                <details>
+                  <summary>{{ activity_analysis.warnings|length - 1 }} more technical note{{ 's' if activity_analysis.warnings|length > 2 else '' }}</summary>
+                  {% for warning in activity_analysis.warnings[1:] %}<p>{{ warning }}</p>{% endfor %}
+                </details>
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
+      {% endif %}
+    {% endif %}
     <h2>Measured wind</h2>
     {% if wind_plot.available %}
       <figure class="wind-plot">
@@ -200,6 +278,97 @@
       </figure>
     {% endif %}
   </main>
+  {% if row.is_owner and row.id is defined %}
+    <script>
+      (() => {
+        const fileInput = document.getElementById("ActivityFile");
+        const fileDisplay = document.getElementById("ActivityFileDisplay");
+        if (fileInput && fileDisplay) {
+          fileInput.addEventListener("change", () => {
+            const file = fileInput.files && fileInput.files[0];
+            if (!file) return;
+            const suffix = file.name.includes(".") ? file.name.split(".").pop().toUpperCase() : "Activity";
+            fileDisplay.replaceChildren();
+            const name = document.createElement("span");
+            name.className = "activity-file-name";
+            name.textContent = file.name;
+            const status = document.createElement("span");
+            status.className = "activity-file-status";
+            status.textContent = `${suffix} · selected`;
+            fileDisplay.append(name, status);
+          });
+        }
+
+        const frames = Array.from(document.querySelectorAll(".activity-analysis-frame"));
+        if (!frames.length) return;
+
+        const MIN_FRAME_HEIGHT = 520;
+        const MAX_FRAME_HEIGHT = 1400;
+        const FRAME_PADDING = 8;
+        const appliedHeights = new WeakMap();
+        const clampHeight = (height) => Math.max(MIN_FRAME_HEIGHT, Math.min(Math.ceil(height), MAX_FRAME_HEIGHT));
+        const resizeFrame = (frame, height) => {
+          if (!Number.isFinite(height) || height <= 0) return;
+          const nextHeight = clampHeight(height + FRAME_PADDING);
+          const previousHeight = appliedHeights.get(frame) || 0;
+          if (Math.abs(nextHeight - previousHeight) < 2) return;
+          appliedHeights.set(frame, nextHeight);
+          frame.style.height = `${nextHeight}px`;
+        };
+        const normalizeLegacyFrame = (doc) => {
+          if (doc.getElementById("analysis-content")) return;
+          if (doc.getElementById("portal-activity-legacy-size-fix")) return;
+          const style = doc.createElement("style");
+          style.id = "portal-activity-legacy-size-fix";
+          style.textContent = `
+            html, body { min-height: 0 !important; }
+            #map { height: clamp(420px, 52vw, 620px) !important; }
+            .dashboard { margin-left: 0 !important; margin-right: 0 !important; max-width: none !important; width: 100% !important; }
+            @media (max-width: 720px) { #map { height: clamp(340px, 70vw, 460px) !important; } }
+          `;
+          doc.head.appendChild(style);
+        };
+        const measuredContentHeight = (doc) => {
+          const content = doc.getElementById("analysis-content");
+          if (content) return content.getBoundingClientRect().height;
+
+          // Legacy generated maps did not have #analysis-content. Measure the known
+          // content blocks instead of body/root height to avoid iframe-height feedback.
+          const blocks = [doc.getElementById("map"), doc.querySelector(".dashboard")].filter(Boolean);
+          if (!blocks.length) return 0;
+          return blocks.reduce((bottom, block) => Math.max(bottom, block.offsetTop + block.offsetHeight), 0);
+        };
+        const measureFrame = (frame) => {
+          try {
+            const doc = frame.contentDocument || frame.contentWindow.document;
+            if (!doc) return;
+            normalizeLegacyFrame(doc);
+            resizeFrame(frame, measuredContentHeight(doc));
+          } catch (error) {
+            // The CSS fallback height plus iframe scrolling keeps the content accessible.
+          }
+        };
+
+        for (const frame of frames) {
+          frame.addEventListener("load", () => {
+            measureFrame(frame);
+            window.setTimeout(() => measureFrame(frame), 350);
+            window.setTimeout(() => measureFrame(frame), 1200);
+          });
+        }
+
+        window.addEventListener("message", (event) => {
+          if (event.origin !== window.location.origin) return;
+          const payload = event.data || {};
+          if (payload.type !== "wingfoil-analysis-height") return;
+          if (payload.source !== "wingfoil-analysis-map") return;
+          if (payload.measuredElement !== "analysis-content") return;
+          const frame = frames.find((candidate) => candidate.contentWindow === event.source);
+          if (frame) resizeFrame(frame, Number(payload.height));
+        });
+      })();
+    </script>
+  {% endif %}
   {% if row.visibility == 'public' and row.is_owner %}
     <script>
       (() => {

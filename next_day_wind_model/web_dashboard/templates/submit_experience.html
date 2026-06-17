@@ -3,9 +3,9 @@
 {% block content %}
   <main class="page">
     <h2>{{ form_title }}</h2>
-    <form method="post" action="{{ form_action }}">
+    <form method="post" action="{{ form_action }}" enctype="multipart/form-data">
       <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-      <div class="experience-form-grid">
+      <div class="form-grid">
         <div>
           <label for="Rider">Rider *</label>
           <input id="Rider" name="Rider" value="{{ form_values.Rider }}" required>
@@ -57,9 +57,16 @@
             {% endfor %}
           </select>
         </div>
-        <div class="form-span-2">
+        <div class="form-row-full">
           <label for="RiderReview">RiderReview</label>
           <textarea id="RiderReview" name="RiderReview">{{ form_values.RiderReview }}</textarea>
+        </div>
+        <div>
+          <label for="RiderWeight">RiderWeight *</label>
+          <div class="unit-field">
+            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
+            <span class="unit">kg</span>
+          </div>
         </div>
         <div>
           <label for="WingSize">WingSize *</label>
@@ -83,20 +90,21 @@
             <span class="unit">cm2</span>
           </div>
         </div>
-        <div>
-          <label for="RiderWeight">RiderWeight *</label>
-          <div class="unit-field">
-            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
-            <span class="unit">kg</span>
-          </div>
-        </div>
-        <div class="form-empty-cell" aria-hidden="true"></div>
-        <div class="form-span-2">
+        <div class="form-row-full">
           <label for="RiderNotes">Private RiderNotes</label>
           <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
           <p class="desc">Only visible to you. Not shown on public submissions.</p>
         </div>
-        <fieldset class="form-span-2">
+        <div class="form-row-full activity-file-control">
+          <input class="activity-file-native" id="ActivityFile" name="ActivityFile" type="file" accept=".fit,.gpx,.kml">
+          <div class="activity-file-box">
+            <label class="activity-file-trigger" for="ActivityFile">Upload file</label>
+            <div class="activity-file-display" id="ActivityFileDisplay" aria-live="polite">
+              <span class="activity-file-name muted">No activity file uploaded</span>
+            </div>
+          </div>
+        </div>
+        <fieldset class="form-row-full">
           <legend>Visibility</legend>
           <div class="choice-group">
             <label class="choice-option">
@@ -152,6 +160,23 @@
     if (startSelect && endSelect) {
       startSelect.addEventListener("change", () => syncEndOptions(true));
       syncEndOptions();
+    }
+    const activityFileInput = document.getElementById("ActivityFile");
+    const activityFileDisplay = document.getElementById("ActivityFileDisplay");
+    if (activityFileInput && activityFileDisplay) {
+      activityFileInput.addEventListener("change", () => {
+        const file = activityFileInput.files && activityFileInput.files[0];
+        if (!file) return;
+        const suffix = file.name.includes(".") ? file.name.split(".").pop().toUpperCase() : "Activity";
+        activityFileDisplay.replaceChildren();
+        const name = document.createElement("span");
+        name.className = "activity-file-name";
+        name.textContent = file.name;
+        const status = document.createElement("span");
+        status.className = "activity-file-status";
+        status.textContent = `${suffix} · selected`;
+        activityFileDisplay.append(name, status);
+      });
     }
   </script>
 {% endblock %}

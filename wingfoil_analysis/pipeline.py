@@ -1051,10 +1051,16 @@ def write_map_html(
     min_speed_mps = min(run_speeds, default=0.0)
     max_speed_mps = max(run_speeds, default=max((sample.smooth_speed_mps for sample in samples), default=1.0))
     run_ranges = [(run.start_index, run.end_index) for run in runs]
+    sample_run_ids: list[int | None] = [None for _sample in samples]
+    for run in runs:
+        for sample_index in range(run.start_index, run.end_index + 1):
+            if 0 <= sample_index < len(sample_run_ids):
+                sample_run_ids[sample_index] = run.run_id
     falls_payload = [fall_to_dict(fall) for fall in falls]
     segments = []
     for previous, sample in zip(samples, samples[1:]):
         in_run = sample.in_run and previous.in_run
+        run_id = sample_run_ids[sample.index] if in_run and 0 <= sample.index < len(sample_run_ids) else None
         speed_mps = sample.smooth_speed_mps
         segments.append(
             {
@@ -1067,6 +1073,7 @@ def write_map_html(
                 "weight": 5 if in_run else 2,
                 "opacity": 0.92 if in_run else 0.42,
                 "in_run": in_run,
+                "run_id": run_id,
             }
         )
 
@@ -1180,6 +1187,8 @@ def write_map_html(
       margin: 5px 0 4px;
     }}
     .speed-title {{ color: var(--text); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; }}
+    .falls-toggle {{ cursor: pointer; font-size: 12px; font-weight: 850; }}
+    .falls-toggle.is-off {{ color: var(--muted); opacity: 0.68; }}
     .legend-row {{ align-items: center; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; font-size: 10px; }}
     .wind-panel {{ max-width: 178px; }}
     .wind-content {{ align-items: center; display: flex; gap: 8px; }}
@@ -1257,6 +1266,8 @@ const labels = L.tileLayer(
 ).addTo(map);
 const lineLayer = L.layerGroup().addTo(map);
 const fallLayer = L.layerGroup().addTo(map);
+const segmentLayers = [];
+window.wingfoilRunLayers = segmentLayers;
 map.fitBounds(data.bounds, {{ padding: [28, 28] }});
 
 for (const segment of data.segments) {{
@@ -1267,29 +1278,84 @@ for (const segment of data.segments) {{
     lineCap: "round"
   }});
   if (segment.in_run) {{
-    line.bindTooltip(`${{segment.speed_kmh}} km/h<br>${{segment.speed_knots}} kt`, {{ sticky: true }});
+    const speedKmh = Number(segment.speed_kmh);
+    line.bindTooltip(`Run ${{segment.run_id}}<br>Speed: ${{Number.isFinite(speedKmh) ? speedKmh.toFixed(1) : segment.speed_kmh}} km/h`, {{ sticky: true }});
   }}
   line.addTo(lineLayer);
+  segmentLayers.push({{ line, inRun: Boolean(segment.in_run), run_id: String(segment.run_id || "") }});
 }}
 
-L.circleMarker(data.start, {{ radius: 7, color: "#ffffff", weight: 2, fillColor: "#10b981", fillOpacity: 1 }})
+function applyWingfoilRunSelection(selectedRunIds) {{
+  const selected = new Set((selectedRunIds || []).map((runId) => String(runId)).filter((runId) => runId !== ""));
+  const showAllRuns = selected.size === 0;
+  for (const item of segmentLayers) {{
+    const shouldShow = !item.inRun || showAllRuns || selected.has(item.run_id);
+    const isVisible = lineLayer.hasLayer(item.line);
+    if (shouldShow && !isVisible) item.line.addTo(lineLayer);
+    if (!shouldShow && isVisible) lineLayer.removeLayer(item.line);
+  }}
+  window.__wingfoilMapDebug.selectedRunIds = Array.from(selected);
+}}
+
+window.applyWingfoilRunSelection = applyWingfoilRunSelection;
+window.addEventListener("message", (event) => {{
+  const payload = event.data || {{}};
+  if (payload.type !== "wingfoil-run-selection") return;
+  applyWingfoilRunSelection(payload.selectedRunIds || payload.runIds || []);
+}});
+
+L.circleMarker(data.start, {{ radius: 5, color: "rgba(255,255,255,0.82)", weight: 1.5, fillColor: "#10b981", fillOpacity: 0.72, opacity: 0.86 }})
   .bindPopup("Start").addTo(map);
-L.circleMarker(data.end, {{ radius: 7, color: "#ffffff", weight: 2, fillColor: "#111827", fillOpacity: 1 }})
+L.circleMarker(data.end, {{ radius: 5, color: "rgba(255,255,255,0.78)", weight: 1.5, fillColor: "#334155", fillOpacity: 0.74, opacity: 0.86 }})
   .bindPopup("End").addTo(map);
 
 for (const fall of data.falls) {{
   L.circleMarker([fall.lat, fall.lon], {{
-    radius: 8,
-    color: "#ffffff",
-    weight: 2,
-    fillColor: "#dc2626",
-    fillOpacity: 0.95
-  }}).bindPopup(`Fall ${{fall.fall_id}}<br>${{fall.time}}<br>${{fall.speed_after_mps}} m/s`).addTo(fallLayer);
+    radius: 4,
+    color: "rgba(127, 29, 29, 0.72)",
+    weight: 1.2,
+    fillColor: "#ef4444",
+    fillOpacity: 0.62,
+    opacity: 0.72
+  }}).bindTooltip(`Fall ${{fall.fall_id}}`, {{ sticky: true }}).addTo(fallLayer);
 }}
+
+let fallsVisible = true;
+function setFallsVisible(visible) {{
+  fallsVisible = Boolean(visible);
+  if (fallsVisible) {{
+    if (!map.hasLayer(fallLayer)) fallLayer.addTo(map);
+  }} else if (map.hasLayer(fallLayer)) {{
+    map.removeLayer(fallLayer);
+  }}
+  const button = document.querySelector(".falls-toggle");
+  if (button) {{
+    button.classList.toggle("is-off", !fallsVisible);
+    button.setAttribute("aria-pressed", fallsVisible ? "true" : "false");
+  }}
+  if (window.__wingfoilMapDebug) window.__wingfoilMapDebug.fallsVisible = fallsVisible;
+}}
+
+const fallsToggle = L.control({{ position: "topright" }});
+fallsToggle.onAdd = function() {{
+  const button = L.DomUtil.create("button", "map-overlay falls-toggle");
+  button.type = "button";
+  button.textContent = "Falls";
+  button.setAttribute("aria-pressed", "true");
+  L.DomEvent.disableClickPropagation(button);
+  L.DomEvent.on(button, "click", (event) => {{
+    L.DomEvent.preventDefault(event);
+    setFallsVisible(!fallsVisible);
+  }});
+  return button;
+}};
+fallsToggle.addTo(map);
 window.__wingfoilMapDebug = {{
   segmentCount: data.segments.length,
   fallCount: data.falls.length,
   runCount: data.runs.length,
+  selectedRunIds: [],
+  fallsVisible: true,
   bounds: data.bounds,
   sourceFilename: data.source_filename,
   windContext: data.wind_context

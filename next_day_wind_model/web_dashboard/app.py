@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
     g,
@@ -620,13 +621,21 @@ def _read_activity_runs(analysis: dict[str, Any], output_dir: Path) -> list[dict
                         distance_m = str(round(float(distance_m))) if distance_m else ""
                     except (TypeError, ValueError):
                         distance_m = str(distance_m)
+                def one_decimal(value: str | None) -> str:
+                    if value is None or value == "":
+                        return ""
+                    try:
+                        return f"{float(value):.1f}"
+                    except (TypeError, ValueError):
+                        return str(value)
+
                 rows.append(
                     {
                         "run_id": row.get("run_id") or "",
                         "distance_m": distance_m,
                         "distance_km": row.get("distance_km") or "",
-                        "mean_speed_kmh": row.get("mean_speed_kmh") or "",
-                        "max_speed_kmh": row.get("max_speed_kmh") or "",
+                        "mean_speed_kmh": one_decimal(row.get("mean_speed_kmh")),
+                        "max_speed_kmh": one_decimal(row.get("max_speed_kmh")),
                         "wind_angle_class": row.get("wind_angle_class") or "",
                     }
                 )
@@ -705,6 +714,116 @@ def _activity_analysis_view_model(
         "runs": _read_activity_runs(analysis, output_dir),
     }
 
+
+
+def _map_html_selection_shim() -> str:
+    return """
+<script>
+(() => {
+  try {
+    if (typeof data === "undefined" || typeof lineLayer === "undefined") return;
+    const layers = typeof lineLayer.getLayers === "function" ? lineLayer.getLayers() : [];
+    const runs = Array.isArray(data.runs) ? data.runs : [];
+    const segments = Array.isArray(data.segments) ? data.segments : [];
+    const runIdForSegment = (segmentIndex) => {
+      const sampleIndex = segmentIndex + 1;
+      const run = runs.find((candidate) => sampleIndex >= Number(candidate.start_index) && sampleIndex <= Number(candidate.end_index));
+      return run && run.run_id !== undefined ? String(run.run_id) : "";
+    };
+    const segmentLayers = segments.map((segment, index) => ({
+      line: layers[index],
+      inRun: Boolean(segment.in_run),
+      run_id: String(segment.run_id || runIdForSegment(index)),
+      speedKmh: Number(segment.speed_kmh),
+    })).filter((item) => item.line);
+    for (const item of segmentLayers) {
+      if (!item.inRun) continue;
+      item.line.bindTooltip(`Run ${item.run_id}<br>Speed: ${Number.isFinite(item.speedKmh) ? item.speedKmh.toFixed(1) : "n/a"} km/h`, { sticky: true });
+    }
+    window.wingfoilRunLayers = segmentLayers;
+    window.applyWingfoilRunSelection = (selectedRunIds) => {
+      const selected = new Set((selectedRunIds || []).map((runId) => String(runId)).filter((runId) => runId !== ""));
+      const showAllRuns = selected.size === 0;
+      for (const item of segmentLayers) {
+        const shouldShow = !item.inRun || showAllRuns || selected.has(item.run_id);
+        const isVisible = lineLayer.hasLayer(item.line);
+        if (shouldShow && !isVisible) item.line.addTo(lineLayer);
+        if (!shouldShow && isVisible) lineLayer.removeLayer(item.line);
+      }
+      if (window.__wingfoilMapDebug) window.__wingfoilMapDebug.selectedRunIds = Array.from(selected);
+    };
+    window.addEventListener("message", (event) => {
+      const payload = event.data || {};
+      if (payload.type !== "wingfoil-run-selection") return;
+      window.applyWingfoilRunSelection(payload.selectedRunIds || payload.runIds || []);
+    });
+
+    if (typeof fallLayer !== "undefined") {
+      const fallMarkers = typeof fallLayer.getLayers === "function" ? fallLayer.getLayers() : [];
+      for (const marker of fallMarkers) {
+        if (typeof marker.setStyle === "function") {
+          marker.setStyle({ radius: 4, color: "rgba(127, 29, 29, 0.72)", weight: 1.2, fillColor: "#ef4444", fillOpacity: 0.62, opacity: 0.72 });
+        }
+      }
+      let fallsVisible = true;
+      window.setWingfoilFallsVisible = (visible) => {
+        fallsVisible = Boolean(visible);
+        if (fallsVisible) {
+          if (!map.hasLayer(fallLayer)) fallLayer.addTo(map);
+        } else if (map.hasLayer(fallLayer)) {
+          map.removeLayer(fallLayer);
+        }
+        const button = document.querySelector(".falls-toggle");
+        if (button) {
+          button.classList.toggle("is-off", !fallsVisible);
+          button.setAttribute("aria-pressed", fallsVisible ? "true" : "false");
+        }
+        if (window.__wingfoilMapDebug) window.__wingfoilMapDebug.fallsVisible = fallsVisible;
+      };
+      if (!document.querySelector(".falls-toggle") && typeof L !== "undefined") {
+        const fallsToggle = L.control({ position: "topright" });
+        fallsToggle.onAdd = function() {
+          const button = L.DomUtil.create("button", "map-overlay falls-toggle");
+          button.type = "button";
+          button.textContent = "Falls";
+          button.setAttribute("aria-pressed", "true");
+          L.DomEvent.disableClickPropagation(button);
+          L.DomEvent.on(button, "click", (event) => {
+            L.DomEvent.preventDefault(event);
+            window.setWingfoilFallsVisible(!fallsVisible);
+          });
+          return button;
+        };
+        fallsToggle.addTo(map);
+      }
+    }
+
+    if (typeof map !== "undefined" && typeof fallLayer !== "undefined") {
+      const fallMarkers = new Set(typeof fallLayer.getLayers === "function" ? fallLayer.getLayers() : []);
+      map.eachLayer((layer) => {
+        if (!fallMarkers.has(layer) && typeof layer.setStyle === "function" && typeof layer.getLatLng === "function") {
+          layer.setStyle({ radius: 5, weight: 1.5, opacity: 0.86, fillOpacity: 0.72 });
+        }
+      });
+    }
+  } catch (error) {
+  }
+})();
+</script>
+"""
+
+
+def _send_activity_artifact_file(output_dir: Path, filename: str, artifact_path: Path):
+    if filename == "map.html":
+        try:
+            html = artifact_path.read_text(encoding="utf-8")
+        except OSError:
+            abort(404)
+        shim = _map_html_selection_shim()
+        if "applyWingfoilRunSelection" not in html or "falls-toggle" not in html:
+            html = html.replace("</body>", f"{shim}\n</body>") if "</body>" in html else f"{html}\n{shim}"
+        return Response(html, mimetype="text/html")
+    return send_from_directory(output_dir, filename)
 
 def _store_activity_analysis_result(
     conn,
@@ -1511,7 +1630,7 @@ def _send_registered_activity_artifact(experience_id: int, filename: str, analys
         abort(404)
     if not artifact_path.is_file():
         abort(404)
-    return send_from_directory(output_dir, filename)
+    return _send_activity_artifact_file(output_dir, filename, artifact_path)
 
 
 @app.route("/experiences/<int:experience_id>/activity-artifact/<path:filename>")

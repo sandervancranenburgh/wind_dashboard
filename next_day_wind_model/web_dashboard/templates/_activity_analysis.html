@@ -24,15 +24,28 @@
   {% if activity_analysis.runs %}
     <div class="table-wrap activity-runs">
       <table>
-        <thead><tr><th>Run</th><th>Distance (m)</th><th>Mean speed</th><th>Max speed</th><th>Wind angle</th></tr></thead>
+        <thead>
+          <tr>
+            <th><button class="activity-sort-button" type="button" data-sort-index="0" data-sort-type="number" aria-label="Sort by run">Run <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th><button class="activity-sort-button" type="button" data-sort-index="1" data-sort-type="number" aria-label="Sort by distance">Distance (m) <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th><button class="activity-sort-button" type="button" data-sort-index="2" data-sort-type="number" aria-label="Sort by mean speed">Mean speed <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th><button class="activity-sort-button" type="button" data-sort-index="3" data-sort-type="number" aria-label="Sort by max speed">Max speed <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th><button class="activity-sort-button" type="button" data-sort-index="4" data-sort-type="text" aria-label="Sort by wind angle">Wind angle <span class="sort-indicator" aria-hidden="true"></span></button></th>
+          </tr>
+        </thead>
         <tbody>
           {% for run in activity_analysis.runs %}
-            <tr>
-              <td>{{ run.run_id }}</td>
-              <td>{{ run.distance_m }} m</td>
-              <td>{{ run.mean_speed_kmh }} km/h</td>
-              <td>{{ run.max_speed_kmh }} km/h</td>
-              <td>{{ run.wind_angle_class or 'n/a' }}</td>
+            <tr class="activity-run-row" data-run-id="{{ run.run_id }}">
+              <td data-sort-value="{{ run.run_id }}">
+                <label class="run-select-label">
+                  <input class="run-select-checkbox" type="checkbox" value="{{ run.run_id }}" aria-label="Show run {{ run.run_id }} on map">
+                  <span>{{ run.run_id }}</span>
+                </label>
+              </td>
+              <td data-sort-value="{{ run.distance_m }}">{{ run.distance_m }} m</td>
+              <td data-sort-value="{{ run.mean_speed_kmh }}">{{ run.mean_speed_kmh }} km/h</td>
+              <td data-sort-value="{{ run.max_speed_kmh }}">{{ run.max_speed_kmh }} km/h</td>
+              <td data-sort-value="{{ run.wind_angle_class or 'n/a' }}">{{ run.wind_angle_class or 'n/a' }}</td>
             </tr>
           {% endfor %}
         </tbody>
@@ -49,5 +62,117 @@
         </details>
       {% endif %}
     </div>
+  {% endif %}
+  {% if activity_analysis.runs and activity_analysis.map_html_url %}
+    <script>
+      (() => {
+        const root = document.currentScript.closest(".activity-analysis");
+        if (!root) return;
+        const frame = root.querySelector(".activity-analysis-frame");
+        const table = root.querySelector(".activity-runs table");
+        const tbody = table ? table.querySelector("tbody") : null;
+        const rows = Array.from(root.querySelectorAll(".activity-run-row"));
+        const checkboxes = Array.from(root.querySelectorAll(".run-select-checkbox"));
+        const sortButtons = Array.from(root.querySelectorAll(".activity-sort-button"));
+        let activeSort = { index: null, direction: "asc" };
+        if (!frame || !checkboxes.length) return;
+
+        const selectedRunIds = () => checkboxes
+          .filter((checkbox) => checkbox.checked)
+          .map((checkbox) => checkbox.value)
+          .filter((value) => value !== "");
+
+        const syncSelectedRows = () => {
+          for (const row of rows) {
+            const checkbox = row.querySelector(".run-select-checkbox");
+            row.classList.toggle("is-selected", Boolean(checkbox && checkbox.checked));
+          }
+        };
+
+        const sendSelection = () => {
+          syncSelectedRows();
+          if (!frame.contentWindow) return;
+          const ids = selectedRunIds();
+          try {
+            if (typeof frame.contentWindow.applyWingfoilRunSelection === "function") {
+              frame.contentWindow.applyWingfoilRunSelection(ids);
+            }
+          } catch (error) {
+          }
+          frame.contentWindow.postMessage({
+            type: "wingfoil-run-selection",
+            selectedRunIds: ids,
+          }, "*");
+        };
+
+        const sortValue = (row, index, type) => {
+          const cell = row.children[index];
+          const raw = cell ? (cell.dataset.sortValue || cell.textContent || "") : "";
+          if (type === "number") {
+            const parsed = Number.parseFloat(String(raw).replace(/[^0-9.+-]/g, ""));
+            return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+          }
+          return String(raw).trim().toLocaleLowerCase();
+        };
+
+        const updateSortIndicators = () => {
+          for (const button of sortButtons) {
+            const indicator = button.querySelector(".sort-indicator");
+            const isActive = activeSort.index !== null && Number(button.dataset.sortIndex) === activeSort.index;
+            button.classList.toggle("is-active", isActive);
+            button.setAttribute("aria-sort", isActive ? (activeSort.direction === "asc" ? "ascending" : "descending") : "none");
+            if (indicator) indicator.textContent = isActive ? (activeSort.direction === "asc" ? "▲" : "▼") : "";
+          }
+        };
+
+        const sortRows = (index, type, direction) => {
+          if (!tbody) return;
+          const multiplier = direction === "asc" ? 1 : -1;
+          const sortedRows = Array.from(tbody.querySelectorAll(".activity-run-row"));
+          sortedRows.sort((left, right) => {
+            const leftValue = sortValue(left, index, type);
+            const rightValue = sortValue(right, index, type);
+            if (typeof leftValue === "number" && typeof rightValue === "number") {
+              return (leftValue - rightValue) * multiplier;
+            }
+            return String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true }) * multiplier;
+          });
+          for (const row of sortedRows) tbody.appendChild(row);
+          updateSortIndicators();
+          sendSelection();
+        };
+
+        for (const button of sortButtons) {
+          button.addEventListener("click", () => {
+            const index = Number(button.dataset.sortIndex);
+            const type = button.dataset.sortType || "text";
+            if (!Number.isFinite(index)) return;
+            const direction = activeSort.index === index && activeSort.direction === "asc" ? "desc" : "asc";
+            activeSort = { index, direction };
+            sortRows(index, type, direction);
+          });
+        }
+        updateSortIndicators();
+
+        for (const row of rows) {
+          row.addEventListener("click", (event) => {
+            if (event.target instanceof Element && event.target.closest(".run-select-label")) return;
+            const checkbox = row.querySelector(".run-select-checkbox");
+            if (!checkbox) return;
+            checkbox.checked = !checkbox.checked;
+            sendSelection();
+          });
+        }
+        for (const checkbox of checkboxes) {
+          checkbox.addEventListener("change", sendSelection);
+        }
+        frame.addEventListener("load", () => {
+          sendSelection();
+          window.setTimeout(sendSelection, 250);
+          window.setTimeout(sendSelection, 1000);
+        });
+        window.setTimeout(sendSelection, 0);
+      })();
+    </script>
   {% endif %}
 </div>

@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1973,6 +1973,61 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/share/experience/{private_id}").status_code, 404)
         self.assertEqual(self.client.get(f"/share/experience/{private_id}/activity-artifact/map.svg").status_code, 404)
 
+    def test_native_run_direction_arrow_targets_follow_spacing_rules(self) -> None:
+        cases = {
+            42: [21.0],
+            50: [25.0],
+            74: [25.0],
+            120: [25.0, 75.0],
+            226: [25.0, 75.0, 125.0, 175.0],
+            230: [25.0, 75.0, 125.0, 175.0],
+            260: [25.0, 75.0, 125.0, 175.0, 225.0],
+        }
+        for distance_m, expected_targets in cases.items():
+            with self.subTest(distance_m=distance_m):
+                self.assertEqual(wingfoil_pipeline.run_direction_arrow_targets(distance_m), expected_targets)
+        self.assertEqual(
+            wingfoil_pipeline.run_direction_arrow_candidate_targets(260),
+            [25.0, 50.0, 75.0, 125.0, 150.0, 175.0, 200.0, 225.0],
+        )
+
+    def test_native_run_direction_arrows_use_run_geometry_and_run_id(self) -> None:
+        base_time = datetime(2026, 1, 20, 11, 0, tzinfo=timezone.utc)
+
+        def make_samples(segment_distances: list[float]) -> list[wingfoil_pipeline.Sample]:
+            return [
+                wingfoil_pipeline.Sample(
+                    index=index,
+                    lat=52.0,
+                    lon=4.0 + index * 0.0001,
+                    ele_m=None,
+                    time=base_time + timedelta(seconds=index),
+                    dt_s=0.0 if index == 0 else 1.0,
+                    segment_distance_m=segment_distance,
+                    speed_mps=8.0 if index else 0.0,
+                    smooth_speed_mps=8.0 if index else 0.0,
+                    in_run=True,
+                )
+                for index, segment_distance in enumerate(segment_distances)
+            ]
+
+        short_samples = make_samples([0.0, 10.0, 10.0, 10.0, 12.0])
+        short_run = wingfoil_pipeline.build_run(3, short_samples, 0, len(short_samples) - 1, min_run_duration_s=1)
+        self.assertIsNotNone(short_run)
+        short_arrows = wingfoil_pipeline.run_direction_arrows(short_samples, [short_run])
+        self.assertEqual([arrow["target_distance_m"] for arrow in short_arrows], [21.0])
+        self.assertEqual(short_arrows[0]["run_id"], 3)
+        self.assertEqual(short_arrows[0]["run_distance_m"], 42.0)
+        self.assertAlmostEqual(short_arrows[0]["bearing_deg"], 90.0, delta=1.0)
+
+        long_samples = make_samples([0.0] + [10.0] * 26)
+        long_run = wingfoil_pipeline.build_run(9, long_samples, 0, len(long_samples) - 1, min_run_duration_s=1)
+        self.assertIsNotNone(long_run)
+        long_arrows = wingfoil_pipeline.run_direction_arrows(long_samples, [long_run])
+        self.assertEqual([arrow["target_distance_m"] for arrow in long_arrows], [25.0, 50.0, 75.0, 125.0, 150.0, 175.0, 200.0, 225.0])
+        self.assertEqual({arrow["run_id"] for arrow in long_arrows}, {9})
+        self.assertTrue(all(89.0 <= arrow["bearing_deg"] <= 91.0 for arrow in long_arrows))
+
     def test_tcx_parser_loads_namespaced_trackpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tcx_path = Path(temp_dir) / "session.tcx"
@@ -2025,6 +2080,20 @@ class RiderPortalTest(unittest.TestCase):
 
         self.assertNotIn(sensitive_name, summary_text)
         self.assertNotIn(sensitive_name, map_text)
+        self.assertIn('"run_detection_source": "native"', summary_text)
+        self.assertIn('"run_arrows":', map_text)
+        self.assertIn("leaflet-providers", map_text)
+        self.assertIn("Stadia.AlidadeSatellite", map_text)
+        self.assertIn("Stadia.Outdoors", map_text)
+        self.assertIn("tiles.stadiamaps.com/tiles/alidade_satellite", map_text)
+        self.assertIn("tiles.stadiamaps.com/tiles/outdoors", map_text)
+        self.assertIn("run-direction-arrow-svg", map_text)
+        self.assertIn('viewBox="0 0 28 16"', map_text)
+        self.assertIn('d="M2 8 H20 M14 2 L22 8 L14 14"', map_text)
+        self.assertIn("arrowZoomStyle", map_text)
+        self.assertIn("refreshDirectionArrows", map_text)
+        self.assertIn("visibleArrowCount", map_text)
+        self.assertIn("run_distance_m", map_text)
 
 
 if __name__ == "__main__":

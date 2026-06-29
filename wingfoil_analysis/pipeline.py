@@ -1017,6 +1017,75 @@ def weighted_mean_bearing_deg(samples: list[Sample]) -> float | None:
     return normalize_degrees(math.degrees(math.atan2(y, x)))
 
 
+def run_direction_arrow_targets(total_run_distance_m: float) -> list[float]:
+    if total_run_distance_m <= 0:
+        return []
+    if total_run_distance_m < 50.0:
+        return [total_run_distance_m / 2.0]
+
+    targets = []
+    distance_m = 25.0
+    while distance_m <= total_run_distance_m - 25.0 + 1e-9:
+        targets.append(distance_m)
+        distance_m += 50.0
+    return targets
+
+
+def run_direction_arrow_candidate_targets(total_run_distance_m: float) -> list[float]:
+    targets = set(run_direction_arrow_targets(total_run_distance_m))
+    if total_run_distance_m >= 50.0:
+        for spacing_m in (100.0, 150.0):
+            distance_m = 50.0
+            while distance_m <= total_run_distance_m - 50.0 + 1e-9:
+                targets.add(distance_m)
+                distance_m += spacing_m
+    return sorted(targets)
+
+
+def run_direction_arrows(samples: list[Sample], runs: list[Run]) -> list[dict[str, float | int]]:
+    arrows: list[dict[str, float | int]] = []
+    for run in runs:
+        run_samples = samples[run.start_index : run.end_index + 1]
+        if len(run_samples) < 2:
+            continue
+
+        targets = run_direction_arrow_candidate_targets(run.distance_m)
+        if not targets and run.distance_m > 0:
+            targets = [run.distance_m / 2.0]
+        target_index = 0
+        cumulative_distance_m = 0.0
+
+        for previous, sample in zip(run_samples, run_samples[1:]):
+            segment_distance_m = max(float(sample.segment_distance_m), 0.0)
+            if segment_distance_m <= 0:
+                continue
+
+            if haversine_m(previous.lat, previous.lon, sample.lat, sample.lon) <= 0.05:
+                cumulative_distance_m += segment_distance_m
+                while target_index < len(targets) and targets[target_index] <= cumulative_distance_m + 1e-9:
+                    target_index += 1
+                continue
+
+            while target_index < len(targets) and targets[target_index] <= cumulative_distance_m + segment_distance_m + 1e-9:
+                target_distance_m = targets[target_index]
+                ratio = min(max((target_distance_m - cumulative_distance_m) / segment_distance_m, 0.0), 1.0)
+                arrows.append(
+                    {
+                        "run_id": run.run_id,
+                        "run_distance_m": round(run.distance_m, 1),
+                        "target_distance_m": round(target_distance_m, 1),
+                        "lat": round(previous.lat + (sample.lat - previous.lat) * ratio, 7),
+                        "lon": round(previous.lon + (sample.lon - previous.lon) * ratio, 7),
+                        "bearing_deg": round(bearing_degrees(previous.lat, previous.lon, sample.lat, sample.lon), 1),
+                    }
+                )
+                target_index += 1
+
+            cumulative_distance_m += segment_distance_m
+
+    return arrows
+
+
 def build_wind_context(
     wind_json: str | Path | None = None,
     wind_direction_deg: float | None = None,
@@ -1203,6 +1272,7 @@ def write_map_html(
             if 0 <= sample_index < len(sample_run_ids):
                 sample_run_ids[sample_index] = run.run_id
     falls_payload = [fall_to_dict(fall) for fall in falls]
+    run_arrows = run_direction_arrows(samples, runs)
     segments = []
     for previous, sample in zip(samples, samples[1:]):
         in_run = sample.in_run and previous.in_run
@@ -1245,6 +1315,7 @@ def write_map_html(
     payload = {
         "source_filename": "activity",
         "source_format": source_activity.suffix.lower().lstrip("."),
+        "run_detection_source": "native",
         "center": [statistics.mean(sample.lat for sample in samples), statistics.mean(sample.lon for sample in samples)],
         "bounds": [[min(sample.lat for sample in samples), min(sample.lon for sample in samples)], [max(sample.lat for sample in samples), max(sample.lon for sample in samples)]],
         "activity": {
@@ -1260,10 +1331,12 @@ def write_map_html(
             "water_time_formatted": format_duration_s(water_time_s),
             "foil_time_s": round(foil_time_s, 1),
             "foil_time_formatted": format_duration_s(foil_time_s),
+            "run_detection_source": "native",
         },
         "wind_context": map_wind_payload,
         "wind_label": wind_label,
         "segments": segments,
+        "run_arrows": run_arrows,
         "runs": [run_to_dict(run) | {"start_index": run.start_index, "end_index": run.end_index} for run in runs],
         "run_ranges": run_ranges,
         "falls": falls_payload,
@@ -1335,6 +1408,15 @@ def write_map_html(
     .speed-title {{ color: var(--text); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; }}
     .falls-toggle {{ cursor: pointer; font-size: 12px; font-weight: 850; }}
     .falls-toggle.is-off {{ color: var(--muted); opacity: 0.68; }}
+    .run-direction-arrow-icon {{ background: transparent; border: 0; pointer-events: none; }}
+    .run-direction-arrow-svg {{
+      display: block;
+      filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.58));
+      overflow: visible;
+      transform-origin: 50% 50%;
+    }}
+    .run-direction-arrow-outline {{ fill: none; stroke: rgba(7, 17, 31, 0.72); stroke-linecap: round; stroke-linejoin: round; stroke-width: 4.2; }}
+    .run-direction-arrow-stroke {{ fill: none; stroke: rgba(248, 250, 252, 0.72); stroke-linecap: round; stroke-linejoin: round; stroke-width: 2.1; }}
     .legend-row {{ align-items: center; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; font-size: 10px; }}
     .wind-panel {{ max-width: 178px; }}
     .wind-content {{ align-items: center; display: flex; gap: 8px; }}
@@ -1399,21 +1481,40 @@ def write_map_html(
   </section>
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-providers@2.0.0/leaflet-providers.js"></script>
 <script>
 const data = {data_json};
 const map = L.map("map", {{ preferCanvas: true }});
-const satellite = L.tileLayer(
-  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
-  {{ maxZoom: 19, attribution: "Tiles &copy; Esri" }}
-).addTo(map);
-const labels = L.tileLayer(
-  "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}",
-  {{ maxZoom: 19, attribution: "Labels &copy; Esri" }}
-).addTo(map);
+const stadiaAttribution = '&copy; <a href="https://www.stadiamaps.com/" target="_blank" rel="noopener">Stadia Maps</a> &copy; <a href="https://openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors';
+const stadiaFallbacks = {{
+  "Stadia.AlidadeSatellite": ["https://tiles.stadiamaps.com/tiles/alidade_satellite/{{z}}/{{x}}/{{y}}{{r}}.jpg", {{ maxZoom: 20, attribution: stadiaAttribution }}],
+  "Stadia.Outdoors": ["https://tiles.stadiamaps.com/tiles/outdoors/{{z}}/{{x}}/{{y}}{{r}}.png", {{ maxZoom: 20, attribution: stadiaAttribution }}],
+}};
+function stadiaBaseLayer(providerName) {{
+  if (L.tileLayer.provider) {{
+    try {{
+      return L.tileLayer.provider(providerName);
+    }} catch (error) {{
+    }}
+  }}
+  const fallback = stadiaFallbacks[providerName];
+  return L.tileLayer(fallback[0], fallback[1]);
+}}
+const satellite = stadiaBaseLayer("Stadia.AlidadeSatellite").addTo(map);
+const outdoors = stadiaBaseLayer("Stadia.Outdoors");
+const baseMaps = {{
+  "Satellite": satellite,
+  "Outdoors": outdoors,
+}};
+L.control.layers(baseMaps, null, {{ collapsed: true, position: "topright" }}).addTo(map);
 const lineLayer = L.layerGroup().addTo(map);
+const arrowLayer = L.layerGroup().addTo(map);
 const fallLayer = L.layerGroup().addTo(map);
 const segmentLayers = [];
+const arrowMarkers = [];
+const selectedWingfoilRunIds = new Set();
 window.wingfoilRunLayers = segmentLayers;
+window.wingfoilArrowLayers = arrowMarkers;
 map.fitBounds(data.bounds, {{ padding: [28, 28] }});
 
 for (const segment of data.segments) {{
@@ -1431,16 +1532,85 @@ for (const segment of data.segments) {{
   segmentLayers.push({{ line, inRun: Boolean(segment.in_run), run_id: String(segment.run_id || "") }});
 }}
 
+function arrowZoomStyle(zoom) {{
+  if (zoom <= 14) return null;
+  if (zoom === 15) return {{ minDistanceM: 50, spacingM: 150, endBufferM: 50, width: 11, height: 6 }};
+  if (zoom === 16) return {{ minDistanceM: 50, spacingM: 100, endBufferM: 50, width: 13, height: 7 }};
+  return {{ minDistanceM: 25, spacingM: 50, endBufferM: 25, width: 15, height: 9 }};
+}}
+
+function runDirectionArrowIcon(bearingDeg, style) {{
+  const rotation = Number.isFinite(Number(bearingDeg)) ? Number(bearingDeg) : 0;
+  const width = style.width;
+  const height = style.height;
+  return L.divIcon({{
+    className: "run-direction-arrow-icon",
+    html: `
+      <svg class="run-direction-arrow-svg" width="${{width}}" height="${{height}}" viewBox="0 0 28 16" aria-hidden="true" focusable="false" style="transform: rotate(${{rotation.toFixed(1)}}deg);">
+        <g transform="rotate(-90 14 8)">
+          <path class="run-direction-arrow-outline" d="M2 8 H20 M14 2 L22 8 L14 14" />
+          <path class="run-direction-arrow-stroke" d="M2 8 H20 M14 2 L22 8 L14 14" />
+        </g>
+      </svg>`,
+    iconSize: [width, height],
+    iconAnchor: [width / 2, height / 2],
+  }});
+}}
+
+function shouldShowArrowAtZoom(arrow, style) {{
+  const runDistance = Number(arrow.run_distance_m);
+  const targetDistance = Number(arrow.target_distance_m);
+  if (!Number.isFinite(runDistance) || !Number.isFinite(targetDistance)) return false;
+  if (runDistance < 50) return style.spacingM === 50;
+  if (targetDistance < style.minDistanceM - 0.01) return false;
+  if (targetDistance > runDistance - style.endBufferM + 0.01) return false;
+  return Math.abs((targetDistance - style.minDistanceM) % style.spacingM) < 0.01;
+}}
+
+function runMatchesCurrentSelection(runId) {{
+  return selectedWingfoilRunIds.size === 0 || selectedWingfoilRunIds.has(String(runId));
+}}
+
+function refreshDirectionArrows() {{
+  const style = arrowZoomStyle(map.getZoom());
+  arrowLayer.clearLayers();
+  for (const item of arrowMarkers) {{
+    item.visible = false;
+    if (!style || !runMatchesCurrentSelection(item.run_id) || !shouldShowArrowAtZoom(item.arrow, style)) continue;
+    item.marker.setIcon(runDirectionArrowIcon(item.arrow.bearing_deg, style));
+    item.marker.addTo(arrowLayer);
+    item.visible = true;
+  }}
+  if (window.__wingfoilMapDebug) {{
+    window.__wingfoilMapDebug.arrowZoom = map.getZoom();
+    window.__wingfoilMapDebug.visibleArrowCount = arrowMarkers.filter((item) => item.visible).length;
+  }}
+}}
+
+for (const arrow of (data.run_arrows || [])) {{
+  const runId = String(arrow.run_id || "");
+  const marker = L.marker([arrow.lat, arrow.lon], {{
+    interactive: false,
+    keyboard: false,
+    zIndexOffset: 80,
+  }});
+  arrowMarkers.push({{ marker, arrow, run_id: runId, visible: false }});
+}}
+
 function applyWingfoilRunSelection(selectedRunIds) {{
-  const selected = new Set((selectedRunIds || []).map((runId) => String(runId)).filter((runId) => runId !== ""));
-  const showAllRuns = selected.size === 0;
+  selectedWingfoilRunIds.clear();
+  for (const runId of (selectedRunIds || []).map((value) => String(value)).filter((value) => value !== "")) {{
+    selectedWingfoilRunIds.add(runId);
+  }}
+  const showAllRuns = selectedWingfoilRunIds.size === 0;
   for (const item of segmentLayers) {{
-    const shouldShow = !item.inRun || showAllRuns || selected.has(item.run_id);
+    const shouldShow = !item.inRun || showAllRuns || selectedWingfoilRunIds.has(item.run_id);
     const isVisible = lineLayer.hasLayer(item.line);
     if (shouldShow && !isVisible) item.line.addTo(lineLayer);
     if (!shouldShow && isVisible) lineLayer.removeLayer(item.line);
   }}
-  window.__wingfoilMapDebug.selectedRunIds = Array.from(selected);
+  refreshDirectionArrows();
+  window.__wingfoilMapDebug.selectedRunIds = Array.from(selectedWingfoilRunIds);
 }}
 
 window.applyWingfoilRunSelection = applyWingfoilRunSelection;
@@ -1496,16 +1666,23 @@ fallsToggle.onAdd = function() {{
   return button;
 }};
 fallsToggle.addTo(map);
+map.on("zoomend", refreshDirectionArrows);
 window.__wingfoilMapDebug = {{
   segmentCount: data.segments.length,
+  arrowCount: (data.run_arrows || []).length,
+  visibleArrowCount: 0,
+  arrowZoom: map.getZoom(),
   fallCount: data.falls.length,
   runCount: data.runs.length,
   selectedRunIds: [],
   fallsVisible: true,
   bounds: data.bounds,
   sourceFilename: data.source_filename,
-  windContext: data.wind_context
+  windContext: data.wind_context,
+  defaultBasemap: "Stadia.AlidadeSatellite",
+  availableBasemaps: ["Stadia.AlidadeSatellite", "Stadia.Outdoors"]
 }};
+refreshDirectionArrows();
 
 function escapeHtml(value) {{
   return String(value).replace(/[&<>"']/g, function(ch) {{
@@ -1983,6 +2160,7 @@ def write_summary_json(
         "analysis_status": "ok",
         "analysis_version": ANALYSIS_VERSION,
         "generated_at": fmt_dt(datetime.now(timezone.utc)),
+        "run_detection_source": "native",
         "wind_direction_deg": wind_payload["wind_direction_deg"],
         "wind_direction_cardinal": wind_payload["wind_direction_cardinal"],
         "wind_speed_kts": wind_payload["wind_speed_kts"],
@@ -2006,6 +2184,7 @@ def write_summary_json(
             "avg_run_distance_km": round(avg_run_distance_m / 1000, 3) if avg_run_distance_m is not None else None,
             "avg_speed_on_foil_mps": round(avg_speed_on_foil_mps, 3) if avg_speed_on_foil_mps is not None else None,
             "avg_speed_on_foil_kmh": round(avg_speed_on_foil_mps * MPS_TO_KMH, 2) if avg_speed_on_foil_mps is not None else None,
+            "run_detection_source": "native",
         },
         "runs_summary": {
             "count": len(runs),

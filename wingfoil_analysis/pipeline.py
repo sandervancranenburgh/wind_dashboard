@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Analyze a wingfoil GPX/KML/FIT activity and emit rider-portal artifacts.
+"""Analyze a wingfoil GPX/KML/FIT/TCX activity and emit rider-portal artifacts.
 
 The pipeline is intentionally dependency-light:
-  GPX/KML/FIT -> canonical dataframe -> samples -> runs/falls -> website assets
+  GPX/KML/FIT/TCX -> canonical dataframe -> samples -> runs/falls -> website assets
 
 Speed is derived from GPS distance and timestamps because GPS exports often do
 not include a speed extension.
@@ -14,11 +14,14 @@ import argparse
 import csv
 import json
 import math
+import stat
 import statistics
 import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
@@ -64,9 +67,10 @@ ARTIFACTS = {
     "run_wind_angle_distribution_svg": "run_wind_angle_distribution.svg",
     "run_speed_profile_svg": "run_speed.svg",
 }
-SUPPORTED_EXTENSIONS = {".gpx", ".kml", ".fit"}
-FOILMOTION_TEXT_HINTS = ("foilmotion", "foil motion", "foil_motion", "foil-motion")
-FOILMOTION_RUN_HINTS = ("foil_run", "foilrun", "on_foil", "onfoil", "on foil", "foiling")
+MAX_ACTIVITY_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+ACTIVITY_FILE_EXTENSIONS = {".gpx", ".kml", ".fit", ".tcx"}
+SUPPORTED_EXTENSIONS = ACTIVITY_FILE_EXTENSIONS | {".zip"}
 
 DEFAULT_SETTINGS = {
     "run_speed_threshold_mps": 4.0,
@@ -181,7 +185,6 @@ class AnalysisResult:
     wind_context: WindContext
     config: AnalysisConfig
     warnings: list[str]
-    run_detection_source: str = "native"
 
 
 def default_analysis_config(**overrides: object) -> AnalysisConfig:
@@ -280,196 +283,100 @@ def first_present(*values: object) -> object | None:
     return None
 
 
-def fit_field_values(message) -> dict[str, object]:
-    return {field.name: field.value for field in message}
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
-def text_contains_foilmotion_hint(value: object) -> bool:
-    text = str(value or "").lower()
-    return any(hint in text for hint in FOILMOTION_TEXT_HINTS) or any(hint in text for hint in FOILMOTION_RUN_HINTS)
-
-
-def fit_file_has_foilmotion_hints(path: Path) -> bool:
-    try:
-        for message in FitFile(str(path)).get_messages():
-            message_name = str(getattr(message, "name", "") or "").lower()
-            if text_contains_foilmotion_hint(message_name):
-                return True
-            for field in message:
-                if text_contains_foilmotion_hint(getattr(field, "name", "")):
-                    return True
-                value = getattr(field, "value", None)
-                if isinstance(value, (str, bytes)) and text_contains_foilmotion_hint(value):
-                    return True
-    except Exception:
-        return False
-    return False
-
-
-def fit_datetime(value: object) -> datetime | None:
-    if value is None:
+def child_text(element: ET.Element | None, name: str) -> str | None:
+    if element is None:
         return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-    if isinstance(value, str):
-        try:
-            return parse_time(value)
-        except ValueError:
-            return None
+    for child in element:
+        if xml_local_name(child.tag) == name and child.text and child.text.strip():
+            return child.text.strip()
     return None
 
 
-def fit_float(value: object) -> float | None:
+def first_descendant_text(element: ET.Element, name: str) -> str | None:
+    for child in element.iter():
+        if child is element:
+            continue
+        if xml_local_name(child.tag) == name and child.text and child.text.strip():
+            return child.text.strip()
+    return None
+
+
+def tcx_heart_rate_bpm(trackpoint: ET.Element) -> int | None:
+    for child in trackpoint:
+        if xml_local_name(child.tag) != "HeartRateBpm":
+            continue
+        return parse_optional_int(child_text(child, "Value"))
+    return None
+
+
+def parse_optional_float(value: str | None) -> float | None:
     if value is None:
         return None
     try:
-        parsed = float(value)
+        return float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if math.isfinite(parsed) else None
 
 
-def parse_fit_duration_s(value: object) -> float | None:
-    parsed = fit_float(value)
-    if parsed is not None:
-        return parsed
-    text = str(value or "").strip()
-    if not text:
-        return None
-    parts = text.split(":")
+def parse_optional_int(value: str | None) -> int | None:
+    parsed = parse_optional_float(value)
+    return int(parsed) if parsed is not None else None
+
+
+def zip_member_has_unsafe_path(info: zipfile.ZipInfo) -> bool:
+    name = info.filename
+    if not name or info.is_dir() or "\\" in name:
+        return True
+    member_path = PurePosixPath(name)
+    if member_path.is_absolute() or len(member_path.parts) != 1:
+        return True
+    if any(part in {"", ".", ".."} for part in member_path.parts):
+        return True
+    return stat.S_ISLNK(info.external_attr >> 16)
+
+
+def select_single_activity_zip_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    infos = archive.infolist()
+    if any(zip_member_has_unsafe_path(info) for info in infos):
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+    file_infos = [info for info in infos if not info.is_dir()]
+    total_uncompressed = sum(info.file_size for info in file_infos)
+    total_compressed = sum(info.compress_size for info in file_infos)
+    if total_uncompressed > MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES or total_compressed > MAX_ACTIVITY_UPLOAD_BYTES:
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+    supported_files = [
+        info
+        for info in file_infos
+        if PurePosixPath(info.filename).suffix.lower() in ACTIVITY_FILE_EXTENSIONS
+    ]
+    if len(file_infos) != 1 or len(supported_files) != 1:
+        raise AnalysisError("ZIP uploads must contain exactly one supported activity file.")
+    return supported_files[0]
+
+
+def extract_single_activity_from_zip(path: Path, output_dir: Path) -> Path:
+    if path.stat().st_size > MAX_ACTIVITY_UPLOAD_BYTES:
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
     try:
-        numbers = [float(part) for part in parts]
-    except ValueError:
-        return None
-    if len(numbers) == 2:
-        return numbers[0] * 60 + numbers[1]
-    if len(numbers) == 3:
-        return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
-    return numbers[0] if len(numbers) == 1 else None
-
-
-def first_fit_duration_s(record: dict[str, object], *names: str) -> float | None:
-    for name in names:
-        parsed = parse_fit_duration_s(record.get(name))
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def first_fit_float(record: dict[str, object], *names: str) -> float | None:
-    for name in names:
-        parsed = fit_float(record.get(name))
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def nearest_sample_index(samples: list[Sample], target_time: datetime) -> int | None:
-    if not samples:
-        return None
-    return min(range(len(samples)), key=lambda index: abs((samples[index].time - target_time).total_seconds()))
-
-
-def run_sample_index_range(samples: list[Sample], start_time: datetime, end_time: datetime) -> tuple[int, int] | None:
-    contained = [sample.index for sample in samples if start_time <= sample.time <= end_time]
-    if len(contained) >= 2:
-        return contained[0], contained[-1]
-    start_index = nearest_sample_index(samples, start_time)
-    end_index = nearest_sample_index(samples, end_time)
-    if start_index is None or end_index is None or end_index <= start_index:
-        return None
-    start_offset_s = abs((samples[start_index].time - start_time).total_seconds())
-    end_offset_s = abs((samples[end_index].time - end_time).total_seconds())
-    duration_s = max((end_time - start_time).total_seconds(), 1.0)
-    tolerance_s = max(10.0, duration_s * 0.25)
-    if start_offset_s > tolerance_s or end_offset_s > tolerance_s:
-        return None
-    return start_index, end_index
-
-
-def imported_run_from_fit_lap(run_id: int, record: dict[str, object], samples: list[Sample]) -> Run | None:
-    if str(record.get("lap_trigger") or "").lower() == "session_end":
-        return None
-    start_time = fit_datetime(record.get("start_time"))
-    duration_s = first_fit_duration_s(record, "run_duration", "total_timer_time", "total_elapsed_time", "total_moving_time")
-    if start_time is None or duration_s is None or duration_s <= 0:
-        return None
-    end_time = start_time + pd.Timedelta(seconds=duration_s).to_pytimedelta()
-    index_range = run_sample_index_range(samples, start_time, end_time)
-    if index_range is None:
-        return None
-    start_index, end_index = index_range
-    run_samples = samples[start_index : end_index + 1]
-    if len(run_samples) < 2:
-        return None
-    moving_samples = run_samples[1:]
-    gps_distance_m = sum(sample.segment_distance_m for sample in moving_samples)
-    sample_speeds = [sample.speed_mps for sample in moving_samples if sample.dt_s > 0]
-    distance_m = first_fit_float(record, "run_distance", "total_distance", "enhanced_total_distance")
-    if distance_m is None or distance_m <= 0:
-        distance_m = gps_distance_m
-    mean_speed_kmh = first_fit_float(record, "run_avg_speed")
-    mean_speed_mps = mean_speed_kmh / MPS_TO_KMH if mean_speed_kmh is not None else first_fit_float(record, "enhanced_avg_speed", "avg_speed")
-    if mean_speed_mps is None or mean_speed_mps <= 0:
-        mean_speed_mps = distance_m / duration_s if duration_s > 0 else None
-    if mean_speed_mps is None or mean_speed_mps <= 0:
-        mean_speed_mps = statistics.mean(sample_speeds) if sample_speeds else 0.0
-    max_speed_kmh = first_fit_float(record, "run_max_speed")
-    max_speed_mps = max_speed_kmh / MPS_TO_KMH if max_speed_kmh is not None else first_fit_float(record, "enhanced_max_speed", "max_speed")
-    if max_speed_mps is None or max_speed_mps <= 0:
-        max_speed_mps = max(sample_speeds, default=mean_speed_mps)
-    median_speed_mps = statistics.median(sample_speeds) if sample_speeds else mean_speed_mps
-    if distance_m <= 0 or mean_speed_mps <= 0:
-        return None
-    return Run(
-        run_id=run_id,
-        start_index=start_index,
-        end_index=end_index,
-        start_time=start_time,
-        end_time=end_time,
-        duration_s=duration_s,
-        distance_m=distance_m,
-        mean_speed_mps=mean_speed_mps,
-        median_speed_mps=median_speed_mps,
-        max_speed_mps=max_speed_mps,
-        start_lat=samples[start_index].lat,
-        start_lon=samples[start_index].lon,
-        end_lat=samples[end_index].lat,
-        end_lon=samples[end_index].lon,
-        end_reason="foilmotion",
-    )
-
-
-def extract_runs_from_foilmotion_fit(path: Path, samples: list[Sample]) -> tuple[bool, list[Run], list[str]]:
-    if path.suffix.lower() != ".fit":
-        return False, [], []
-    detected = fit_file_has_foilmotion_hints(path)
-    if not detected:
-        return False, [], []
-    warnings: list[str] = []
-    runs: list[Run] = []
-    try:
-        lap_messages = list(FitFile(str(path)).get_messages("lap"))
-    except Exception as exc:
-        return True, [], [f"FoilMotion run data was detected, but lap messages could not be read: {exc}"]
-    for message in lap_messages:
-        run = imported_run_from_fit_lap(len(runs) + 1, fit_field_values(message), samples)
-        if run is not None:
-            runs.append(run)
-    if not runs and lap_messages:
-        warnings.append("FoilMotion run data was detected, but lap timing or metrics could not be mapped to the GPS track; native run detection was used.")
-    elif not runs:
-        warnings.append("FoilMotion activity metadata was detected, but no usable lap/run messages were found; native run detection was used.")
-    return True, runs, warnings
-
-
-def mark_samples_for_runs(samples: list[Sample], runs: list[Run]) -> list[Sample]:
-    run_indices: set[int] = set()
-    for run in runs:
-        run_indices.update(range(run.start_index, run.end_index + 1))
-    return [Sample(**{**sample.__dict__, "in_run": sample.index in run_indices}) for sample in samples]
+        with zipfile.ZipFile(path) as archive:
+            member = select_single_activity_zip_member(archive)
+            inner_name = PurePosixPath(member.filename).name
+            extracted_path = output_dir / inner_name
+            with archive.open(member) as source, extracted_path.open("wb") as target:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    if target.tell() > MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES:
+                        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+            return extracted_path
+    except zipfile.BadZipFile as exc:
+        raise AnalysisError("ZIP uploads must contain exactly one supported activity file.") from exc
 
 
 def canonicalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -683,9 +590,50 @@ def load_fit_activity(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
 
 
+def load_tcx_activity(path: Path) -> pd.DataFrame:
+    tree = ET.parse(path)
+    root = tree.getroot()
+    rows = []
+
+    for trackpoint in root.iter():
+        if xml_local_name(trackpoint.tag) != "Trackpoint":
+            continue
+        timestamp_text = child_text(trackpoint, "Time")
+        position = None
+        for child in trackpoint:
+            if xml_local_name(child.tag) == "Position":
+                position = child
+                break
+        lat = parse_optional_float(child_text(position, "LatitudeDegrees"))
+        lon = parse_optional_float(child_text(position, "LongitudeDegrees"))
+        if not timestamp_text or lat is None or lon is None:
+            continue
+        try:
+            timestamp = parse_time(timestamp_text)
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "lat": lat,
+                "lon": lon,
+                "altitude_m": parse_optional_float(child_text(trackpoint, "AltitudeMeters")),
+                "speed_mps": parse_optional_float(first_descendant_text(trackpoint, "Speed")),
+                "distance_m": parse_optional_float(child_text(trackpoint, "DistanceMeters")),
+                "heart_rate_bpm": tcx_heart_rate_bpm(trackpoint),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
+
+
 def load_activity(path: Path, smooth_window: int) -> tuple[list[Sample], list[str]]:
     suffix = path.suffix.lower()
     warnings: list[str] = []
+    if suffix == ".zip":
+        with tempfile.TemporaryDirectory(prefix="wingfoil_activity_zip_") as temp_dir:
+            inner_path = extract_single_activity_from_zip(path, Path(temp_dir))
+            return load_activity(inner_path, smooth_window)
     if suffix == ".gpx":
         df = load_gpx_activity(path)
     elif suffix == ".kml":
@@ -694,8 +642,11 @@ def load_activity(path: Path, smooth_window: int) -> tuple[list[Sample], list[st
         df = load_fit_activity(path)
         if df.empty:
             warnings.append("FIT file has no GPS records")
+    elif suffix == ".tcx":
+        df = load_tcx_activity(path)
     else:
-        raise ValueError(f"Unsupported activity format: {path.suffix}. Expected .gpx, .kml, or .fit")
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ValueError(f"Unsupported activity format: {path.suffix}. Expected one of: {supported}")
 
     return dataframe_to_samples(df, smooth_window, warnings), warnings
 
@@ -758,7 +709,20 @@ def detect_runs(
         else raw_runs
     )
 
-    return mark_samples_for_runs(samples, runs), runs
+    run_indices: set[int] = set()
+    for run in runs:
+        run_indices.update(range(run.start_index, run.end_index + 1))
+
+    marked = [
+        Sample(
+            **{
+                **sample.__dict__,
+                "in_run": sample.index in run_indices,
+            }
+        )
+        for sample in samples
+    ]
+    return marked, runs
 
 
 def build_run(run_id: int, samples: list[Sample], start_index: int, end_index: int, min_run_duration_s: float) -> Run | None:
@@ -1161,43 +1125,6 @@ def project_points(samples: list[Sample], width: int, height: int, pad: int) -> 
     return points
 
 
-def endpoint_run_bearing(samples: list[Sample], run: Run, endpoint: str) -> float | None:
-    run_samples = samples[run.start_index : run.end_index + 1]
-    if len(run_samples) < 2:
-        return None
-    pairs = list(zip(run_samples, run_samples[1:]))
-    if endpoint == "end":
-        pairs = list(reversed(pairs))
-    for previous, sample in pairs:
-        if sample.segment_distance_m > 0 or haversine_m(previous.lat, previous.lon, sample.lat, sample.lon) > 0:
-            return bearing_degrees(previous.lat, previous.lon, sample.lat, sample.lon)
-    return None
-
-
-def run_direction_markers(samples: list[Sample], runs: list[Run]) -> list[dict[str, float | int | str]]:
-    markers: list[dict[str, float | int | str]] = []
-    for run in runs:
-        endpoints = (
-            ("start", run.start_index, endpoint_run_bearing(samples, run, "start")),
-            ("end", run.end_index, endpoint_run_bearing(samples, run, "end")),
-        )
-        for endpoint, sample_index, bearing in endpoints:
-            if bearing is None or not (0 <= sample_index < len(samples)):
-                continue
-            sample = samples[sample_index]
-            markers.append(
-                {
-                    "run_id": run.run_id,
-                    "endpoint": endpoint,
-                    "lat": round(sample.lat, 7),
-                    "lon": round(sample.lon, 7),
-                    "bearing_deg": round(bearing, 1),
-                    "rotation_deg": round(bearing - 90.0, 1),
-                }
-            )
-    return markers
-
-
 def write_map_svg(path: Path, samples: list[Sample], runs: list[Run], falls: list[Fall]) -> None:
     width, height, pad = 1000, 700, 42
     if not samples:
@@ -1316,7 +1243,7 @@ def write_map_html(
             wind_label += f", {wind_payload['wind_speed_kts']:.0f} kt"
 
     payload = {
-        "source_filename": source_activity.name,
+        "source_filename": "activity",
         "source_format": source_activity.suffix.lower().lstrip("."),
         "center": [statistics.mean(sample.lat for sample in samples), statistics.mean(sample.lon for sample in samples)],
         "bounds": [[min(sample.lat for sample in samples), min(sample.lon for sample in samples)], [max(sample.lat for sample in samples), max(sample.lon for sample in samples)]],
@@ -1340,7 +1267,6 @@ def write_map_html(
         "runs": [run_to_dict(run) | {"start_index": run.start_index, "end_index": run.end_index} for run in runs],
         "run_ranges": run_ranges,
         "falls": falls_payload,
-        "run_direction_markers": run_direction_markers(samples, runs),
         "start": [samples[0].lat, samples[0].lon],
         "end": [samples[-1].lat, samples[-1].lon],
         "speed_min_kmh": round(min_speed_mps * MPS_TO_KMH, 1),
@@ -1409,17 +1335,6 @@ def write_map_html(
     .speed-title {{ color: var(--text); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; }}
     .falls-toggle {{ cursor: pointer; font-size: 12px; font-weight: 850; }}
     .falls-toggle.is-off {{ color: var(--muted); opacity: 0.68; }}
-    .run-direction-icon {{ background: transparent; border: 0; }}
-    .run-direction-arrow {{
-      border-bottom: 4px solid transparent;
-      border-left: 10px solid rgba(248, 250, 252, 0.82);
-      border-top: 4px solid transparent;
-      filter: drop-shadow(0 1px 2px rgba(7, 17, 31, 0.86));
-      height: 0;
-      opacity: 0.78;
-      transform-origin: 50% 50%;
-      width: 0;
-    }}
     .legend-row {{ align-items: center; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; font-size: 10px; }}
     .wind-panel {{ max-width: 178px; }}
     .wind-content {{ align-items: center; display: flex; gap: 8px; }}
@@ -1498,7 +1413,6 @@ const labels = L.tileLayer(
 const lineLayer = L.layerGroup().addTo(map);
 const fallLayer = L.layerGroup().addTo(map);
 const segmentLayers = [];
-const runDirectionMarkerLayers = [];
 window.wingfoilRunLayers = segmentLayers;
 map.fitBounds(data.bounds, {{ padding: [28, 28] }});
 
@@ -1514,24 +1428,7 @@ for (const segment of data.segments) {{
     line.bindTooltip(`Run ${{segment.run_id}}<br>Speed: ${{Number.isFinite(speedKmh) ? speedKmh.toFixed(1) : segment.speed_kmh}} km/h`, {{ sticky: true }});
   }}
   line.addTo(lineLayer);
-  segmentLayers.push({{ line, inRun: Boolean(segment.in_run), run_id: String(segment.run_id || ""), kind: "segment" }});
-}}
-
-for (const marker of data.run_direction_markers || []) {{
-  const rotation = Number(marker.rotation_deg);
-  const directionMarker = L.marker([marker.lat, marker.lon], {{
-    interactive: false,
-    keyboard: false,
-    icon: L.divIcon({{
-      className: "run-direction-icon",
-      html: `<div class="run-direction-arrow" style="transform: rotate(${{Number.isFinite(rotation) ? rotation : 0}}deg)"></div>`,
-      iconSize: [18, 18],
-      iconAnchor: [9, 9],
-    }})
-  }}).addTo(lineLayer);
-  const item = {{ line: directionMarker, inRun: true, run_id: String(marker.run_id || ""), kind: "direction-marker" }};
-  segmentLayers.push(item);
-  runDirectionMarkerLayers.push(item);
+  segmentLayers.push({{ line, inRun: Boolean(segment.in_run), run_id: String(segment.run_id || "") }});
 }}
 
 function applyWingfoilRunSelection(selectedRunIds) {{
@@ -1601,7 +1498,6 @@ fallsToggle.onAdd = function() {{
 fallsToggle.addTo(map);
 window.__wingfoilMapDebug = {{
   segmentCount: data.segments.length,
-  directionMarkerCount: (data.run_direction_markers || []).length,
   fallCount: data.falls.length,
   runCount: data.runs.length,
   selectedRunIds: [],
@@ -2066,7 +1962,6 @@ def write_summary_json(
     wind_context: WindContext,
     config: dict[str, object],
     warnings: list[str],
-    run_detection_source: str = "native",
 ) -> None:
     total_distance_m = sum(sample.segment_distance_m for sample in samples)
     moving_time_s = sum(sample.dt_s for sample in samples if sample.smooth_speed_mps >= config["water_speed_threshold_mps"])
@@ -2082,7 +1977,7 @@ def write_summary_json(
     raw_run_count = sum(run.merged_raw_run_count for run in runs)
 
     payload = {
-        "source_filename": source_activity.name,
+        "source_filename": "activity",
         "source_format": source_activity.suffix.lower().lstrip("."),
         "activity_type": source_activity.suffix.lower().lstrip("."),
         "analysis_status": "ok",
@@ -2096,8 +1991,6 @@ def write_summary_json(
         "wind_context": wind_payload,
         "config": config,
         "warnings": warnings,
-        "run_detection_source": run_detection_source,
-        "run_detection_label": "FoilMotion" if run_detection_source == "foilmotion" else "Native",
         "activity": {
             "start_time": fmt_dt(samples[0].time) if samples else None,
             "end_time": fmt_dt(samples[-1].time) if samples else None,
@@ -2109,7 +2002,6 @@ def write_summary_json(
             "water_time_formatted": format_duration_s(water_time_s),
             "foil_time_s": round(foil_time_s, 2),
             "foil_time_formatted": format_duration_s(foil_time_s),
-            "run_detection_source": run_detection_source,
             "avg_run_distance_m": round(avg_run_distance_m, 2) if avg_run_distance_m is not None else None,
             "avg_run_distance_km": round(avg_run_distance_m / 1000, 3) if avg_run_distance_m is not None else None,
             "avg_speed_on_foil_mps": round(avg_speed_on_foil_mps, 3) if avg_speed_on_foil_mps is not None else None,
@@ -2175,24 +2067,15 @@ def analyze_activity(
         raise
     except Exception as exc:
         raise AnalysisError(f"Could not parse activity file {source_activity.name}: {exc}") from exc
-    run_detection_source = "native"
-    _foilmotion_detected, foilmotion_runs, foilmotion_warnings = extract_runs_from_foilmotion_fit(source_activity, samples)
-    warnings.extend(foilmotion_warnings)
-    if foilmotion_runs:
-        run_detection_source = "foilmotion"
-        samples = mark_samples_for_runs(samples, foilmotion_runs)
-        runs = foilmotion_runs
-        warnings.append("Runs imported from FoilMotion activity data.")
-    else:
-        samples, runs = detect_runs(
-            samples,
-            run_speed_threshold_mps=config.run_speed_threshold_mps,
-            run_continue_threshold_mps=config.run_continue_threshold_mps,
-            min_run_duration_s=config.min_run_duration_s,
-            max_gap_s=config.max_gap_s,
-            merge_runs_without_stop=config.merge_runs_without_stop,
-            run_stop_threshold_mps=config.run_stop_threshold_mps,
-        )
+    samples, runs = detect_runs(
+        samples,
+        run_speed_threshold_mps=config.run_speed_threshold_mps,
+        run_continue_threshold_mps=config.run_continue_threshold_mps,
+        min_run_duration_s=config.min_run_duration_s,
+        max_gap_s=config.max_run_gap_s,
+        merge_runs_without_stop=config.merge_runs_without_stop,
+        run_stop_threshold_mps=config.run_stop_threshold_mps,
+    )
     if not runs:
         warnings.append("no runs detected under current thresholds")
     falls = detect_falls(
@@ -2202,8 +2085,7 @@ def analyze_activity(
         fall_window_s=config.fall_window_s,
         min_fall_gap_s=config.min_fall_gap_s,
     )
-    if run_detection_source == "native":
-        runs = classify_run_end_reasons(samples, runs, falls, config.fall_window_s, config.run_stop_threshold_mps)
+    runs = classify_run_end_reasons(samples, runs, falls, config.fall_window_s, config.run_stop_threshold_mps)
     runs = add_wind_metrics_to_runs(samples, runs, wind_context)
     water_time_s = compute_water_time_s(samples, config.water_speed_threshold_mps)
 
@@ -2216,7 +2098,6 @@ def analyze_activity(
         wind_context=wind_context,
         config=config,
         warnings=warnings,
-        run_detection_source=run_detection_source,
     )
 
 
@@ -2238,7 +2119,6 @@ def write_analysis_outputs(result: AnalysisResult, output_dir: str | Path, clear
         result.wind_context,
         config_payload,
         result.warnings,
-        result.run_detection_source,
     )
     write_runs_csv(output_path / "runs.csv", result.runs)
     write_map_svg(output_path / "map.svg", result.samples, result.runs, result.falls)
@@ -2287,7 +2167,6 @@ def analysis_stats(result: AnalysisResult) -> dict[str, object]:
         "fall_count": len(result.falls),
         "water_time_s": round(result.water_time_s, 2),
         "bounds": bounds,
-        "run_detection_source": result.run_detection_source,
     }
 
 
@@ -2315,7 +2194,6 @@ def analysis_result_to_dict(result: AnalysisResult, output_dir: str | Path | Non
         },
         "stats": analysis_stats(result),
         "warnings": result.warnings,
-        "run_detection_source": result.run_detection_source,
     }
     if artifact_paths is not None:
         payload["artifact_paths"] = artifact_paths
@@ -2396,9 +2274,9 @@ def analyze(args: argparse.Namespace) -> AnalysisResult:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze wingfoil runs and falls from a GPX, KML, or FIT file.")
-    parser.add_argument("activity", nargs="?", help="Input GPX, KML, or FIT file")
-    parser.add_argument("--input", dest="input_file", help="Input GPX, KML, or FIT file")
+    parser = argparse.ArgumentParser(description="Analyze wingfoil runs and falls from a GPX, KML, FIT, TCX, or ZIP file.")
+    parser.add_argument("activity", nargs="?", help="Input GPX, KML, FIT, TCX, or ZIP file")
+    parser.add_argument("--input", dest="input_file", help="Input GPX, KML, FIT, TCX, or ZIP file")
     parser.add_argument("-o", "--output-dir", "--out-dir", default="outputs/wingfoil_analysis", help="Directory for JSON, CSV, and SVG artifacts")
     parser.add_argument("--run-speed-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_speed_threshold_mps"], help="Minimum smoothed speed required to start a run")
     parser.add_argument("--run-continue-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_continue_threshold_mps"], help="Minimum smoothed speed to keep an active run alive")

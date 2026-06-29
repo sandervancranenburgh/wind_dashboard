@@ -6,8 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,24 +86,6 @@ class RiderPortalTest(unittest.TestCase):
     def _activity_file(self, filename: str = "session.gpx"):
         gpx = b'<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">\n  <trk><name>Test</name><trkseg>\n    <trkpt lat="52.1" lon="4.4"><time>2026-01-20T11:00:00Z</time></trkpt>\n    <trkpt lat="52.1005" lon="4.4005"><time>2026-01-20T11:00:10Z</time></trkpt>\n  </trkseg></trk>\n</gpx>\n'
         return (io.BytesIO(gpx), filename)
-
-    def _tcx_bytes(self) -> bytes:
-        return b'''<?xml version="1.0" encoding="UTF-8"?>
-<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
-  <Activities><Activity Sport="Other"><Lap StartTime="2026-01-20T11:00:00Z"><Track>
-    <Trackpoint><Time>2026-01-20T11:00:00Z</Time><Position><LatitudeDegrees>52.1</LatitudeDegrees><LongitudeDegrees>4.4</LongitudeDegrees></Position><AltitudeMeters>1.0</AltitudeMeters><DistanceMeters>0.0</DistanceMeters><HeartRateBpm><Value>101</Value></HeartRateBpm><Extensions><ns3:TPX><ns3:Speed>0.0</ns3:Speed></ns3:TPX></Extensions></Trackpoint>
-    <Trackpoint><Time>2026-01-20T11:00:10Z</Time><Position><LatitudeDegrees>52.1005</LatitudeDegrees><LongitudeDegrees>4.4005</LongitudeDegrees></Position><AltitudeMeters>1.2</AltitudeMeters><DistanceMeters>65.0</DistanceMeters><HeartRateBpm><Value>105</Value></HeartRateBpm><Extensions><ns3:TPX><ns3:Speed>6.5</ns3:Speed></ns3:TPX></Extensions></Trackpoint>
-  </Track></Lap></Activity></Activities>
-</TrainingCenterDatabase>
-'''
-
-    def _zip_activity_file(self, entries: dict[str, bytes], filename: str = "session.zip"):
-        payload = io.BytesIO()
-        with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name, content in entries.items():
-                archive.writestr(name, content)
-        payload.seek(0)
-        return (payload, filename)
 
     def _mock_analysis_payload(self, input_file, output_dir, wind_context=None, raise_on_error=False, **_kwargs):
         output_path = Path(output_dir)
@@ -1226,9 +1207,6 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"Private RiderNotes", new_page.data)
         self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
         self.assertIn(b'<label class="activity-file-trigger" for="ActivityFile">Upload file</label>', new_page.data)
-        self.assertIn(b'.tcx,.TCX', new_page.data)
-        self.assertIn(b'.zip,.ZIP', new_page.data)
-        self.assertIn(b"Upload a FIT, TCX, GPX, KML, or ZIP activity file.", new_page.data)
         self.assertIn(b"No activity file uploaded", new_page.data)
         self.assertNotIn(b'<label for="ActivityFile">Activity file</label>', new_page.data)
         self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", new_page.data)
@@ -1613,122 +1591,6 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIsNone(db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id))
         conn.close()
 
-    def test_tcx_activity_upload_is_accepted(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload) as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": (io.BytesIO(self._tcx_bytes()), "session.tcx")},
-            )
-
-        self.assertEqual(response.status_code, 302)
-        mocked_analysis.assert_called_once()
-        conn = db_store.connect_db(self.temp_dir.name)
-        analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id)
-        conn.close()
-        self.assertIsNotNone(analysis)
-        self.assertEqual(analysis["file_type"], "tcx")
-
-    def test_zip_activity_upload_with_one_supported_file_is_accepted(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        gpx_bytes = self._activity_file()[0].getvalue()
-        with patch.object(portal, "analyze_session_file", side_effect=self._mock_analysis_payload) as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._zip_activity_file({"session.gpx": gpx_bytes})},
-            )
-
-        self.assertEqual(response.status_code, 302)
-        mocked_analysis.assert_called_once()
-        conn = db_store.connect_db(self.temp_dir.name)
-        analysis = db_store.get_surf_experience_activity_analysis(conn, experience_id, self.user_id)
-        conn.close()
-        self.assertIsNotNone(analysis)
-        self.assertEqual(analysis["file_type"], "zip")
-
-    def test_zip_activity_upload_rejects_no_supported_file(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        with patch.object(portal, "analyze_session_file") as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._zip_activity_file({"notes.txt": b"not activity"})},
-                follow_redirects=True,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"ZIP uploads must contain exactly one supported activity file.", response.data)
-        mocked_analysis.assert_not_called()
-
-    def test_zip_activity_upload_rejects_multiple_supported_files(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        gpx_bytes = self._activity_file()[0].getvalue()
-        with patch.object(portal, "analyze_session_file") as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._zip_activity_file({"a.gpx": gpx_bytes, "b.tcx": self._tcx_bytes()})},
-                follow_redirects=True,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"ZIP uploads must contain exactly one supported activity file.", response.data)
-        mocked_analysis.assert_not_called()
-
-    def test_zip_activity_upload_rejects_path_traversal(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        with patch.object(portal, "analyze_session_file") as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._zip_activity_file({"../session.gpx": self._activity_file()[0].getvalue()})},
-                follow_redirects=True,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"ZIP upload rejected because it contains unsafe paths or is too large when extracted.", response.data)
-        mocked_analysis.assert_not_called()
-
-    def test_activity_upload_above_twenty_mb_is_rejected(self) -> None:
-        experience_id = self._create_submission(self.user_id, "Owner", "2026-04-02", "private")
-        self._set_user(self.user_id)
-        self.client.get(f"/experiences/{experience_id}")
-        with self.client.session_transaction() as current_session:
-            csrf_token = current_session["_csrf_token"]
-
-        with patch.object(portal, "_uploaded_stream_size", return_value=portal.MAX_ACTIVITY_UPLOAD_BYTES + 1), patch.object(portal, "analyze_session_file") as mocked_analysis:
-            response = self.client.post(
-                f"/experiences/{experience_id}/activity-upload",
-                data={"_csrf_token": csrf_token, "ActivityFile": self._activity_file("large.fit")},
-                follow_redirects=True,
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Activity file is too large. Please upload a file up to 20 MB.", response.data)
-        mocked_analysis.assert_not_called()
-
     def test_existing_submission_activity_upload_persists_and_renders_artifacts(self) -> None:
         experience_id = self._create_submission(
             self.user_id,
@@ -1772,7 +1634,6 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"GPX", detail.data)
         self.assertIn(b"OK", detail.data)
         self.assertIn(b"Upload file", detail.data)
-        self.assertIn(b"Upload a FIT, TCX, GPX, KML, or ZIP activity file.", detail.data)
         self.assertNotIn(b"<label for=\"ActivityFile\">Activity file</label>", detail.data)
         self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", detail.data)
         self.assertNotIn(b"Current file:", detail.data)
@@ -1973,58 +1834,125 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/share/experience/{private_id}").status_code, 404)
         self.assertEqual(self.client.get(f"/share/experience/{private_id}/activity-artifact/map.svg").status_code, 404)
 
-    def test_tcx_parser_loads_namespaced_trackpoints(self) -> None:
+
+
+class WingfoilPipelineRunSourceTest(unittest.TestCase):
+    def _samples(self) -> list[wingfoil_pipeline.Sample]:
+        start = datetime(2026, 1, 20, 11, 0, tzinfo=timezone.utc)
+        samples: list[wingfoil_pipeline.Sample] = []
+        for index in range(12):
+            samples.append(
+                wingfoil_pipeline.Sample(
+                    index=index,
+                    lat=52.0 + index * 0.0001,
+                    lon=4.0 + index * 0.0001,
+                    ele_m=None,
+                    time=start + timedelta(seconds=index),
+                    dt_s=0.0 if index == 0 else 1.0,
+                    segment_distance_m=10.0 if index else 0.0,
+                    speed_mps=10.0 if index else 0.0,
+                    smooth_speed_mps=10.0 if index else 0.0,
+                )
+            )
+        return samples
+
+    def test_foilmotion_lap_import_uses_run_metrics_and_maps_track(self) -> None:
+        samples = self._samples()
+        run = wingfoil_pipeline.imported_run_from_fit_lap(
+            1,
+            {
+                "lap_trigger": "manual",
+                "start_time": samples[1].time,
+                "run_duration": "0:08",
+                "run_distance": 123.4,
+                "run_avg_speed": 37.8,
+                "run_max_speed": 44.1,
+            },
+            samples,
+        )
+
+        self.assertIsNotNone(run)
+        self.assertEqual(run.start_index, 1)
+        self.assertEqual(run.end_index, 9)
+        self.assertEqual(run.distance_m, 123.4)
+        self.assertAlmostEqual(run.mean_speed_mps * wingfoil_pipeline.MPS_TO_KMH, 37.8)
+        self.assertAlmostEqual(run.max_speed_mps * wingfoil_pipeline.MPS_TO_KMH, 44.1)
+        self.assertEqual(run.end_reason, "foilmotion")
+
+    def test_foilmotion_detected_but_unusable_laps_fall_back(self) -> None:
+        class FakeField:
+            def __init__(self, name, value):
+                self.name = name
+                self.value = value
+
+        class FakeMessage:
+            def __iter__(self):
+                return iter([FakeField("lap_trigger", "manual"), FakeField("start_time", None)])
+
+        class FakeFitFile:
+            def __init__(self, _path):
+                pass
+
+            def get_messages(self, name=None):
+                if name == "lap":
+                    return [FakeMessage()]
+                return []
+
+        with patch.object(wingfoil_pipeline, "fit_file_has_foilmotion_hints", return_value=True), patch.object(wingfoil_pipeline, "FitFile", FakeFitFile):
+            detected, runs, warnings = wingfoil_pipeline.extract_runs_from_foilmotion_fit(Path("activity.fit"), self._samples())
+
+        self.assertTrue(detected)
+        self.assertEqual(runs, [])
+        self.assertIn("native run detection was used", warnings[0])
+
+    def test_summary_json_records_run_detection_source(self) -> None:
+        samples = self._samples()
+        run = wingfoil_pipeline.build_run(1, samples, 1, 9, min_run_duration_s=1)
+        self.assertIsNotNone(run)
         with tempfile.TemporaryDirectory() as temp_dir:
-            tcx_path = Path(temp_dir) / "session.tcx"
-            tcx_path.write_bytes(self._tcx_bytes())
+            path = Path(temp_dir) / "summary.json"
+            wingfoil_pipeline.write_summary_json(
+                path,
+                Path("activity.fit"),
+                samples,
+                [run],
+                [],
+                0.0,
+                wingfoil_pipeline.WindContext(),
+                wingfoil_pipeline.config_to_dict(wingfoil_pipeline.default_analysis_config()),
+                [],
+                "foilmotion",
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
 
-            df = wingfoil_pipeline.load_tcx_activity(tcx_path)
-            samples, warnings = wingfoil_pipeline.load_activity(tcx_path, smooth_window=1)
+        self.assertEqual(payload["run_detection_source"], "foilmotion")
+        self.assertEqual(payload["run_detection_label"], "FoilMotion")
+        self.assertEqual(payload["activity"]["run_detection_source"], "foilmotion")
 
-        self.assertEqual(len(df), 2)
-        self.assertEqual(int(df.iloc[0]["heart_rate_bpm"]), 101)
-        self.assertEqual(len(samples), 2)
-        self.assertAlmostEqual(samples[1].speed_mps, 6.5)
-        self.assertAlmostEqual(samples[1].segment_distance_m, 65.0)
-        self.assertEqual(warnings, [])
-
-    def test_zip_parser_extracts_single_supported_activity_privately(self) -> None:
+    def test_map_html_contains_direction_markers_that_share_run_selection(self) -> None:
+        samples = self._samples()
+        run = wingfoil_pipeline.build_run(1, samples, 1, 9, min_run_duration_s=1)
+        self.assertIsNotNone(run)
+        marked_samples = wingfoil_pipeline.mark_samples_for_runs(samples, [run])
         with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = Path(temp_dir) / "session.zip"
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("session.tcx", self._tcx_bytes())
+            path = Path(temp_dir) / "map.html"
+            wingfoil_pipeline.write_map_html(
+                path,
+                Path("activity.fit"),
+                marked_samples,
+                [run],
+                [],
+                wingfoil_pipeline.WindContext(),
+                0.0,
+            )
+            html = path.read_text(encoding="utf-8")
 
-            samples, warnings = wingfoil_pipeline.load_activity(zip_path, smooth_window=1)
+        self.assertIn("run_direction_markers", html)
+        self.assertIn("runDirectionMarkerLayers", html)
+        self.assertIn("run-direction-arrow", html)
+        self.assertIn('kind: "direction-marker"', html)
+        self.assertIn("applyWingfoilRunSelection", html)
 
-        self.assertEqual(len(samples), 2)
-        self.assertAlmostEqual(samples[1].speed_mps, 6.5)
-        self.assertEqual(warnings, [])
-
-    def test_zip_parser_rejects_unsafe_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = Path(temp_dir) / "session.zip"
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("../session.tcx", self._tcx_bytes())
-
-            with self.assertRaisesRegex(wingfoil_pipeline.AnalysisError, "unsafe paths"):
-                wingfoil_pipeline.load_activity(zip_path, smooth_window=1)
-
-    def test_generated_activity_artifacts_do_not_include_raw_source_filename(self) -> None:
-        sensitive_name = "20260401T120000Z_private_raw_upload.tcx"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            tcx_path = temp_path / sensitive_name
-            output_dir = temp_path / "out"
-            tcx_path.write_bytes(self._tcx_bytes())
-
-            result = wingfoil_pipeline.analyze_activity(tcx_path)
-            wingfoil_pipeline.write_analysis_outputs(result, output_dir)
-
-            summary_text = (output_dir / "summary.json").read_text(encoding="utf-8")
-            map_text = (output_dir / "map.html").read_text(encoding="utf-8")
-
-        self.assertNotIn(sensitive_name, summary_text)
-        self.assertNotIn(sensitive_name, map_text)
 
 
 if __name__ == "__main__":

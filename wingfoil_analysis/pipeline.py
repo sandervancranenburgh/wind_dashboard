@@ -1481,30 +1481,25 @@ def write_map_html(
   </section>
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet-providers@2.0.0/leaflet-providers.js"></script>
 <script>
 const data = {data_json};
 const map = L.map("map", {{ preferCanvas: true }});
-const stadiaAttribution = '&copy; <a href="https://www.stadiamaps.com/" target="_blank" rel="noopener">Stadia Maps</a> &copy; <a href="https://openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors';
-const stadiaFallbacks = {{
-  "Stadia.AlidadeSatellite": ["https://tiles.stadiamaps.com/tiles/alidade_satellite/{{z}}/{{x}}/{{y}}{{r}}.jpg", {{ maxZoom: 20, attribution: stadiaAttribution }}],
-  "Stadia.Outdoors": ["https://tiles.stadiamaps.com/tiles/outdoors/{{z}}/{{x}}/{{y}}{{r}}.png", {{ maxZoom: 20, attribution: stadiaAttribution }}],
-}};
-function stadiaBaseLayer(providerName) {{
-  if (L.tileLayer.provider) {{
-    try {{
-      return L.tileLayer.provider(providerName);
-    }} catch (error) {{
-    }}
-  }}
-  const fallback = stadiaFallbacks[providerName];
-  return L.tileLayer(fallback[0], fallback[1]);
-}}
-const satellite = stadiaBaseLayer("Stadia.AlidadeSatellite").addTo(map);
-const outdoors = stadiaBaseLayer("Stadia.Outdoors");
+const satellite = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+  {{ maxZoom: 19, attribution: "Tiles &copy; Esri" }}
+).addTo(map);
+const openStreetMap = L.tileLayer(
+  "https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",
+  {{ maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }}
+);
+const cartoLight = L.tileLayer(
+  "https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png",
+  {{ maxZoom: 20, attribution: "&copy; OpenStreetMap contributors &copy; CARTO" }}
+);
 const baseMaps = {{
   "Satellite": satellite,
-  "Outdoors": outdoors,
+  "OpenStreetMap": openStreetMap,
+  "CARTO Light": cartoLight,
 }};
 L.control.layers(baseMaps, null, {{ collapsed: true, position: "topright" }}).addTo(map);
 const lineLayer = L.layerGroup().addTo(map);
@@ -1679,8 +1674,8 @@ window.__wingfoilMapDebug = {{
   bounds: data.bounds,
   sourceFilename: data.source_filename,
   windContext: data.wind_context,
-  defaultBasemap: "Stadia.AlidadeSatellite",
-  availableBasemaps: ["Stadia.AlidadeSatellite", "Stadia.Outdoors"]
+  defaultBasemap: "Esri World Imagery",
+  availableBasemaps: ["Esri World Imagery", "OpenStreetMap", "CARTO Light"]
 }};
 refreshDirectionArrows();
 

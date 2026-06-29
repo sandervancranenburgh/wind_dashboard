@@ -10,9 +10,11 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
+import zipfile
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -86,8 +88,17 @@ SORT_OPTIONS = {
     "avg_forecast_temperature",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ACTIVITY_UPLOAD_EXTENSIONS = {".fit", ".gpx", ".kml"}
+MAX_ACTIVITY_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+ACTIVITY_UPLOAD_EXTENSIONS = {".fit", ".tcx", ".gpx", ".kml", ".zip"}
+ACTIVITY_ZIP_INNER_EXTENSIONS = ACTIVITY_UPLOAD_EXTENSIONS - {".zip"}
+ACTIVITY_UPLOAD_ACCEPT = (
+    ".fit,.FIT,.tcx,.TCX,.gpx,.GPX,.kml,.KML,.zip,.ZIP,"
+    "application/xml,text/xml,application/octet-stream,application/zip,"
+    "application/x-zip-compressed,application/gpx+xml,application/vnd.google-earth.kml+xml"
+)
 ACTIVITY_UPLOAD_FIELD = "ActivityFile"
+ACTIVITY_UPLOAD_FORMATS = "FIT, TCX, GPX, KML, or ZIP"
 ACTIVITY_ARTIFACT_LABELS = {
     "map_svg": "Session map",
     "run_distance_distribution_svg": "Run distance distribution",
@@ -128,7 +139,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("WIND_DASHBOARD_COOKIE_SECURE", "").lower()
     in {"1", "true", "yes"},
-    MAX_CONTENT_LENGTH=int(os.environ.get("WIND_DASHBOARD_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024))),
+    MAX_CONTENT_LENGTH=max(MAX_ACTIVITY_UPLOAD_BYTES, int(os.environ.get("WIND_DASHBOARD_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))),
 )
 
 
@@ -488,21 +499,124 @@ def _uploaded_activity_file():
     return uploaded
 
 
+def _unsupported_activity_message() -> str:
+    return f"Unsupported activity file. Please upload a {ACTIVITY_UPLOAD_FORMATS} file."
+
+
+def _activity_too_large_message() -> str:
+    limit_mb = MAX_ACTIVITY_UPLOAD_BYTES // (1024 * 1024)
+    return f"Activity file is too large. Please upload a file up to {limit_mb} MB."
+
+
+def _uploaded_stream_size(uploaded) -> int | None:
+    stream = getattr(uploaded, "stream", None)
+    if stream is not None:
+        try:
+            position = stream.tell()
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(position)
+            return int(size)
+        except (OSError, ValueError):
+            try:
+                stream.seek(0)
+            except (OSError, ValueError):
+                pass
+    content_length = getattr(uploaded, "content_length", None)
+    if content_length is None:
+        return None
+    try:
+        return int(content_length)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reset_uploaded_stream(uploaded) -> None:
+    stream = getattr(uploaded, "stream", None)
+    if stream is None:
+        return
+    try:
+        stream.seek(0)
+    except (OSError, ValueError):
+        pass
+
+
+def _zip_member_is_symlink(info: zipfile.ZipInfo) -> bool:
+    return stat.S_ISLNK(info.external_attr >> 16)
+
+
+def _zip_member_has_unsafe_path(info: zipfile.ZipInfo) -> bool:
+    name = info.filename
+    if not name or info.is_dir() or "\\" in name:
+        return True
+    member_path = PurePosixPath(name)
+    if member_path.is_absolute() or len(member_path.parts) != 1:
+        return True
+    if any(part in {"", ".", ".."} for part in member_path.parts):
+        return True
+    return _zip_member_is_symlink(info)
+
+
+def _validate_activity_zip_upload(uploaded) -> None:
+    stream = getattr(uploaded, "stream", None)
+    if stream is None:
+        raise ActivityUploadError("ZIP uploads must contain exactly one supported activity file.")
+    position = None
+    try:
+        position = stream.tell()
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as archive:
+            infos = archive.infolist()
+            if any(_zip_member_has_unsafe_path(info) for info in infos):
+                raise ActivityUploadError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+            file_infos = [info for info in infos if not info.is_dir()]
+            total_uncompressed = sum(info.file_size for info in file_infos)
+            total_compressed = sum(info.compress_size for info in file_infos)
+            if total_uncompressed > MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES or total_compressed > MAX_ACTIVITY_UPLOAD_BYTES:
+                raise ActivityUploadError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+            supported_files = [
+                info
+                for info in file_infos
+                if PurePosixPath(info.filename).suffix.lower() in ACTIVITY_ZIP_INNER_EXTENSIONS
+            ]
+            if len(file_infos) != 1 or len(supported_files) != 1:
+                raise ActivityUploadError("ZIP uploads must contain exactly one supported activity file.")
+    except ActivityUploadError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise ActivityUploadError("ZIP uploads must contain exactly one supported activity file.") from exc
+    finally:
+        try:
+            stream.seek(position or 0)
+        except (OSError, ValueError):
+            pass
+
+
 def _save_activity_upload(uploaded, experience_id: int) -> dict[str, Any]:
     original_filename = (uploaded.filename or "").strip()
     safe_name = secure_filename(original_filename)
     if not safe_name:
-        raise ActivityUploadError("Choose a FIT, GPX or KML activity file.")
+        raise ActivityUploadError(_unsupported_activity_message())
     suffix = Path(safe_name).suffix.lower()
     if suffix not in ACTIVITY_UPLOAD_EXTENSIONS:
-        raise ActivityUploadError("Activity file must be a FIT, GPX or KML file.")
+        raise ActivityUploadError(_unsupported_activity_message())
+
+    upload_size = _uploaded_stream_size(uploaded)
+    if upload_size is not None and upload_size > MAX_ACTIVITY_UPLOAD_BYTES:
+        raise ActivityUploadError(_activity_too_large_message())
+    if suffix == ".zip":
+        _validate_activity_zip_upload(uploaded)
 
     upload_dir = _activity_upload_dir(experience_id)
     upload_dir.mkdir(parents=True, exist_ok=True)
     stored_filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(8)}{suffix}"
     stored_path = upload_dir / stored_filename
     _ensure_child_path(stored_path, upload_dir)
+    _reset_uploaded_stream(uploaded)
     uploaded.save(stored_path)
+    if stored_path.stat().st_size > MAX_ACTIVITY_UPLOAD_BYTES:
+        stored_path.unlink(missing_ok=True)
+        raise ActivityUploadError(_activity_too_large_message())
     return {
         "original_filename": original_filename,
         "stored_filename": stored_filename,
@@ -1600,7 +1714,7 @@ def upload_experience_activity(experience_id: int):
         abort(404)
     uploaded = _uploaded_activity_file()
     if uploaded is None:
-        flash("Choose a FIT, GPX or KML activity file.", "error")
+        flash(f"Upload a {ACTIVITY_UPLOAD_FORMATS} activity file.", "error")
         return redirect(url_for("experience_detail", experience_id=experience_id))
     try:
         analysis = _run_activity_analysis_for_upload(conn, row, uploaded)

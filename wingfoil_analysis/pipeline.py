@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Analyze a wingfoil GPX/KML/FIT activity and emit rider-portal artifacts.
+"""Analyze a wingfoil GPX/KML/FIT/TCX activity and emit rider-portal artifacts.
 
 The pipeline is intentionally dependency-light:
-  GPX/KML/FIT -> canonical dataframe -> samples -> runs/falls -> website assets
+  GPX/KML/FIT/TCX -> canonical dataframe -> samples -> runs/falls -> website assets
 
 Speed is derived from GPS distance and timestamps because GPS exports often do
 not include a speed extension.
@@ -14,11 +14,14 @@ import argparse
 import csv
 import json
 import math
+import stat
 import statistics
 import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
@@ -64,7 +67,10 @@ ARTIFACTS = {
     "run_wind_angle_distribution_svg": "run_wind_angle_distribution.svg",
     "run_speed_profile_svg": "run_speed.svg",
 }
-SUPPORTED_EXTENSIONS = {".gpx", ".kml", ".fit"}
+MAX_ACTIVITY_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+ACTIVITY_FILE_EXTENSIONS = {".gpx", ".kml", ".fit", ".tcx"}
+SUPPORTED_EXTENSIONS = ACTIVITY_FILE_EXTENSIONS | {".zip"}
 
 DEFAULT_SETTINGS = {
     "run_speed_threshold_mps": 4.0,
@@ -275,6 +281,102 @@ def first_present(*values: object) -> object | None:
         if value is not None:
             return value
     return None
+
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def child_text(element: ET.Element | None, name: str) -> str | None:
+    if element is None:
+        return None
+    for child in element:
+        if xml_local_name(child.tag) == name and child.text and child.text.strip():
+            return child.text.strip()
+    return None
+
+
+def first_descendant_text(element: ET.Element, name: str) -> str | None:
+    for child in element.iter():
+        if child is element:
+            continue
+        if xml_local_name(child.tag) == name and child.text and child.text.strip():
+            return child.text.strip()
+    return None
+
+
+def tcx_heart_rate_bpm(trackpoint: ET.Element) -> int | None:
+    for child in trackpoint:
+        if xml_local_name(child.tag) != "HeartRateBpm":
+            continue
+        return parse_optional_int(child_text(child, "Value"))
+    return None
+
+
+def parse_optional_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    parsed = parse_optional_float(value)
+    return int(parsed) if parsed is not None else None
+
+
+def zip_member_has_unsafe_path(info: zipfile.ZipInfo) -> bool:
+    name = info.filename
+    if not name or info.is_dir() or "\\" in name:
+        return True
+    member_path = PurePosixPath(name)
+    if member_path.is_absolute() or len(member_path.parts) != 1:
+        return True
+    if any(part in {"", ".", ".."} for part in member_path.parts):
+        return True
+    return stat.S_ISLNK(info.external_attr >> 16)
+
+
+def select_single_activity_zip_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    infos = archive.infolist()
+    if any(zip_member_has_unsafe_path(info) for info in infos):
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+    file_infos = [info for info in infos if not info.is_dir()]
+    total_uncompressed = sum(info.file_size for info in file_infos)
+    total_compressed = sum(info.compress_size for info in file_infos)
+    if total_uncompressed > MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES or total_compressed > MAX_ACTIVITY_UPLOAD_BYTES:
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+    supported_files = [
+        info
+        for info in file_infos
+        if PurePosixPath(info.filename).suffix.lower() in ACTIVITY_FILE_EXTENSIONS
+    ]
+    if len(file_infos) != 1 or len(supported_files) != 1:
+        raise AnalysisError("ZIP uploads must contain exactly one supported activity file.")
+    return supported_files[0]
+
+
+def extract_single_activity_from_zip(path: Path, output_dir: Path) -> Path:
+    if path.stat().st_size > MAX_ACTIVITY_UPLOAD_BYTES:
+        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            member = select_single_activity_zip_member(archive)
+            inner_name = PurePosixPath(member.filename).name
+            extracted_path = output_dir / inner_name
+            with archive.open(member) as source, extracted_path.open("wb") as target:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    if target.tell() > MAX_ACTIVITY_ZIP_UNCOMPRESSED_BYTES:
+                        raise AnalysisError("ZIP upload rejected because it contains unsafe paths or is too large when extracted.")
+            return extracted_path
+    except zipfile.BadZipFile as exc:
+        raise AnalysisError("ZIP uploads must contain exactly one supported activity file.") from exc
 
 
 def canonicalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -488,9 +590,50 @@ def load_fit_activity(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
 
 
+def load_tcx_activity(path: Path) -> pd.DataFrame:
+    tree = ET.parse(path)
+    root = tree.getroot()
+    rows = []
+
+    for trackpoint in root.iter():
+        if xml_local_name(trackpoint.tag) != "Trackpoint":
+            continue
+        timestamp_text = child_text(trackpoint, "Time")
+        position = None
+        for child in trackpoint:
+            if xml_local_name(child.tag) == "Position":
+                position = child
+                break
+        lat = parse_optional_float(child_text(position, "LatitudeDegrees"))
+        lon = parse_optional_float(child_text(position, "LongitudeDegrees"))
+        if not timestamp_text or lat is None or lon is None:
+            continue
+        try:
+            timestamp = parse_time(timestamp_text)
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "lat": lat,
+                "lon": lon,
+                "altitude_m": parse_optional_float(child_text(trackpoint, "AltitudeMeters")),
+                "speed_mps": parse_optional_float(first_descendant_text(trackpoint, "Speed")),
+                "distance_m": parse_optional_float(child_text(trackpoint, "DistanceMeters")),
+                "heart_rate_bpm": tcx_heart_rate_bpm(trackpoint),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
+
+
 def load_activity(path: Path, smooth_window: int) -> tuple[list[Sample], list[str]]:
     suffix = path.suffix.lower()
     warnings: list[str] = []
+    if suffix == ".zip":
+        with tempfile.TemporaryDirectory(prefix="wingfoil_activity_zip_") as temp_dir:
+            inner_path = extract_single_activity_from_zip(path, Path(temp_dir))
+            return load_activity(inner_path, smooth_window)
     if suffix == ".gpx":
         df = load_gpx_activity(path)
     elif suffix == ".kml":
@@ -499,8 +642,11 @@ def load_activity(path: Path, smooth_window: int) -> tuple[list[Sample], list[st
         df = load_fit_activity(path)
         if df.empty:
             warnings.append("FIT file has no GPS records")
+    elif suffix == ".tcx":
+        df = load_tcx_activity(path)
     else:
-        raise ValueError(f"Unsupported activity format: {path.suffix}. Expected .gpx, .kml, or .fit")
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ValueError(f"Unsupported activity format: {path.suffix}. Expected one of: {supported}")
 
     return dataframe_to_samples(df, smooth_window, warnings), warnings
 
@@ -1097,7 +1243,7 @@ def write_map_html(
             wind_label += f", {wind_payload['wind_speed_kts']:.0f} kt"
 
     payload = {
-        "source_filename": source_activity.name,
+        "source_filename": "activity",
         "source_format": source_activity.suffix.lower().lstrip("."),
         "center": [statistics.mean(sample.lat for sample in samples), statistics.mean(sample.lon for sample in samples)],
         "bounds": [[min(sample.lat for sample in samples), min(sample.lon for sample in samples)], [max(sample.lat for sample in samples), max(sample.lon for sample in samples)]],
@@ -1831,7 +1977,7 @@ def write_summary_json(
     raw_run_count = sum(run.merged_raw_run_count for run in runs)
 
     payload = {
-        "source_filename": source_activity.name,
+        "source_filename": "activity",
         "source_format": source_activity.suffix.lower().lstrip("."),
         "activity_type": source_activity.suffix.lower().lstrip("."),
         "analysis_status": "ok",
@@ -2128,9 +2274,9 @@ def analyze(args: argparse.Namespace) -> AnalysisResult:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze wingfoil runs and falls from a GPX, KML, or FIT file.")
-    parser.add_argument("activity", nargs="?", help="Input GPX, KML, or FIT file")
-    parser.add_argument("--input", dest="input_file", help="Input GPX, KML, or FIT file")
+    parser = argparse.ArgumentParser(description="Analyze wingfoil runs and falls from a GPX, KML, FIT, TCX, or ZIP file.")
+    parser.add_argument("activity", nargs="?", help="Input GPX, KML, FIT, TCX, or ZIP file")
+    parser.add_argument("--input", dest="input_file", help="Input GPX, KML, FIT, TCX, or ZIP file")
     parser.add_argument("-o", "--output-dir", "--out-dir", default="outputs/wingfoil_analysis", help="Directory for JSON, CSV, and SVG artifacts")
     parser.add_argument("--run-speed-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_speed_threshold_mps"], help="Minimum smoothed speed required to start a run")
     parser.add_argument("--run-continue-threshold-mps", type=float, default=DEFAULT_SETTINGS["run_continue_threshold_mps"], help="Minimum smoothed speed to keep an active run alive")

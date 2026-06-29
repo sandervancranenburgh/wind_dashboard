@@ -96,13 +96,14 @@
           <p class="desc">Only visible to you. Not shown on public submissions.</p>
         </div>
         <div class="form-row-full activity-file-control">
-          <input class="activity-file-native" id="ActivityFile" name="ActivityFile" type="file" accept=".fit,.gpx,.kml">
+          <input class="activity-file-native" id="ActivityFile" name="ActivityFile" type="file" accept=".fit,.FIT,.tcx,.TCX,.gpx,.GPX,.kml,.KML,.zip,.ZIP,application/xml,text/xml,application/octet-stream,application/zip,application/x-zip-compressed,application/gpx+xml,application/vnd.google-earth.kml+xml">
           <div class="activity-file-box">
             <label class="activity-file-trigger" for="ActivityFile">Upload file</label>
             <div class="activity-file-display" id="ActivityFileDisplay" aria-live="polite">
               <span class="activity-file-name muted">No activity file uploaded</span>
             </div>
           </div>
+          <p class="desc">Upload a FIT, TCX, GPX, KML, or ZIP activity file. FIT/original is preferred; TCX is the best fallback; GPX and KML also work. ZIP files should contain one supported activity file.</p>
         </div>
         <fieldset class="form-row-full">
           <legend>Visibility</legend>

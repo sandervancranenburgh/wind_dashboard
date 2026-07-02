@@ -1325,7 +1325,9 @@ def write_map_html(
             "elapsed_time_s": round(elapsed_time_s, 1),
             "total_distance_km": round(total_distance_m / 1000, 2),
             "max_speed_kmh": round(max_speed_track_mps * MPS_TO_KMH, 1),
+            "foil_distance_m": round(foil_distance_m, 2),
             "avg_run_distance_km": round(avg_run_distance_m / 1000, 2) if avg_run_distance_m is not None else None,
+            "avg_run_distance_m": round(avg_run_distance_m, 2) if avg_run_distance_m is not None else None,
             "avg_speed_on_foil_kmh": round(avg_speed_on_foil_mps * MPS_TO_KMH, 1) if avg_speed_on_foil_mps is not None else None,
             "water_time_s": round(water_time_s, 1),
             "water_time_formatted": format_duration_s(water_time_s),
@@ -1693,21 +1695,28 @@ function formatDuration(seconds) {{
   return `${{minutes}}m`;
 }}
 
+function formatDistanceMeters(value) {{
+  const distanceM = Number(value);
+  if (!Number.isFinite(distanceM)) return "n/a";
+  if (distanceM < 1000) return `${{Math.round(distanceM)}} m`;
+  const distanceKm = distanceM / 1000;
+  return `${{distanceKm.toFixed(1).replace(/\\.0$/, "")}} km`;
+}}
+
 function statCard(value, label) {{
   return `<div class="stat"><div class="stat-value">${{escapeHtml(value)}}</div><div class="stat-label">${{escapeHtml(label)}}</div></div>`;
 }}
 
 function renderStats() {{
-  const avgRun = data.activity.avg_run_distance_km === null || data.activity.avg_run_distance_km === undefined
-    ? "n/a"
-    : `${{data.activity.avg_run_distance_km}} km`;
+  const distanceOnFoil = formatDistanceMeters(data.activity.foil_distance_m);
+  const avgRun = formatDistanceMeters(data.activity.avg_run_distance_m);
   const avgFoilSpeed = data.activity.avg_speed_on_foil_kmh === null || data.activity.avg_speed_on_foil_kmh === undefined
     ? "n/a"
     : `${{data.activity.avg_speed_on_foil_kmh}} km/h`;
   document.getElementById("statsGrid").innerHTML = [
     statCard(formatDuration(data.activity.elapsed_time_s), "elapsed time"),
     statCard(data.activity.foil_time_formatted, "time on foil"),
-    statCard(data.activity.water_time_formatted, "time in water"),
+    statCard(distanceOnFoil, "distance on foil"),
     statCard(`${{data.activity.total_distance_km}} km`, "total distance"),
     statCard(data.activity.run_count, "runs"),
     statCard(data.activity.fall_count, "falls"),

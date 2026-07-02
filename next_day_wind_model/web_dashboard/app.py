@@ -86,6 +86,8 @@ SORT_OPTIONS = {
     "wind_variability",
     "mean_measured_direction",
     "avg_forecast_temperature",
+    "activity_foil_distance_m",
+    "activity_avg_run_distance_m",
 }
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MAX_ACTIVITY_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -693,22 +695,104 @@ def _format_stat_value(value: Any, suffix: str = "", digits: int = 1) -> str | N
     return f"{formatted} {suffix}".strip()
 
 
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_activity_distance_m(value: Any) -> str | None:
+    distance_m = _to_float(value)
+    if distance_m is None:
+        return None
+    if distance_m < 1000:
+        return f"{distance_m:.0f} m"
+    distance_km = distance_m / 1000
+    formatted = f"{distance_km:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted} km"
+
+
+def _km_to_m(value: Any) -> float | None:
+    distance_km = _to_float(value)
+    return distance_km * 1000 if distance_km is not None else None
+
+
+def _activity_avg_run_distance_m(summary: dict[str, Any], stats: dict[str, Any] | None = None) -> float | None:
+    stats = stats or {}
+    activity = summary.get("activity") if isinstance(summary, dict) else {}
+    activity = activity or {}
+    runs_summary = summary.get("runs_summary") if isinstance(summary, dict) else {}
+    distance_summary = runs_summary.get("distance_m") if isinstance(runs_summary, dict) else {}
+    candidates = [
+        stats.get("avg_run_distance_m"),
+        activity.get("avg_run_distance_m"),
+        distance_summary.get("mean") if isinstance(distance_summary, dict) else None,
+        _km_to_m(stats.get("avg_run_distance_km")),
+        _km_to_m(activity.get("avg_run_distance_km")),
+    ]
+    for value in candidates:
+        distance_m = _to_float(value)
+        if distance_m is not None:
+            return distance_m
+    return None
+
+
+def _activity_distance_on_foil_m(summary: dict[str, Any], stats: dict[str, Any] | None = None) -> float | None:
+    stats = stats or {}
+    activity = summary.get("activity") if isinstance(summary, dict) else {}
+    activity = activity or {}
+    for value in (
+        stats.get("foil_distance_m"),
+        stats.get("on_foil_distance_m"),
+        activity.get("foil_distance_m"),
+        activity.get("on_foil_distance_m"),
+    ):
+        distance_m = _to_float(value)
+        if distance_m is not None:
+            return distance_m
+
+    runs = summary.get("runs") if isinstance(summary, dict) else None
+    if isinstance(runs, list):
+        distances = [_to_float(run.get("distance_m")) for run in runs if isinstance(run, dict)]
+        present = [distance for distance in distances if distance is not None]
+        if present:
+            return sum(present)
+
+    runs_summary = summary.get("runs_summary") if isinstance(summary, dict) else {}
+    distance_summary = runs_summary.get("distance_m") if isinstance(runs_summary, dict) else {}
+    if isinstance(distance_summary, dict):
+        distance_m = _to_float(distance_summary.get("sum") or distance_summary.get("total"))
+        if distance_m is not None:
+            return distance_m
+
+    avg_run_distance_m = _activity_avg_run_distance_m(summary, stats)
+    run_count = _to_float(stats.get("run_count") or (runs_summary or {}).get("count"))
+    if avg_run_distance_m is not None and run_count is not None:
+        return avg_run_distance_m * run_count
+    return None
+
+
 def _activity_summary_items(analysis: dict[str, Any]) -> list[dict[str, str]]:
     stats = analysis.get("stats") or {}
     summary = analysis.get("summary") or {}
     activity = summary.get("activity") if isinstance(summary, dict) else {}
     activity = activity or {}
+    distance_on_foil = _format_activity_distance_m(_activity_distance_on_foil_m(summary, stats))
+    avg_run_distance = _format_activity_distance_m(_activity_avg_run_distance_m(summary, stats))
     items = [
         ("Distance", _format_stat_value(stats.get("distance_km") or activity.get("total_distance_m") and float(activity["total_distance_m"]) / 1000, "km", 2)),
         ("Max speed", _format_stat_value(stats.get("max_speed_kmh"), "km/h", 1)),
         ("Avg foil speed", _format_stat_value(stats.get("avg_speed_on_foil_kmh") or activity.get("avg_speed_on_foil_kmh"), "km/h", 1)),
+        ("Avg run distance", avg_run_distance),
         ("Runs", _format_stat_value(stats.get("run_count") or (summary.get("runs_summary") or {}).get("count"), "", 0)),
         ("Falls", _format_stat_value(stats.get("fall_count") or (summary.get("falls_summary") or {}).get("count"), "", 0)),
         ("Track points", _format_stat_value(stats.get("track_point_count") or activity.get("sample_count"), "", 0)),
     ]
-    water_time = activity.get("water_time_formatted")
-    if water_time:
-        items.insert(1, ("Water time", str(water_time)))
+    if distance_on_foil:
+        items.insert(1, ("Distance on foil", distance_on_foil))
     return [{"label": label, "value": value} for label, value in items if value]
 
 
@@ -1621,6 +1705,9 @@ def experiences():
         scope = "mine"
     db_store.backfill_surf_experience_measured_summaries(get_db(), user_id=int(current_user()["id"]))
     rows = db_store.list_surf_experiences(get_db(), int(current_user()["id"]), sort_key, sort_dir, scope=scope)
+    for row in rows:
+        row["activity_foil_distance_display"] = _format_activity_distance_m(row.get("activity_foil_distance_m")) or "n/a"
+        row["activity_avg_run_distance_display"] = _format_activity_distance_m(row.get("activity_avg_run_distance_m")) or "n/a"
     return render_template(
         "submissions.html",
         rows=rows,

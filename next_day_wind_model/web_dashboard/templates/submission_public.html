@@ -40,12 +40,14 @@
     .activity-artifact img { border: 1px solid #ddd; border-radius: 8px; background: #fff; max-width: 100%; object-fit: contain; }
     .activity-artifact figcaption { color: #555; margin-top: 6px; font-size: 13px; }
     .activity-runs { margin-top: 12px; overflow-x: auto; }
-    .activity-runs table { border-collapse: collapse; width: 100%; min-width: 620px; }
+    .activity-runs table { border-collapse: collapse; width: 100%; min-width: 660px; }
     .activity-runs th, .activity-runs td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    .activity-runs .run-select-column, .activity-runs .run-select-cell { min-width: 72px; white-space: nowrap; }
+    .activity-runs .run-distance-column, .activity-runs .run-distance-cell { min-width: 112px; white-space: nowrap; }
     .activity-runs th { background: #f6f6f6; }
     .activity-run-row { cursor: pointer; }
     .activity-run-row.is-selected { background: #eaf4ff; }
-    .run-select-label { align-items: center; display: inline-flex; gap: 6px; font-weight: 700; white-space: nowrap; }
+    .run-select-label { align-items: center; display: inline-flex; flex-wrap: nowrap; gap: 6px; font-weight: 700; white-space: nowrap; }
     .run-select-checkbox { margin: 0; }
     .activity-sort-button { align-items: center; background: transparent; border: 0; color: inherit; cursor: pointer; display: inline-flex; font: inherit; font-weight: 700; gap: 4px; padding: 0; text-align: left; }
     .activity-sort-button.is-active { color: #174f7a; }

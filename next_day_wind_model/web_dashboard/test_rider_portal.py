@@ -88,6 +88,34 @@ class RiderPortalTest(unittest.TestCase):
         gpx = b'<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">\n  <trk><name>Test</name><trkseg>\n    <trkpt lat="52.1" lon="4.4"><time>2026-01-20T11:00:00Z</time></trkpt>\n    <trkpt lat="52.1005" lon="4.4005"><time>2026-01-20T11:00:10Z</time></trkpt>\n  </trkseg></trk>\n</gpx>\n'
         return (io.BytesIO(gpx), filename)
 
+    def _store_activity_summary(
+        self,
+        experience_id: int,
+        user_id: int,
+        summary: dict[str, object],
+        stats: dict[str, object] | None = None,
+    ) -> None:
+        conn = db_store.connect_db(self.temp_dir.name)
+        db_store.upsert_surf_experience_activity_analysis(
+            conn,
+            {
+                "experience_id": experience_id,
+                "user_id": user_id,
+                "uploaded_at": "2026-01-20T12:00:00Z",
+                "original_filename": "session.gpx",
+                "stored_filename": "session.gpx",
+                "file_type": "gpx",
+                "status": "ok",
+                "summary": summary,
+                "stats": stats or {},
+                "artifacts": {},
+                "warnings": [],
+                "errors": [],
+                "analysis_version": "test-version",
+            },
+        )
+        conn.close()
+
     def _tcx_bytes(self) -> bytes:
         return b'''<?xml version="1.0" encoding="UTF-8"?>
 <TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
@@ -113,10 +141,12 @@ class RiderPortalTest(unittest.TestCase):
             "activity": {
                 "total_distance_m": 1234.0,
                 "water_time_formatted": "20m 0s",
+                "avg_run_distance_m": 657.0,
                 "avg_speed_on_foil_kmh": 18.5,
                 "sample_count": 42,
             },
-            "runs_summary": {"count": 2},
+            "runs_summary": {"count": 13},
+            "runs": [{"run_id": index, "distance_m": 650 + index} for index in range(1, 14)],
             "falls_summary": {"count": 1},
             "warnings": ["summary warning"],
         }
@@ -165,7 +195,8 @@ class RiderPortalTest(unittest.TestCase):
                 "distance_km": 1.234,
                 "max_speed_kmh": 24.0,
                 "avg_speed_on_foil_kmh": 18.5,
-                "run_count": 2,
+                "run_count": 13,
+                "avg_run_distance_m": 657.0,
                 "fall_count": 1,
                 "track_point_count": 42,
             },
@@ -1306,6 +1337,148 @@ class RiderPortalTest(unittest.TestCase):
         positions = [response.data.index(f'href="/experiences/{experience_id}"'.encode()) for experience_id in ordered_ids]
         self.assertEqual(positions, sorted(positions))
 
+    def test_generated_activity_dashboard_formats_session_stats(self) -> None:
+        base_time = datetime(2026, 1, 20, 11, 0, tzinfo=timezone.utc)
+        samples = [
+            wingfoil_pipeline.Sample(
+                index=0,
+                lat=52.0,
+                lon=4.0,
+                ele_m=None,
+                time=base_time,
+                dt_s=0.0,
+                segment_distance_m=0.0,
+                speed_mps=0.0,
+                smooth_speed_mps=0.0,
+                in_run=True,
+            )
+        ]
+        runs = []
+        for index in range(1, 30):
+            samples.append(
+                wingfoil_pipeline.Sample(
+                    index=index,
+                    lat=52.0,
+                    lon=4.0 + index * 0.0001,
+                    ele_m=None,
+                    time=base_time + timedelta(seconds=index * 10),
+                    dt_s=10.0,
+                    segment_distance_m=190.0,
+                    speed_mps=19.0,
+                    smooth_speed_mps=19.0,
+                    in_run=True,
+                )
+            )
+            runs.append(
+                wingfoil_pipeline.Run(
+                    run_id=index,
+                    start_index=index,
+                    end_index=index,
+                    start_time=base_time + timedelta(seconds=index * 10),
+                    end_time=base_time + timedelta(seconds=index * 10),
+                    duration_s=10.0,
+                    distance_m=190.0,
+                    mean_speed_mps=19.0,
+                    median_speed_mps=19.0,
+                    max_speed_mps=19.0,
+                    start_lat=52.0,
+                    start_lon=4.0 + index * 0.0001,
+                    end_lat=52.0,
+                    end_lon=4.0 + index * 0.0001,
+                    wind_angle_class="crosswind",
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "map.html"
+            wingfoil_pipeline.write_map_html(
+                map_path,
+                Path("private-session.tcx"),
+                samples,
+                runs,
+                [],
+                wingfoil_pipeline.WindContext(),
+                water_time_s=3457.0,
+            )
+            map_text = map_path.read_text(encoding="utf-8")
+
+        self.assertIn('"foil_distance_m": 5510.0', map_text)
+        self.assertIn('"avg_run_distance_m": 190.0', map_text)
+        self.assertIn('statCard(distanceOnFoil, "distance on foil")', map_text)
+        self.assertIn('formatDistanceMeters(data.activity.avg_run_distance_m)', map_text)
+        self.assertIn('return `${Math.round(distanceM)} m`', map_text)
+        self.assertIn('return `${distanceKm.toFixed(1).replace(/\\.0$/, "")} km`', map_text)
+        self.assertNotIn('statCard(data.activity.water_time_formatted, "time in water")', map_text)
+        self.assertNotIn('>TIME IN WATER<', map_text.upper())
+
+    def test_activity_metrics_render_and_sort_on_submissions_overview(self) -> None:
+        small_id = self._create_submission(self.user_id, "Small Activity", "2026-03-11", "private")
+        large_id = self._create_submission(self.user_id, "Large Activity", "2026-03-12", "private")
+        missing_id = self._create_submission(self.user_id, "Missing Activity", "2026-03-13", "private")
+        self._store_activity_summary(
+            small_id,
+            self.user_id,
+            {
+                "activity": {"avg_run_distance_m": 236.0},
+                "runs_summary": {"count": 3},
+                "runs": [{"run_id": 1, "distance_m": 200.0}, {"run_id": 2, "distance_m": 242.0}, {"run_id": 3, "distance_m": 300.0}],
+            },
+        )
+        self._store_activity_summary(
+            large_id,
+            self.user_id,
+            {
+                "activity": {"avg_run_distance_m": 1200.0},
+                "runs_summary": {"count": 2},
+                "runs": [{"run_id": 1, "distance_m": 1100.0}, {"run_id": 2, "distance_m": 1100.0}],
+            },
+        )
+        self._store_activity_summary(
+            missing_id,
+            self.user_id,
+            {"activity": {"total_distance_m": 5000.0}, "runs_summary": {"count": 2}},
+        )
+
+        self._set_user(self.user_id)
+        overview = self.client.get("/experiences?scope=mine")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn(b"Distance on foil", overview.data)
+        self.assertIn(b"Avg run distance", overview.data)
+        self.assertIn(b"sort=activity_foil_distance_m", overview.data)
+        self.assertIn(b"sort=activity_avg_run_distance_m", overview.data)
+        self.assertIn(b"742 m", overview.data)
+        self.assertIn(b"236 m", overview.data)
+        self.assertIn(b"2.2 km", overview.data)
+        self.assertIn(b"1.2 km", overview.data)
+
+        missing_link = f'href="/experiences/{missing_id}"'.encode()
+        missing_position = overview.data.index(missing_link)
+        row_start = overview.data.rfind(b"<tr", 0, missing_position)
+        row_end = overview.data.find(b"</tr>", missing_position)
+        self.assertIn(b">n/a</td>", overview.data[row_start:row_end])
+
+        by_foil_desc = self.client.get("/experiences?scope=mine&sort=activity_foil_distance_m&dir=desc")
+        self.assertEqual(by_foil_desc.status_code, 200)
+        self.assertLess(
+            by_foil_desc.data.index(f'href="/experiences/{large_id}"'.encode()),
+            by_foil_desc.data.index(f'href="/experiences/{small_id}"'.encode()),
+        )
+        self.assertLess(
+            by_foil_desc.data.index(f'href="/experiences/{small_id}"'.encode()),
+            by_foil_desc.data.index(f'href="/experiences/{missing_id}"'.encode()),
+        )
+
+        by_avg_asc = self.client.get("/experiences?scope=mine&sort=activity_avg_run_distance_m&dir=asc")
+        self.assertEqual(by_avg_asc.status_code, 200)
+        self.assertLess(
+            by_avg_asc.data.index(f'href="/experiences/{small_id}"'.encode()),
+            by_avg_asc.data.index(f'href="/experiences/{large_id}"'.encode()),
+        )
+        self.assertLess(
+            by_avg_asc.data.index(f'href="/experiences/{large_id}"'.encode()),
+            by_avg_asc.data.index(f'href="/experiences/{missing_id}"'.encode()),
+        )
+
     def test_submission_scopes_and_detail_access_control(self) -> None:
         self._set_profile(self.user_id, "Zulu Rider", "Owner Private Name")
         self._set_profile(self.other_user_id, "Alpha Rider", "Other Private Name")
@@ -1761,7 +1934,7 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIsNotNone(analysis)
         self.assertEqual(analysis["status"], "ok")
         self.assertEqual(analysis["original_filename"], "my-session.gpx")
-        self.assertEqual(analysis["stats"]["run_count"], 2)
+        self.assertEqual(analysis["stats"]["run_count"], 13)
         self.assertEqual(analysis["artifacts"]["map_html"], "map.html")
         self.assertIn("timestamps are irregular", analysis["warnings"][0])
 
@@ -1778,8 +1951,12 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"Current file:", detail.data)
         self.assertIn(b"GPS timestamps were somewhat irregular; speed and distance were reconstructed where needed.", detail.data)
         self.assertNotIn(b"median interval is 0.70s", detail.data)
-        self.assertNotIn(b'class="activity-stats"', detail.data)
-        self.assertNotIn(b"1.23 km", detail.data)
+        self.assertNotIn(b'class="activity-summary-stats"', detail.data)
+        self.assertNotIn(b'class="activity-summary-stat"', detail.data)
+        self.assertNotIn(b"Distance on foil", detail.data)
+        self.assertNotIn(b"Avg run distance", detail.data)
+        self.assertNotIn(b"Water time", detail.data)
+        self.assertNotIn(b"20m 0s", detail.data)
         self.assertIn(b'class="activity-analysis-frame"', detail.data)
         self.assertIn(f"/experiences/{experience_id}/activity-artifact/map.html".encode(), detail.data)
         self.assertIn(b"Distance (m)", detail.data)
@@ -1791,6 +1968,8 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"24.04 km/h", detail.data)
         self.assertNotIn(b"0.651 km", detail.data)
         self.assertIn(b'class="run-select-checkbox"', detail.data)
+        self.assertIn(b'class="run-select-cell"', detail.data)
+        self.assertIn(b'class="run-distance-cell"', detail.data)
         self.assertIn(b'data-run-id="13"', detail.data)
         self.assertIn(b'class="activity-sort-button"', detail.data)
         self.assertIn(b'data-sort-type="number"', detail.data)

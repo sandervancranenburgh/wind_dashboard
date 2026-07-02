@@ -26,8 +26,8 @@
       <table>
         <thead>
           <tr>
-            <th><button class="activity-sort-button" type="button" data-sort-index="0" data-sort-type="number" aria-label="Sort by run">Run <span class="sort-indicator" aria-hidden="true"></span></button></th>
-            <th><button class="activity-sort-button" type="button" data-sort-index="1" data-sort-type="number" aria-label="Sort by distance">Distance (m) <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th class="run-select-column"><button class="activity-sort-button" type="button" data-sort-index="0" data-sort-type="number" aria-label="Sort by run">Run <span class="sort-indicator" aria-hidden="true"></span></button></th>
+            <th class="run-distance-column"><button class="activity-sort-button" type="button" data-sort-index="1" data-sort-type="number" aria-label="Sort by distance">Distance (m) <span class="sort-indicator" aria-hidden="true"></span></button></th>
             <th><button class="activity-sort-button" type="button" data-sort-index="2" data-sort-type="number" aria-label="Sort by mean speed">Mean speed <span class="sort-indicator" aria-hidden="true"></span></button></th>
             <th><button class="activity-sort-button" type="button" data-sort-index="3" data-sort-type="number" aria-label="Sort by max speed">Max speed <span class="sort-indicator" aria-hidden="true"></span></button></th>
             <th><button class="activity-sort-button" type="button" data-sort-index="4" data-sort-type="text" aria-label="Sort by wind angle">Wind angle <span class="sort-indicator" aria-hidden="true"></span></button></th>
@@ -36,13 +36,13 @@
         <tbody>
           {% for run in activity_analysis.runs %}
             <tr class="activity-run-row" data-run-id="{{ run.run_id }}">
-              <td data-sort-value="{{ run.run_id }}">
+              <td class="run-select-cell" data-sort-value="{{ run.run_id }}">
                 <label class="run-select-label">
                   <input class="run-select-checkbox" type="checkbox" value="{{ run.run_id }}" aria-label="Show run {{ run.run_id }} on map">
                   <span>{{ run.run_id }}</span>
                 </label>
               </td>
-              <td data-sort-value="{{ run.distance_m }}">{{ run.distance_m }} m</td>
+              <td class="run-distance-cell" data-sort-value="{{ run.distance_m }}">{{ run.distance_m }} m</td>
               <td data-sort-value="{{ run.mean_speed_kmh }}">{{ run.mean_speed_kmh }} km/h</td>
               <td data-sort-value="{{ run.max_speed_kmh }}">{{ run.max_speed_kmh }} km/h</td>
               <td data-sort-value="{{ run.wind_angle_class or 'n/a' }}">{{ run.wind_angle_class or 'n/a' }}</td>

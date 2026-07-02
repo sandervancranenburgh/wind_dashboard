@@ -37,6 +37,8 @@
             <th>{{ sort_link('Measured variability', 'wind_variability') }}</th>
             <th>{{ sort_link('Mean dir', 'mean_measured_direction') }}</th>
             <th>{{ sort_link('Avg air temp', 'avg_forecast_temperature') }}</th>
+            <th>{{ sort_link('Distance on foil', 'activity_foil_distance_m') }}</th>
+            <th>{{ sort_link('Avg run distance', 'activity_avg_run_distance_m') }}</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -67,6 +69,8 @@
               <td>{{ ('%.2f'|format(row.wind_variability)) if row.wind_variability is not none else 'n/a' }}</td>
               <td>{{ row.mean_measured_direction_display or 'n/a' }}</td>
               <td>{{ ('%.0f C'|format(row.avg_forecast_temperature)) if row.avg_forecast_temperature is not none else 'n/a' }}</td>
+              <td>{{ row.activity_foil_distance_display }}</td>
+              <td>{{ row.activity_avg_run_distance_display }}</td>
               <td>
                 {% if row.is_owner %}
                   <div class="table-actions">
@@ -83,7 +87,7 @@
             </tr>
           {% else %}
             <tr>
-              <td colspan="16">No submissions yet.</td>
+              <td colspan="18">No submissions yet.</td>
             </tr>
           {% endfor %}
         </tbody>

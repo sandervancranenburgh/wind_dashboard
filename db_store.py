@@ -2632,6 +2632,61 @@ def delete_surf_experience(conn: sqlite3.Connection, user_id: int, experience_id
     return int(cur.rowcount) > 0
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _activity_overview_metrics(summary_raw: Optional[str]) -> tuple[Optional[float], Optional[float]]:
+    if not summary_raw:
+        return None, None
+    try:
+        summary = json.loads(summary_raw)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(summary, dict):
+        return None, None
+
+    activity = summary.get("activity") if isinstance(summary.get("activity"), dict) else {}
+    runs_summary = summary.get("runs_summary") if isinstance(summary.get("runs_summary"), dict) else {}
+    distance_summary = runs_summary.get("distance_m") if isinstance(runs_summary.get("distance_m"), dict) else {}
+
+    avg_run_distance_m = _float_or_none(activity.get("avg_run_distance_m"))
+    if avg_run_distance_m is None:
+        avg_run_distance_m = _float_or_none(distance_summary.get("mean"))
+    if avg_run_distance_m is None:
+        avg_run_distance_km = _float_or_none(activity.get("avg_run_distance_km"))
+        avg_run_distance_m = avg_run_distance_km * 1000 if avg_run_distance_km is not None else None
+
+    foil_distance_m = None
+    for value in (activity.get("foil_distance_m"), activity.get("on_foil_distance_m")):
+        foil_distance_m = _float_or_none(value)
+        if foil_distance_m is not None:
+            break
+
+    if foil_distance_m is None:
+        runs = summary.get("runs")
+        if isinstance(runs, list):
+            distances = [_float_or_none(run.get("distance_m")) for run in runs if isinstance(run, dict)]
+            present = [distance for distance in distances if distance is not None]
+            if present:
+                foil_distance_m = sum(present)
+
+    if foil_distance_m is None:
+        foil_distance_m = _float_or_none(distance_summary.get("sum") or distance_summary.get("total"))
+
+    if foil_distance_m is None and avg_run_distance_m is not None:
+        run_count = _float_or_none(runs_summary.get("count"))
+        if run_count is not None:
+            foil_distance_m = avg_run_distance_m * run_count
+
+    return foil_distance_m, avg_run_distance_m
+
+
 def list_surf_experiences(
     conn: sqlite3.Connection,
     user_id: int,
@@ -2657,6 +2712,8 @@ def list_surf_experiences(
         "perceived_wind_variability": "e.date",
         "mean_measured_direction": "e.mean_measured_direction",
         "avg_forecast_temperature": "e.avg_forecast_temperature",
+        "activity_foil_distance_m": "e.date",
+        "activity_avg_run_distance_m": "e.date",
     }
     order_expr = allowed_sort.get(sort_key, allowed_sort["date"])
     direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
@@ -2673,9 +2730,11 @@ def list_surf_experiences(
                CAST(json_extract(e.measured_wind_data_json, '$.summary.wind_variability') AS REAL),
                COALESCE(e.mean_measured_direction, e.avg_measured_wind_dir),
                e.mean_measured_direction_label, e.avg_forecast_temperature,
-               e.perceived_wind_variability, e.measured_wind_data_json
+               e.perceived_wind_variability, e.measured_wind_data_json,
+               a.summary_json
         FROM surf_experiences AS e
         LEFT JOIN user_profiles AS p ON p.user_id = e.user_id
+        LEFT JOIN surf_experience_activity_analysis AS a ON a.experience_id = e.id AND a.status = 'ok'
         WHERE {where_clause}
         ORDER BY {order_expr} {direction}, e.start_time {direction}, e.id {direction}
         """,
@@ -2696,6 +2755,7 @@ def list_surf_experiences(
         mean_direction_label = row[23] or _wind_direction_label(mean_direction)
         perceived_variability = row[25]
         measured_raw = row[26] or "{}"
+        activity_foil_distance_m, activity_avg_run_distance_m = _activity_overview_metrics(row[27])
         try:
             measured = json.loads(measured_raw)
         except json.JSONDecodeError:
@@ -2735,6 +2795,8 @@ def list_surf_experiences(
                 "mean_measured_direction_label": mean_direction_label,
                 "mean_measured_direction_display": _wind_direction_display(mean_direction, mean_direction_label),
                 "avg_forecast_temperature": row[24],
+                "activity_foil_distance_m": activity_foil_distance_m,
+                "activity_avg_run_distance_m": activity_avg_run_distance_m,
             }
         )
     if sort_key == "wind_variability":
@@ -2750,6 +2812,14 @@ def list_surf_experiences(
         missing = [item for item in experiences if not item.get("perceived_wind_variability")]
         present.sort(
             key=lambda item: (perceived_order.get(item.get("perceived_wind_variability") or "", 99), item["date"], item["start_time"], item["id"]),
+            reverse=direction == "DESC",
+        )
+        experiences = present + missing
+    elif sort_key in {"activity_foil_distance_m", "activity_avg_run_distance_m"}:
+        present = [item for item in experiences if item.get(sort_key) is not None]
+        missing = [item for item in experiences if item.get(sort_key) is None]
+        present.sort(
+            key=lambda item: (item[sort_key], item["date"], item["start_time"], item["id"]),
             reverse=direction == "DESC",
         )
         experiences = present + missing

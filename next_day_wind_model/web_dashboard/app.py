@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import sys
 import zipfile
@@ -58,7 +59,10 @@ SPOT_OPTIONS = [
 ]
 WING_SIZE_OPTIONS = [2, 3, 4, 5, 6, 7, 8]
 FOIL_SIZE_OPTIONS = list(range(700, 2501, 100))
-SESSION_TIME_OPTIONS = [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
+SESSION_HOUR_OPTIONS = [f"{hour:02d}" for hour in range(24)]
+SESSION_MINUTE_OPTIONS = [f"{minute:02d}" for minute in range(0, 60, 10)]
+SESSION_TIME_OPTIONS = [f"{hour}:{minute}" for hour in SESSION_HOUR_OPTIONS for minute in SESSION_MINUTE_OPTIONS]
+SESSION_MINUTE_VALUES = {int(value) for value in SESSION_MINUTE_OPTIONS}
 PERCEIVED_WIND_VARIABILITY_OPTIONS = [
     ("very_steady", "Very steady"),
     ("steady", "Steady"),
@@ -289,9 +293,64 @@ def _parse_session_time(value: str) -> tuple[int, int] | None:
         minute = int(minute_text)
     except (AttributeError, ValueError):
         return None
-    if 0 <= hour <= 23 and minute in {0, 30}:
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
         return hour, minute
     return None
+
+
+def _format_session_time(hour: int, minute: int) -> str:
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _split_session_time(value: str) -> dict[str, str]:
+    parts = _parse_session_time(value)
+    if parts is None:
+        return {"Hour": "", "Minute": ""}
+    return {"Hour": f"{parts[0]:02d}", "Minute": f"{parts[1]:02d}"}
+
+
+def _apply_split_time_fields(values: dict[str, Any], prefix: str) -> None:
+    parts = _split_session_time(str(values.get(f"{prefix}Time") or ""))
+    values.setdefault(f"{prefix}Hour", parts["Hour"])
+    values.setdefault(f"{prefix}Minute", parts["Minute"])
+
+
+def _parse_split_session_time(
+    form: dict[str, str], prefix: str, legacy_key: str, errors: list[str], allowed_exact_time: str | None = None
+) -> str:
+    hour_text = (form.get(f"{prefix}Hour") or "").strip()
+    minute_text = (form.get(f"{prefix}Minute") or "").strip()
+    if not hour_text and not minute_text and form.get(legacy_key):
+        parsed = _parse_session_time(form.get(legacy_key, ""))
+        if parsed is None:
+            errors.append(f"{legacy_key} must be a valid time.")
+            return ""
+        hour, minute = parsed
+    else:
+        if not hour_text:
+            errors.append(f"{prefix} hour is required.")
+        if not minute_text:
+            errors.append(f"{prefix} minute is required.")
+        try:
+            hour = int(hour_text)
+        except ValueError:
+            errors.append(f"{prefix} hour must be a whole number.")
+            hour = -1
+        try:
+            minute = int(minute_text)
+        except ValueError:
+            errors.append(f"{prefix} minute must be a whole number.")
+            minute = -1
+
+    if not 0 <= hour <= 23:
+        errors.append(f"{prefix} hour must be between 00 and 23.")
+    formatted_time = _format_session_time(hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else ""
+    minute_allowed = minute in SESSION_MINUTE_VALUES or (allowed_exact_time is not None and formatted_time == allowed_exact_time)
+    if not minute_allowed:
+        errors.append(f"{prefix} minute must use a 10-minute interval.")
+    if 0 <= hour <= 23 and minute_allowed:
+        return formatted_time
+    return ""
 
 
 def _local_session_bounds(day: str, start_time: str, end_time: str) -> tuple[int | None, int | None]:
@@ -317,10 +376,46 @@ def _local_session_bounds(day: str, start_time: str, end_time: str) -> tuple[int
     )
 
 
+def _measured_wind_unavailable(reason: str, spot: str) -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "reason": reason,
+        "site": db_store.SPOT_TO_SITE.get(spot),
+        "records": [],
+        "plot_records": [],
+        "summary": {
+            "point_count": 0,
+            "avg_wind_speed": None,
+            "max_wind_speed": None,
+            "min_wind_speed": None,
+            "mean_wind_dir": None,
+            "mean_wind_dir_label": None,
+        },
+    }
+
+
+def _is_missing_observations_error(error: sqlite3.OperationalError) -> bool:
+    return "no such table: observations" in str(error).lower()
+
+
+def _get_measured_wind_for_submission(conn, experience: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return db_store.get_measured_wind_for_session(
+            conn,
+            experience["spot"],
+            int(experience["start_ts"]),
+            int(experience["end_ts"]),
+        )
+    except sqlite3.OperationalError as exc:
+        if not _is_missing_observations_error(exc):
+            raise
+        return _measured_wind_unavailable("Measured wind observations table is unavailable.", experience["spot"])
+
+
 def _experience_form_defaults() -> dict[str, Any]:
     profile = current_profile() or {}
     start_time = "12:00"
-    return {
+    values = {
         "Rider": _effective_profile_rider_name(profile),
         "Spot": profile.get("default_spot") or "Valkenburgse meer",
         "Date": datetime.now(LOCAL_TZ).date().isoformat(),
@@ -335,15 +430,21 @@ def _experience_form_defaults() -> dict[str, Any]:
         "RiderNotes": "",
         "Visibility": "private",
     }
+    _apply_split_time_fields(values, "Start")
+    _apply_split_time_fields(values, "End")
+    return values
 
 
-def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], list[str]]:
+def _validate_experience_form(
+    form: dict[str, str], existing_times: dict[str, str] | None = None
+) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     rider = form.get("Rider", "").strip()
     spot = form.get("Spot", "")
     day = form.get("Date", "")
-    start_time = form.get("StartTime", "")
-    end_time = form.get("EndTime", "")
+    existing_times = existing_times or {}
+    start_time = _parse_split_session_time(form, "Start", "StartTime", errors, existing_times.get("start_time"))
+    end_time = _parse_split_session_time(form, "End", "EndTime", errors, existing_times.get("end_time"))
     rating = _parse_int(form.get("SessionRating"), "SessionRating", errors)
     rider_weight = _parse_int(form.get("RiderWeight"), "RiderWeight", errors)
     wing_size = _parse_int(form.get("WingSize"), "WingSize", errors)
@@ -359,12 +460,8 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
         date.fromisoformat(day)
     except ValueError:
         errors.append("Date must be valid.")
-    if start_time not in SESSION_TIME_OPTIONS:
-        errors.append("StartTime must be a half-hour time.")
-    if end_time not in SESSION_TIME_OPTIONS:
-        errors.append("EndTime must be a half-hour time.")
-    if start_time in SESSION_TIME_OPTIONS and end_time in SESSION_TIME_OPTIONS and end_time < start_time:
-        errors.append("EndTime cannot be earlier than StartTime.")
+    if start_time and end_time and end_time <= start_time:
+        errors.append("EndTime must be after StartTime.")
     if rating is not None and not 1 <= rating <= 5:
         errors.append("SessionRating must be between 1 and 5.")
     if rider_weight is not None and rider_weight <= 0:
@@ -405,7 +502,7 @@ def _validate_experience_form(form: dict[str, str]) -> tuple[dict[str, Any], lis
 
 
 def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    values = {
         "Rider": row.get("rider") or "",
         "Spot": row.get("spot") or "Valkenburgse meer",
         "Date": row.get("date") or datetime.now(LOCAL_TZ).date().isoformat(),
@@ -420,6 +517,9 @@ def _experience_form_values_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "RiderNotes": row.get("rider_notes") or "",
         "Visibility": row.get("visibility") or "private",
     }
+    _apply_split_time_fields(values, "Start")
+    _apply_split_time_fields(values, "End")
+    return values
 
 
 def _dashboard_asset_url(filename: str) -> str:
@@ -1214,11 +1314,12 @@ def _measured_wind_variability_plot(row: dict[str, Any]) -> dict[str, Any]:
         tick_ts = int(tick_dt.astimezone(timezone.utc).timestamp() * 1000)
         hour_ticks.append({"x": f"{to_x(tick_ts):.1f}", "label": tick_dt.strftime("%H:%M")})
         tick_dt += timedelta(minutes=30)
-    if not hour_ticks:
-        hour_ticks = [
-            {"x": f"{to_x(min_ts):.1f}", "label": start_local.strftime("%H:%M")},
-            {"x": f"{to_x(max_ts):.1f}", "label": end_local.strftime("%H:%M")},
-        ]
+    start_tick = {"x": f"{to_x(min_ts):.1f}", "label": start_local.strftime("%H:%M")}
+    end_tick = {"x": f"{to_x(max_ts):.1f}", "label": end_local.strftime("%H:%M")}
+    if not hour_ticks or hour_ticks[0]["label"] != start_tick["label"]:
+        hour_ticks.insert(0, start_tick)
+    if hour_ticks[-1]["label"] != end_tick["label"]:
+        hour_ticks.append(end_tick)
 
     y_ticks = [
         {"y": f"{to_y(value):.1f}", "label_y": f"{to_y(value) + 4.0:.1f}", "label": f"{value:.1f}"}
@@ -1385,11 +1486,12 @@ def _measured_wind_plot(row: dict[str, Any], predictions: dict[str, Any] | None 
         )
         tick_dt += timedelta(minutes=30)
 
-    if not hour_ticks:
-        hour_ticks = [
-            {"x": f"{to_x(min_ts):.1f}", "label": start_local.strftime("%H:%M")},
-            {"x": f"{to_x(max_ts):.1f}", "label": end_local.strftime("%H:%M")},
-        ]
+    start_tick = {"x": f"{to_x(min_ts):.1f}", "label": start_local.strftime("%H:%M")}
+    end_tick = {"x": f"{to_x(max_ts):.1f}", "label": end_local.strftime("%H:%M")}
+    if not hour_ticks or hour_ticks[0]["label"] != start_tick["label"]:
+        hour_ticks.insert(0, start_tick)
+    if hour_ticks[-1]["label"] != end_tick["label"]:
+        hour_ticks.append(end_tick)
 
     arrow_candidates = []
     arrow_dt = start_local.replace(second=0, microsecond=0)
@@ -1611,15 +1713,10 @@ def new_experience():
         form_values.update(submitted_values)
         experience, errors = _validate_experience_form(submitted_values)
         if not errors:
-            measured = db_store.get_measured_wind_for_session(
-                get_db(),
-                experience["spot"],
-                int(experience["start_ts"]),
-                int(experience["end_ts"]),
-            )
+            conn = get_db()
+            measured = _get_measured_wind_for_submission(conn, experience)
             experience["user_id"] = int(current_user()["id"])
             experience["measured_wind"] = measured
-            conn = get_db()
             experience_id = db_store.create_surf_experience(conn, experience)
             if measured.get("status") == "ok":
                 flash("Experience submitted with measured wind data attached.", "success")
@@ -1648,7 +1745,8 @@ def new_experience():
         form_action=url_for("new_experience"),
         submit_label="Save submission",
         spot_options=SPOT_OPTIONS,
-        hour_options=SESSION_TIME_OPTIONS,
+        hour_options=SESSION_HOUR_OPTIONS,
+        minute_options=SESSION_MINUTE_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
         perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
@@ -1668,7 +1766,10 @@ def edit_experience(experience_id: int):
         _validate_csrf()
         submitted_values = request.form.to_dict()
         form_values.update(submitted_values)
-        experience, errors = _validate_experience_form(submitted_values)
+        experience, errors = _validate_experience_form(
+            submitted_values,
+            existing_times={"start_time": row.get("start_time") or "", "end_time": row.get("end_time") or ""},
+        )
         if not errors:
             updated = db_store.update_surf_experience(conn, experience_id, user_id, experience)
             if not updated:
@@ -1684,7 +1785,8 @@ def edit_experience(experience_id: int):
         form_action=url_for("edit_experience", experience_id=experience_id),
         submit_label="Save changes",
         spot_options=SPOT_OPTIONS,
-        hour_options=SESSION_TIME_OPTIONS,
+        hour_options=SESSION_HOUR_OPTIONS,
+        minute_options=SESSION_MINUTE_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
         foil_size_options=FOIL_SIZE_OPTIONS,
         perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
@@ -1768,10 +1870,15 @@ def experience_detail(experience_id: int):
             for record in (row.get("measured_wind") or {}).get("plot_records", [])
         )
     ):
-        db_store.refresh_surf_experience_measured_wind(conn, experience_id, user_id=user_id)
-        row = db_store.get_visible_surf_experience(conn, user_id, experience_id)
-        if row is None:
-            abort(404)
+        try:
+            db_store.refresh_surf_experience_measured_wind(conn, experience_id, user_id=user_id)
+        except sqlite3.OperationalError as exc:
+            if not _is_missing_observations_error(exc):
+                raise
+        else:
+            row = db_store.get_visible_surf_experience(conn, user_id, experience_id)
+            if row is None:
+                abort(404)
     session_start_ms, session_end_ms = _local_session_bounds(row["date"], row["start_time"], row["end_time"])
     predictions = (
         db_store.get_prediction_lines_for_session(conn, row["spot"], session_start_ms, session_end_ms)

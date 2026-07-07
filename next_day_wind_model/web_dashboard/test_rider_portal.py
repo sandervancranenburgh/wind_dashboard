@@ -208,8 +208,10 @@ class RiderPortalTest(unittest.TestCase):
             "Rider": "Form Rider",
             "Spot": "Valkenburgse meer",
             "Date": "2026-01-20",
-            "StartTime": "12:00",
-            "EndTime": "14:00",
+            "StartHour": "12",
+            "StartMinute": "00",
+            "EndHour": "14",
+            "EndMinute": "00",
             "SessionRating": "4",
             "PerceivedWindVariability": "moderate",
             "RiderReview": "Form review",
@@ -647,6 +649,37 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual([tick["label"] for tick in measured_plot["hour_ticks"]], ["12:30", "13:00", "13:30", "14:00", "14:30", "15:00"])
         self.assertEqual(float(measured_plot["hour_ticks"][0]["x"]), measured_plot["pad_left"])
         self.assertEqual(float(variability_plot["hour_ticks"][0]["x"]), variability_plot["pad_left"])
+
+    def test_session_plots_use_precise_ten_minute_time_limits(self) -> None:
+        start_ms, end_ms = portal._local_session_bounds("2026-06-09", "13:20", "15:50")
+        self.assertEqual(end_ms - start_ms, 150 * 60 * 1000)
+        records = [
+            {
+                "timestamp": start_ms + index * 30 * 60 * 1000,
+                "measured_wind_speed": 12.0 + index,
+                "measured_wind_min": 9.0 + index,
+                "measured_wind_max": 15.0 + index,
+                "measured_wind_direction": 225.0,
+            }
+            for index in range(6)
+        ]
+        row = {
+            "date": "2026-06-09",
+            "start_time": "13:20",
+            "end_time": "15:50",
+            "measured_wind": {"records": records, "plot_records": records},
+        }
+
+        measured_plot = portal._measured_wind_plot(row)
+        variability_plot = portal._measured_wind_variability_plot(row)
+
+        self.assertTrue(measured_plot["available"])
+        self.assertEqual(measured_plot["hour_ticks"][0]["label"], "13:20")
+        self.assertEqual(measured_plot["hour_ticks"][-1]["label"], "15:50")
+        self.assertEqual(variability_plot["hour_ticks"][0]["label"], "13:20")
+        self.assertEqual(variability_plot["hour_ticks"][-1]["label"], "15:50")
+        self.assertEqual(float(measured_plot["hour_ticks"][0]["x"]), measured_plot["pad_left"])
+        self.assertEqual(float(measured_plot["hour_ticks"][-1]["x"]), measured_plot["plot_right"])
 
     def test_measured_wind_variability_plot_uses_power_based_rolling_window(self) -> None:
         start_ms, _end_ms = portal._local_session_bounds("2026-01-15", "12:00", "13:00")
@@ -1144,18 +1177,44 @@ class RiderPortalTest(unittest.TestCase):
         invalid_perceived_form["PerceivedWindVariability"] = "wild"
         _, invalid_perceived_errors = portal._validate_experience_form(invalid_perceived_form)
         self.assertIn("PerceivedWindVariability must be one of the allowed options.", invalid_perceived_errors)
-        half_hour_form = self._valid_form()
-        half_hour_form["StartTime"] = "15:30"
-        half_hour_form["EndTime"] = "17:30"
-        half_hour_experience, half_hour_errors = portal._validate_experience_form(half_hour_form)
-        self.assertEqual(half_hour_errors, [])
-        self.assertEqual(half_hour_experience["start_time"], "15:30")
-        self.assertEqual(half_hour_experience["end_time"], "17:30")
-        self.assertEqual(half_hour_experience["end_ts"] - half_hour_experience["start_ts"], 120 * 60 * 1000)
-        invalid_time_form = self._valid_form()
-        invalid_time_form["StartTime"] = "15:15"
-        _, invalid_time_errors = portal._validate_experience_form(invalid_time_form)
-        self.assertIn("StartTime must be a half-hour time.", invalid_time_errors)
+        ten_minute_form = self._valid_form()
+        ten_minute_form.update({"StartHour": "15", "StartMinute": "20", "EndHour": "17", "EndMinute": "50"})
+        ten_minute_experience, ten_minute_errors = portal._validate_experience_form(ten_minute_form)
+        self.assertEqual(ten_minute_errors, [])
+        self.assertEqual(ten_minute_experience["start_time"], "15:20")
+        self.assertEqual(ten_minute_experience["end_time"], "17:50")
+        self.assertEqual(ten_minute_experience["end_ts"] - ten_minute_experience["start_ts"], 150 * 60 * 1000)
+        legacy_time_form = self._valid_form()
+        for key in ["StartHour", "StartMinute", "EndHour", "EndMinute"]:
+            legacy_time_form.pop(key)
+        legacy_time_form["StartTime"] = "15:30"
+        legacy_time_form["EndTime"] = "17:30"
+        legacy_experience, legacy_errors = portal._validate_experience_form(legacy_time_form)
+        self.assertEqual(legacy_errors, [])
+        self.assertEqual(legacy_experience["start_time"], "15:30")
+        self.assertEqual(legacy_experience["end_time"], "17:30")
+        for invalid_minute in ["07", "61", ""]:
+            invalid_time_form = self._valid_form()
+            invalid_time_form["StartMinute"] = invalid_minute
+            _, invalid_time_errors = portal._validate_experience_form(invalid_time_form)
+            self.assertIn("Start minute must use a 10-minute interval.", invalid_time_errors)
+        existing_exact_form = self._valid_form()
+        existing_exact_form.update({"StartHour": "13", "StartMinute": "07", "EndHour": "15", "EndMinute": "44"})
+        existing_exact, existing_exact_errors = portal._validate_experience_form(
+            existing_exact_form,
+            existing_times={"start_time": "13:07", "end_time": "15:44"},
+        )
+        self.assertEqual(existing_exact_errors, [])
+        self.assertEqual(existing_exact["start_time"], "13:07")
+        self.assertEqual(existing_exact["end_time"], "15:44")
+        equal_time_form = self._valid_form()
+        equal_time_form.update({"StartHour": "15", "StartMinute": "20", "EndHour": "15", "EndMinute": "20"})
+        _, equal_time_errors = portal._validate_experience_form(equal_time_form)
+        self.assertIn("EndTime must be after StartTime.", equal_time_errors)
+        earlier_time_form = self._valid_form()
+        earlier_time_form.update({"StartHour": "15", "StartMinute": "20", "EndHour": "15", "EndMinute": "10"})
+        _, earlier_time_errors = portal._validate_experience_form(earlier_time_form)
+        self.assertIn("EndTime must be after StartTime.", earlier_time_errors)
         _, invalid_errors = portal._validate_experience_form(self._valid_form("friends"))
         self.assertIn("Visibility must be private or public.", invalid_errors)
 
@@ -1240,20 +1299,51 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM surf_experiences").fetchone()[0], 1)
         conn.close()
 
+    def test_split_time_submission_handles_missing_observations_table(self) -> None:
+        self._set_user(self.user_id)
+        conn = db_store.connect_db(self.temp_dir.name)
+        conn.execute("DROP TABLE observations")
+        conn.commit()
+        conn.close()
+
+        new_page = self.client.get("/experience/new")
+        self.assertEqual(new_page.status_code, 200)
+        with self.client.session_transaction() as current_session:
+            csrf_token = current_session["_csrf_token"]
+        form = self._valid_form()
+        form.update({"StartHour": "13", "StartMinute": "20", "EndHour": "15", "EndMinute": "50"})
+        form["_csrf_token"] = csrf_token
+        response = self.client.post("/experience/new", data=form, follow_redirects=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Experience submitted. Measured wind data was unavailable for that session.", response.data)
+        self.assertIn(b"13:20 to 15:50", response.data)
+        conn = db_store.connect_db(self.temp_dir.name)
+        row = conn.execute(
+            "SELECT start_time, end_time, measured_wind_status FROM surf_experiences WHERE date = ?",
+            ("2026-01-20",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ("13:20", "15:50", "unavailable"))
+
     def test_new_submission_route_stores_private_and_public_visibility(self) -> None:
         self._set_user(self.user_id)
         new_page = self.client.get("/experience/new")
         self.assertEqual(new_page.status_code, 200)
         self.assertIn(b'checked', new_page.data.split(b'value="private"', 1)[1].split(b'>', 1)[0])
         self.assertIn(b'<button class="primary" type="submit">Save submission</button>', new_page.data)
-        self.assertIn(b'<option value="12:30"', new_page.data)
-        self.assertIn(b'<option value="15:30"', new_page.data)
-        self.assertIn(b'<option value="17:30"', new_page.data)
-        self.assertIn(b"function parseTimeToMinutes(value)", new_page.data)
-        self.assertIn(b"function formatMinutesToTime(totalMinutes)", new_page.data)
-        self.assertIn(b"resolveEndValue(start + 120, start)", new_page.data)
-        self.assertIn(b"validOptions[validOptions.length - 1]", new_page.data)
-        self.assertIn(b"addEventListener(\"change\", () => syncEndOptions(true))", new_page.data)
+        self.assertIn(b'<label class="sub-label" for="StartHour">Start hour</label>', new_page.data)
+        self.assertIn(b'<label class="sub-label" for="StartMinute">Start minute</label>', new_page.data)
+        self.assertIn(b'<label class="sub-label" for="EndHour">End hour</label>', new_page.data)
+        self.assertIn(b'<label class="sub-label" for="EndMinute">End minute</label>', new_page.data)
+        self.assertIn(b'<option value="13"', new_page.data)
+        start_minute_select = new_page.data.split(b'id="StartMinute"', 1)[1].split(b'</select>', 1)[0]
+        for minute in [b"00", b"10", b"20", b"30", b"40", b"50"]:
+            self.assertIn(b'<option value="' + minute + b'"', start_minute_select)
+        self.assertNotIn(b'<option value="07"', start_minute_select)
+        self.assertIn(b"function selectedTimeToMinutes(hourSelect, minuteSelect)", new_page.data)
+        self.assertIn(b"setSelectedTime(endHourSelect, endMinuteSelect, start + 120)", new_page.data)
+        self.assertIn(b"startMinuteSelect.addEventListener", new_page.data)
         self.assertIn(b"Private RiderNotes", new_page.data)
         self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
         self.assertIn(b'<label class="activity-file-trigger" for="ActivityFile">Upload file</label>', new_page.data)
@@ -1264,23 +1354,22 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b'<label for="ActivityFile">Activity file</label>', new_page.data)
         self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", new_page.data)
         self.assertIn(b'<div class="form-date-row">', new_page.data)
-        self.assertIn(b'<div class="form-time-start">', new_page.data)
-        self.assertIn(b'<div class="form-time-end">', new_page.data)
+        self.assertIn(b'<div class="form-time-start time-pair-field">', new_page.data)
+        self.assertIn(b'<div class="form-time-end time-pair-field">', new_page.data)
         self.assertIn(b'<div class="form-rating-row">', new_page.data)
         self.assertIn(b'<div class="form-perceived-row">', new_page.data)
         self.assertIn(b'<select id="PerceivedWindVariability" name="PerceivedWindVariability" required>', new_page.data)
         self.assertIn(b'<label for="PerceivedWindVariability">Perceived wind variability *</label>', new_page.data)
         self.assertNotIn(b'<label for="PerceivedWindVariability">Perceived variability *</label>', new_page.data)
         self.assertIn(b'<option value="gusty"', new_page.data)
-        self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartTime"'))
-        self.assertLess(new_page.data.index(b'id="StartTime"'), new_page.data.index(b'id="EndTime"'))
+        self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartHour"'))
+        self.assertLess(new_page.data.index(b'id="StartHour"'), new_page.data.index(b'id="EndHour"'))
         self.assertLess(new_page.data.index(b'name="SessionRating"'), new_page.data.index(b'id="PerceivedWindVariability"'))
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
         private_form = self._valid_form()
-        private_form["StartTime"] = "12:30"
-        private_form["EndTime"] = "14:00"
+        private_form.update({"StartHour": "13", "StartMinute": "20", "EndHour": "15", "EndMinute": "50"})
         private_form["PerceivedWindVariability"] = "gusty"
         private_form["_csrf_token"] = csrf_token
         private_response = self.client.post("/experience/new", data=private_form)
@@ -1312,7 +1401,14 @@ class RiderPortalTest(unittest.TestCase):
         conn.close()
         self.assertEqual(visibility_by_date["2026-01-20"], "private")
         self.assertEqual(visibility_by_date["2026-01-21"], "public")
-        self.assertEqual(private_time_row, ("12:30", "14:00", 90 * 60 * 1000))
+        self.assertEqual(private_time_row, ("13:20", "15:50", 150 * 60 * 1000))
+        detail = self.client.get(private_response.headers["Location"])
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn(b"13:20 to 15:50", detail.data)
+        overview = self.client.get("/experiences")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn(b">13:20</td>", overview.data)
+        self.assertIn(b">15:50</td>", overview.data)
         self.assertEqual(private_notes_row, ("Form notes",))
         self.assertEqual(private_perceived_row, ("gusty",))
 

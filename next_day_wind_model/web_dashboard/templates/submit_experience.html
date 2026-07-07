@@ -23,21 +23,53 @@
           <label for="Date">Date *</label>
           <input id="Date" name="Date" type="date" value="{{ form_values.Date }}" required>
         </div>
-        <div class="form-time-start">
-          <label for="StartTime">StartTime *</label>
-          <select id="StartTime" name="StartTime" required>
-            {% for value in hour_options %}
-              <option value="{{ value }}" {% if form_values.StartTime == value %}selected{% endif %}>{{ value }}</option>
-            {% endfor %}
-          </select>
+        <div class="form-time-start time-pair-field">
+          <label>Start time *</label>
+          <div class="time-pair">
+            <div>
+              <label class="sub-label" for="StartHour">Start hour</label>
+              <select id="StartHour" name="StartHour" required>
+                {% for value in hour_options %}
+                  <option value="{{ value }}" {% if form_values.StartHour == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label class="sub-label" for="StartMinute">Start minute</label>
+              <select id="StartMinute" name="StartMinute" required>
+                {% if form_values.StartMinute and form_values.StartMinute not in minute_options %}
+                  <option value="{{ form_values.StartMinute }}" selected>{{ form_values.StartMinute }}</option>
+                {% endif %}
+                {% for value in minute_options %}
+                  <option value="{{ value }}" {% if form_values.StartMinute == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
         </div>
-        <div class="form-time-end">
-          <label for="EndTime">EndTime *</label>
-          <select id="EndTime" name="EndTime" required>
-            {% for value in hour_options %}
-              <option value="{{ value }}" {% if form_values.EndTime == value %}selected{% endif %}>{{ value }}</option>
-            {% endfor %}
-          </select>
+        <div class="form-time-end time-pair-field">
+          <label>End time *</label>
+          <div class="time-pair">
+            <div>
+              <label class="sub-label" for="EndHour">End hour</label>
+              <select id="EndHour" name="EndHour" required>
+                {% for value in hour_options %}
+                  <option value="{{ value }}" {% if form_values.EndHour == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label class="sub-label" for="EndMinute">End minute</label>
+              <select id="EndMinute" name="EndMinute" required>
+                {% if form_values.EndMinute and form_values.EndMinute not in minute_options %}
+                  <option value="{{ form_values.EndMinute }}" selected>{{ form_values.EndMinute }}</option>
+                {% endif %}
+                {% for value in minute_options %}
+                  <option value="{{ value }}" {% if form_values.EndMinute == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
         </div>
         <div class="form-rating-row">
           <label>SessionRating *</label>
@@ -127,40 +159,36 @@
 {% endblock %}
 {% block scripts %}
   <script>
-    const startSelect = document.getElementById("StartTime");
-    const endSelect = document.getElementById("EndTime");
-    function parseTimeToMinutes(value) {
-      const [hours, minutes] = value.split(":").map(Number);
-      return hours * 60 + minutes;
+    const startHourSelect = document.getElementById("StartHour");
+    const startMinuteSelect = document.getElementById("StartMinute");
+    const endHourSelect = document.getElementById("EndHour");
+    const endMinuteSelect = document.getElementById("EndMinute");
+    function selectedTimeToMinutes(hourSelect, minuteSelect) {
+      return Number(hourSelect.value) * 60 + Number(minuteSelect.value);
     }
-    function formatMinutesToTime(totalMinutes) {
-      const hours = Math.floor(totalMinutes / 60);
-      const minutes = totalMinutes % 60;
-      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    function setSelectedTime(hourSelect, minuteSelect, totalMinutes) {
+      const bounded = Math.min(Math.max(totalMinutes, 0), (23 * 60) + 50);
+      const rounded = Math.ceil(bounded / 10) * 10;
+      const hours = Math.floor(rounded / 60);
+      const minutes = rounded % 60;
+      hourSelect.value = String(hours).padStart(2, "0");
+      minuteSelect.value = String(minutes).padStart(2, "0");
     }
-    function resolveEndValue(target, start) {
-      const targetValue = formatMinutesToTime(target);
-      const validOptions = Array.from(endSelect.options)
-        .map((option) => ({ value: option.value, minutes: parseTimeToMinutes(option.value) }))
-        .filter((option) => option.minutes >= start);
-      const exact = validOptions.find((option) => option.value === targetValue);
-      if (exact) return exact.value;
-      const later = validOptions.find((option) => option.minutes > target);
-      if (later) return later.value;
-      return validOptions.length ? validOptions[validOptions.length - 1].value : endSelect.value;
-    }
-    function syncEndOptions(updateDefault = false) {
-      const start = parseTimeToMinutes(startSelect.value);
-      for (const option of endSelect.options) option.disabled = parseTimeToMinutes(option.value) < start;
+    function syncEndTime(updateDefault = false) {
+      const start = selectedTimeToMinutes(startHourSelect, startMinuteSelect);
+      const end = selectedTimeToMinutes(endHourSelect, endMinuteSelect);
       if (updateDefault) {
-        endSelect.value = resolveEndValue(start + 120, start);
-      } else if (parseTimeToMinutes(endSelect.value) < start) {
-        endSelect.value = resolveEndValue(parseTimeToMinutes(endSelect.value), start);
+        setSelectedTime(endHourSelect, endMinuteSelect, start + 120);
+      } else if (end <= start) {
+        setSelectedTime(endHourSelect, endMinuteSelect, start + 10);
       }
     }
-    if (startSelect && endSelect) {
-      startSelect.addEventListener("change", () => syncEndOptions(true));
-      syncEndOptions();
+    if (startHourSelect && startMinuteSelect && endHourSelect && endMinuteSelect) {
+      startHourSelect.addEventListener("change", () => syncEndTime(true));
+      startMinuteSelect.addEventListener("change", () => syncEndTime(true));
+      endHourSelect.addEventListener("change", () => syncEndTime());
+      endMinuteSelect.addEventListener("change", () => syncEndTime());
+      syncEndTime();
     }
     const activityFileInput = document.getElementById("ActivityFile");
     const activityFileDisplay = document.getElementById("ActivityFileDisplay");

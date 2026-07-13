@@ -9,7 +9,6 @@
         <div>
           <label for="Rider">Rider *</label>
           <input id="Rider" name="Rider" value="{{ form_values.Rider }}" required>
-          <p class="desc">Prefilled from RiderName, or Public username when RiderName is empty.</p>
         </div>
         <div>
           <label for="Spot">Spot *</label>
@@ -23,20 +22,18 @@
           <label for="Date">Date *</label>
           <input id="Date" name="Date" type="date" value="{{ form_values.Date }}" required>
         </div>
-        <div class="form-time-start time-pair-field">
+        <div class="form-time-start time-pair-field form-row-mobile-full">
           <label>Start time *</label>
           <div class="time-pair">
             <div>
-              <label class="sub-label" for="StartHour">Start hour</label>
-              <select id="StartHour" name="StartHour" required>
+              <select id="StartHour" name="StartHour" aria-label="Start hour" required>
                 {% for value in hour_options %}
                   <option value="{{ value }}" {% if form_values.StartHour == value %}selected{% endif %}>{{ value }}</option>
                 {% endfor %}
               </select>
             </div>
             <div>
-              <label class="sub-label" for="StartMinute">Start minute</label>
-              <select id="StartMinute" name="StartMinute" required>
+              <select id="StartMinute" name="StartMinute" aria-label="Start minute" required>
                 {% if form_values.StartMinute and form_values.StartMinute not in minute_options %}
                   <option value="{{ form_values.StartMinute }}" selected>{{ form_values.StartMinute }}</option>
                 {% endif %}
@@ -47,20 +44,18 @@
             </div>
           </div>
         </div>
-        <div class="form-time-end time-pair-field">
+        <div class="form-time-end time-pair-field form-row-mobile-full">
           <label>End time *</label>
           <div class="time-pair">
             <div>
-              <label class="sub-label" for="EndHour">End hour</label>
-              <select id="EndHour" name="EndHour" required>
+              <select id="EndHour" name="EndHour" aria-label="End hour" required>
                 {% for value in hour_options %}
                   <option value="{{ value }}" {% if form_values.EndHour == value %}selected{% endif %}>{{ value }}</option>
                 {% endfor %}
               </select>
             </div>
             <div>
-              <label class="sub-label" for="EndMinute">End minute</label>
-              <select id="EndMinute" name="EndMinute" required>
+              <select id="EndMinute" name="EndMinute" aria-label="End minute" required>
                 {% if form_values.EndMinute and form_values.EndMinute not in minute_options %}
                   <option value="{{ form_values.EndMinute }}" selected>{{ form_values.EndMinute }}</option>
                 {% endif %}
@@ -89,18 +84,11 @@
             {% endfor %}
           </select>
         </div>
-        <div class="form-row-full">
+        <div class="form-row-full form-review-row">
           <label for="RiderReview">RiderReview</label>
           <textarea id="RiderReview" name="RiderReview">{{ form_values.RiderReview }}</textarea>
         </div>
-        <div>
-          <label for="RiderWeight">RiderWeight *</label>
-          <div class="unit-field">
-            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
-            <span class="unit">kg</span>
-          </div>
-        </div>
-        <div>
+        <div class="form-equipment-wing">
           <label for="WingSize">WingSize *</label>
           <div class="unit-field">
             <select id="WingSize" name="WingSize" required>
@@ -111,23 +99,26 @@
             <span class="unit">m2</span>
           </div>
         </div>
-        <div>
+        <div class="form-equipment-foil">
           <label for="FoilSize">FoilSize *</label>
           <div class="unit-field">
-            <select id="FoilSize" name="FoilSize" required>
-              {% for value in foil_size_options %}
-                <option value="{{ value }}" {% if form_values.FoilSize|string == value|string %}selected{% endif %}>{{ value }}</option>
-              {% endfor %}
-            </select>
+            <input id="FoilSize" name="FoilSize" type="number" min="1" step="1" value="{{ form_values.FoilSize }}" required>
             <span class="unit">cm2</span>
           </div>
         </div>
-        <div class="form-row-full">
+        <div class="form-equipment-weight">
+          <label for="RiderWeight">RiderWeight *</label>
+          <div class="unit-field">
+            <input id="RiderWeight" name="RiderWeight" type="number" min="1" step="1" value="{{ form_values.RiderWeight }}" required>
+            <span class="unit">kg</span>
+          </div>
+        </div>
+        <div class="form-row-full form-notes-row">
           <label for="RiderNotes">Private RiderNotes</label>
           <textarea id="RiderNotes" name="RiderNotes">{{ form_values.RiderNotes }}</textarea>
           <p class="desc">Only visible to you. Not shown on public submissions.</p>
         </div>
-        <div class="form-row-full activity-file-control">
+        <div class="form-row-full activity-file-control form-upload-row">
           <input class="activity-file-native" id="ActivityFile" name="ActivityFile" type="file" accept=".fit,.FIT,.tcx,.TCX,.gpx,.GPX,.kml,.KML,.zip,.ZIP,application/xml,text/xml,application/octet-stream,application/zip,application/x-zip-compressed,application/gpx+xml,application/vnd.google-earth.kml+xml">
           <div class="activity-file-box">
             <label class="activity-file-trigger" for="ActivityFile">Upload file</label>
@@ -137,15 +128,15 @@
           </div>
           <p class="desc">Upload a FIT, TCX, GPX, KML, or ZIP activity file. FIT/original is preferred; TCX is the best fallback; GPX and KML also work. ZIP files should contain one supported activity file.</p>
         </div>
-        <fieldset class="form-row-full">
+        <fieldset class="form-row-full visibility-row">
           <legend>Visibility</legend>
           <div class="choice-group">
             <label class="choice-option">
-              <input type="radio" name="Visibility" value="private" {% if form_values.Visibility != 'public' %}checked{% endif %}>
+              <input type="radio" name="Visibility" value="private" {% if form_values.Visibility == 'private' %}checked{% endif %}>
               <span>Private &mdash; only you can see this submission</span>
             </label>
             <label class="choice-option">
-              <input type="radio" name="Visibility" value="public" {% if form_values.Visibility == 'public' %}checked{% endif %}>
+              <input type="radio" name="Visibility" value="public" {% if form_values.Visibility != 'private' %}checked{% endif %}>
               <span>Public &mdash; visible to logged-in riders</span>
             </label>
           </div>

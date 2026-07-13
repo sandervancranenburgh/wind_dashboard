@@ -458,7 +458,7 @@ class RiderPortalTest(unittest.TestCase):
         new_page = self.client.get("/experience/new")
         self.assertEqual(new_page.status_code, 200)
         self.assertIn(b'name="Rider" value="Public Default"', new_page.data)
-        self.assertIn(b"Prefilled from RiderName, or Public username when RiderName is empty.", new_page.data)
+        self.assertNotIn(b"Prefilled from RiderName", new_page.data)
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
@@ -1162,7 +1162,7 @@ class RiderPortalTest(unittest.TestCase):
         conn.close()
 
         missing_visibility, missing_errors = portal._validate_experience_form(self._valid_form())
-        self.assertEqual(missing_visibility["visibility"], "private")
+        self.assertEqual(missing_visibility["visibility"], "public")
         self.assertEqual(missing_errors, [])
         public_form, public_errors = portal._validate_experience_form(self._valid_form("public"))
         self.assertEqual(public_form["visibility"], "public")
@@ -1217,6 +1217,22 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn("EndTime must be after StartTime.", earlier_time_errors)
         _, invalid_errors = portal._validate_experience_form(self._valid_form("friends"))
         self.assertIn("Visibility must be private or public.", invalid_errors)
+        custom_foil_form = self._valid_form()
+        custom_foil_form["FoilSize"] = "1501"
+        custom_foil_experience, custom_foil_errors = portal._validate_experience_form(custom_foil_form)
+        self.assertEqual(custom_foil_errors, [])
+        self.assertEqual(custom_foil_experience["foil_size"], 1501)
+        for invalid_foil_size, expected_error in [
+            ("0", "FoilSize must be a positive whole number."),
+            ("-100", "FoilSize must be a positive whole number."),
+            ("1500.5", "FoilSize must be a whole number."),
+            ("not-a-number", "FoilSize must be a whole number."),
+            ("", "FoilSize is required."),
+        ]:
+            invalid_foil_form = self._valid_form()
+            invalid_foil_form["FoilSize"] = invalid_foil_size
+            _, invalid_foil_errors = portal._validate_experience_form(invalid_foil_form)
+            self.assertIn(expected_error, invalid_foil_errors)
 
     def test_legacy_account_schema_migration_preserves_users_profiles_and_ownership(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -1330,12 +1346,16 @@ class RiderPortalTest(unittest.TestCase):
         self._set_user(self.user_id)
         new_page = self.client.get("/experience/new")
         self.assertEqual(new_page.status_code, 200)
-        self.assertIn(b'checked', new_page.data.split(b'value="private"', 1)[1].split(b'>', 1)[0])
+        private_visibility = new_page.data.split(b'value="private"', 1)[1].split(b'>', 1)[0]
+        public_visibility = new_page.data.split(b'value="public"', 1)[1].split(b'>', 1)[0]
+        self.assertNotIn(b'checked', private_visibility)
+        self.assertIn(b'checked', public_visibility)
         self.assertIn(b'<button class="primary" type="submit">Save submission</button>', new_page.data)
-        self.assertIn(b'<label class="sub-label" for="StartHour">Start hour</label>', new_page.data)
-        self.assertIn(b'<label class="sub-label" for="StartMinute">Start minute</label>', new_page.data)
-        self.assertIn(b'<label class="sub-label" for="EndHour">End hour</label>', new_page.data)
-        self.assertIn(b'<label class="sub-label" for="EndMinute">End minute</label>', new_page.data)
+        self.assertIn(b'<select id="StartHour" name="StartHour" aria-label="Start hour" required>', new_page.data)
+        self.assertIn(b'<select id="StartMinute" name="StartMinute" aria-label="Start minute" required>', new_page.data)
+        self.assertIn(b'<select id="EndHour" name="EndHour" aria-label="End hour" required>', new_page.data)
+        self.assertIn(b'<select id="EndMinute" name="EndMinute" aria-label="End minute" required>', new_page.data)
+        self.assertNotIn(b'<label class="sub-label"', new_page.data)
         self.assertIn(b'<option value="13"', new_page.data)
         start_minute_select = new_page.data.split(b'id="StartMinute"', 1)[1].split(b'</select>', 1)[0]
         for minute in [b"00", b"10", b"20", b"30", b"40", b"50"]:
@@ -1344,6 +1364,16 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"function selectedTimeToMinutes(hourSelect, minuteSelect)", new_page.data)
         self.assertIn(b"setSelectedTime(endHourSelect, endMinuteSelect, start + 120)", new_page.data)
         self.assertIn(b"startMinuteSelect.addEventListener", new_page.data)
+        self.assertIn(
+            b'<div class="form-row-full form-review-row">\n          <label for="RiderReview">RiderReview</label>\n          <textarea id="RiderReview" name="RiderReview">',
+            new_page.data,
+        )
+        self.assertIn(
+            b'<div class="form-row-full form-notes-row">\n          <label for="RiderNotes">Private RiderNotes</label>\n          <textarea id="RiderNotes" name="RiderNotes">',
+            new_page.data,
+        )
+        self.assertIn(b'<div class="form-row-full activity-file-control form-upload-row">', new_page.data)
+        self.assertIn(b'<fieldset class="form-row-full visibility-row">', new_page.data)
         self.assertIn(b"Private RiderNotes", new_page.data)
         self.assertIn(b"Only visible to you. Not shown on public submissions.", new_page.data)
         self.assertIn(b'<label class="activity-file-trigger" for="ActivityFile">Upload file</label>', new_page.data)
@@ -1354,22 +1384,25 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b'<label for="ActivityFile">Activity file</label>', new_page.data)
         self.assertNotIn(b"Optional FIT, GPX or KML file from your session.", new_page.data)
         self.assertIn(b'<div class="form-date-row">', new_page.data)
-        self.assertIn(b'<div class="form-time-start time-pair-field">', new_page.data)
-        self.assertIn(b'<div class="form-time-end time-pair-field">', new_page.data)
+        self.assertIn(b'<div class="form-time-start time-pair-field form-row-mobile-full">', new_page.data)
+        self.assertIn(b'<div class="form-time-end time-pair-field form-row-mobile-full">', new_page.data)
         self.assertIn(b'<div class="form-rating-row">', new_page.data)
         self.assertIn(b'<div class="form-perceived-row">', new_page.data)
         self.assertIn(b'<select id="PerceivedWindVariability" name="PerceivedWindVariability" required>', new_page.data)
         self.assertIn(b'<label for="PerceivedWindVariability">Perceived wind variability *</label>', new_page.data)
         self.assertNotIn(b'<label for="PerceivedWindVariability">Perceived variability *</label>', new_page.data)
         self.assertIn(b'<option value="gusty"', new_page.data)
+        self.assertIn(b'<input id="FoilSize" name="FoilSize" type="number" min="1" step="1" value="1500" required>', new_page.data)
+        self.assertNotIn(b'<select id="FoilSize"', new_page.data)
         self.assertLess(new_page.data.index(b'id="Date"'), new_page.data.index(b'id="StartHour"'))
         self.assertLess(new_page.data.index(b'id="StartHour"'), new_page.data.index(b'id="EndHour"'))
         self.assertLess(new_page.data.index(b'name="SessionRating"'), new_page.data.index(b'id="PerceivedWindVariability"'))
 
         with self.client.session_transaction() as current_session:
             csrf_token = current_session["_csrf_token"]
-        private_form = self._valid_form()
+        private_form = self._valid_form("private")
         private_form.update({"StartHour": "13", "StartMinute": "20", "EndHour": "15", "EndMinute": "50"})
+        private_form["FoilSize"] = "1140"
         private_form["PerceivedWindVariability"] = "gusty"
         private_form["_csrf_token"] = csrf_token
         private_response = self.client.post("/experience/new", data=private_form)
@@ -1379,6 +1412,7 @@ class RiderPortalTest(unittest.TestCase):
             csrf_token = current_session["_csrf_token"]
         public_form = self._valid_form("public")
         public_form["Date"] = "2026-01-21"
+        public_form["FoilSize"] = "1501"
         public_form["_csrf_token"] = csrf_token
         public_response = self.client.post("/experience/new", data=public_form)
         self.assertEqual(public_response.status_code, 302)
@@ -1398,6 +1432,9 @@ class RiderPortalTest(unittest.TestCase):
             "SELECT perceived_wind_variability FROM surf_experiences WHERE date = ?",
             ("2026-01-20",),
         ).fetchone()
+        foil_rows = dict(
+            conn.execute("SELECT date, foil_size FROM surf_experiences WHERE date IN (?, ?)", ("2026-01-20", "2026-01-21"))
+        )
         conn.close()
         self.assertEqual(visibility_by_date["2026-01-20"], "private")
         self.assertEqual(visibility_by_date["2026-01-21"], "public")
@@ -1405,12 +1442,26 @@ class RiderPortalTest(unittest.TestCase):
         detail = self.client.get(private_response.headers["Location"])
         self.assertEqual(detail.status_code, 200)
         self.assertIn(b"13:20 to 15:50", detail.data)
+        self.assertIn(b"1140 cm2", detail.data)
         overview = self.client.get("/experiences")
         self.assertEqual(overview.status_code, 200)
         self.assertIn(b">13:20</td>", overview.data)
         self.assertIn(b">15:50</td>", overview.data)
         self.assertEqual(private_notes_row, ("Form notes",))
         self.assertEqual(private_perceived_row, ("gusty",))
+        self.assertEqual(foil_rows["2026-01-20"], 1140)
+        self.assertEqual(foil_rows["2026-01-21"], 1501)
+
+        for invalid_foil_size in ["0", "-100", "1500.5", "not-a-number"]:
+            with self.client.session_transaction() as current_session:
+                csrf_token = current_session["_csrf_token"]
+            invalid_form = self._valid_form("public")
+            invalid_form["Date"] = "2026-01-22"
+            invalid_form["FoilSize"] = invalid_foil_size
+            invalid_form["_csrf_token"] = csrf_token
+            invalid_response = self.client.post("/experience/new", data=invalid_form)
+            self.assertEqual(invalid_response.status_code, 200)
+            self.assertIn(b"FoilSize", invalid_response.data)
 
     def test_perceived_variability_sort_uses_ordinal_order(self) -> None:
         self._set_profile(self.user_id, "Ordinal Rider", "Ordinal Private")

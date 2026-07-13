@@ -58,7 +58,6 @@ SPOT_OPTIONS = [
     "Other",
 ]
 WING_SIZE_OPTIONS = [2, 3, 4, 5, 6, 7, 8]
-FOIL_SIZE_OPTIONS = list(range(700, 2501, 100))
 SESSION_HOUR_OPTIONS = [f"{hour:02d}" for hour in range(24)]
 SESSION_MINUTE_OPTIONS = [f"{minute:02d}" for minute in range(0, 60, 10)]
 SESSION_TIME_OPTIONS = [f"{hour}:{minute}" for hour in SESSION_HOUR_OPTIONS for minute in SESSION_MINUTE_OPTIONS]
@@ -428,7 +427,7 @@ def _experience_form_defaults() -> dict[str, Any]:
         "WingSize": "5",
         "FoilSize": "1500",
         "RiderNotes": "",
-        "Visibility": "private",
+        "Visibility": "public",
     }
     _apply_split_time_fields(values, "Start")
     _apply_split_time_fields(values, "End")
@@ -436,7 +435,9 @@ def _experience_form_defaults() -> dict[str, Any]:
 
 
 def _validate_experience_form(
-    form: dict[str, str], existing_times: dict[str, str] | None = None
+    form: dict[str, str],
+    existing_times: dict[str, str] | None = None,
+    default_visibility: str = "public",
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     rider = form.get("Rider", "").strip()
@@ -449,7 +450,7 @@ def _validate_experience_form(
     rider_weight = _parse_int(form.get("RiderWeight"), "RiderWeight", errors)
     wing_size = _parse_int(form.get("WingSize"), "WingSize", errors)
     foil_size = _parse_int(form.get("FoilSize"), "FoilSize", errors)
-    visibility = (form.get("Visibility") or "private").strip().lower()
+    visibility = (form.get("Visibility") or default_visibility).strip().lower()
     perceived_wind_variability = (form.get("PerceivedWindVariability") or "").strip().lower()
 
     if not rider:
@@ -468,8 +469,8 @@ def _validate_experience_form(
         errors.append("RiderWeight must be greater than zero.")
     if wing_size is not None and wing_size not in WING_SIZE_OPTIONS:
         errors.append("WingSize must be one of the allowed options.")
-    if foil_size is not None and foil_size not in FOIL_SIZE_OPTIONS:
-        errors.append("FoilSize must be one of the allowed options.")
+    if foil_size is not None and foil_size <= 0:
+        errors.append("FoilSize must be a positive whole number.")
     if visibility not in {"private", "public"}:
         errors.append("Visibility must be private or public.")
     if perceived_wind_variability not in PERCEIVED_WIND_VARIABILITY_VALUES:
@@ -1748,7 +1749,6 @@ def new_experience():
         hour_options=SESSION_HOUR_OPTIONS,
         minute_options=SESSION_MINUTE_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
-        foil_size_options=FOIL_SIZE_OPTIONS,
         perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
     )
 
@@ -1769,6 +1769,7 @@ def edit_experience(experience_id: int):
         experience, errors = _validate_experience_form(
             submitted_values,
             existing_times={"start_time": row.get("start_time") or "", "end_time": row.get("end_time") or ""},
+            default_visibility=row.get("visibility") or "private",
         )
         if not errors:
             updated = db_store.update_surf_experience(conn, experience_id, user_id, experience)
@@ -1788,7 +1789,6 @@ def edit_experience(experience_id: int):
         hour_options=SESSION_HOUR_OPTIONS,
         minute_options=SESSION_MINUTE_OPTIONS,
         wing_size_options=WING_SIZE_OPTIONS,
-        foil_size_options=FOIL_SIZE_OPTIONS,
         perceived_wind_variability_options=PERCEIVED_WIND_VARIABILITY_OPTIONS,
     )
 

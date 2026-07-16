@@ -851,6 +851,111 @@ class RiderPortalTest(unittest.TestCase):
         self.assertEqual(len(speed_coords), 2)
         self.assertNotIn("trend_points", plot)
 
+    def test_portal_head_serves_icons_without_dashboard_refresh_logic(self) -> None:
+        portal_home = self.client.get("/")
+        self.assertEqual(portal_home.status_code, 200)
+        self.assertIn(b'rel="apple-touch-icon"', portal_home.data)
+        self.assertIn(b'href="/site.webmanifest?v=1"', portal_home.data)
+        self.assertIn(b'href="/site-assets/favicon.ico?v=1"', portal_home.data)
+        self.assertIn(b'href="/site-assets/favicon-32x32.png?v=1"', portal_home.data)
+        self.assertIn(b'href="/site-assets/favicon-16x16.png?v=1"', portal_home.data)
+        self.assertIn(b'href="/site-assets/apple-touch-icon.png?v=1"', portal_home.data)
+        self.assertNotIn(b'id="dashboard-refresh"', portal_home.data)
+
+        self._set_user(self.user_id)
+        submission_form = self.client.get("/experience/new")
+        self.assertEqual(submission_form.status_code, 200)
+        self.assertNotIn(b'id="dashboard-refresh"', submission_form.data)
+        self.assertNotIn(b"visibilitychange", submission_form.data)
+
+        manifest = self.client.get("/site.webmanifest")
+        self.assertEqual(manifest.status_code, 200)
+        self.assertEqual(manifest.mimetype, "application/manifest+json")
+        self.assertIn(b"site-assets/icon-192x192.png?v=1", manifest.data)
+        self.assertIn(b"site-assets/icon-512x512.png?v=1", manifest.data)
+        manifest.close()
+        icon_response = self.client.get("/site-assets/apple-touch-icon.png")
+        self.assertEqual(icon_response.status_code, 200)
+        icon_response.close()
+        self.assertEqual(self.client.get("/site-assets/not-an-icon.png").status_code, 404)
+
+    def test_published_dashboard_has_throttled_foreground_refresh_and_versioned_assets(self) -> None:
+        model_dir = str(Path(__file__).resolve().parents[1])
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
+        from next_day_wind_model import update_model_and_predict as updater
+
+        output_dir = Path(self.temp_dir.name) / "published-dashboard"
+        source_dir = Path(self.temp_dir.name) / "dashboard-source"
+        source_dir.mkdir()
+        next_day_png = source_dir / "next-day.png"
+        current_day_png = source_dir / "current-day.png"
+        next_day_png.write_bytes(b"next-day-image")
+        current_day_png.write_bytes(b"current-day-image")
+        next_day_csv = source_dir / "next-day.csv"
+        updater.pd.DataFrame(
+            {
+                "target_time_local": ["2026-01-15T12:00:00+01:00"],
+                "forecast_wind_speed": [12.0],
+            }
+        ).to_csv(next_day_csv, index=False)
+        missing_csv = source_dir / "missing-current-day.csv"
+
+        copied = updater.publish_web_dashboard(
+            web_out_dir=output_dir,
+            local_tz="Europe/Amsterdam",
+            web_refresh_seconds=360,
+            next_day_png=next_day_png,
+            next_day_png_mobile=None,
+            next_day_csv=next_day_csv,
+            current_day_png=current_day_png,
+            current_day_png_mobile=None,
+            current_day_csv=missing_csv,
+            daily_mae_png=None,
+            daily_mae_png_mobile=None,
+            daily_mae_csv=None,
+            gate_eval_png=None,
+            gate_eval_csv=None,
+            direction_spider_png=None,
+            direction_spider_csv=None,
+            current_day_direction_spider_png=None,
+            current_day_direction_spider_csv=None,
+        )
+
+        html = (output_dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="dashboard-refresh"', html)
+        self.assertIn("↻ Refresh", html)
+        self.assertNotIn('http-equiv="refresh"', html)
+        self.assertIn('rel="apple-touch-icon"', html)
+        self.assertIn('href="site-assets/favicon.ico?v=1"', html)
+        self.assertIn('href="site-assets/favicon-32x32.png?v=1"', html)
+        self.assertIn('href="site-assets/favicon-16x16.png?v=1"', html)
+        self.assertIn('href="site-assets/apple-touch-icon.png?v=1"', html)
+        self.assertIn('href="site.webmanifest?v=1"', html)
+        self.assertIn('src="dashboard_refresh.js?v=', html)
+        self.assertIn('current_day_predictions.png?v=', html)
+        self.assertIn('next_day_predictions.png?v=', html)
+        self.assertIn('data-json-url="next_day_interactive_data.json?v=', html)
+        self.assertIn("minimumIntervalMs: 300000", html)
+        self.assertIn('metadataUrl: "metadata_update.json"', html)
+        self.assertIn("dashboard_refresh.js", copied)
+        self.assertIn("site.webmanifest", copied)
+        self.assertTrue((output_dir / "site-assets" / "apple-touch-icon.png").exists())
+
+        metadata = json.loads((output_dir / "metadata_update.json").read_text(encoding="utf-8"))
+        self.assertIn("current_day_predictions.png", metadata["static_images"])
+        self.assertIn("next_day_predictions.png", metadata["static_images"])
+        self.assertEqual(metadata["interactive_json"], ["next_day_interactive_data.json"])
+
+        refresh_source = (output_dir / "dashboard_refresh.js").read_text(encoding="utf-8")
+        self.assertIn('cache: "no-store"', refresh_source)
+        self.assertIn('document.addEventListener("visibilitychange"', refresh_source)
+        self.assertIn('window.addEventListener("pageshow"', refresh_source)
+        self.assertIn("shouldCheck(lastCheckAt", refresh_source)
+        self.assertIn("if (inFlight)", refresh_source)
+        self.assertIn('reason: "manual-after-check"', refresh_source)
+        self.assertIn('checkForUpdate({ force: true, manual: true', refresh_source)
+
     def test_current_day_plot_frame_keeps_three_minute_measured_rows(self) -> None:
         model_dir = str(Path(__file__).resolve().parents[1])
         if model_dir not in sys.path:

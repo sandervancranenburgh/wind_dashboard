@@ -44,6 +44,8 @@ from wingfoil_analysis import analyze_session_file, build_wind_context
 
 
 BASE_DIR = Path(__file__).resolve().parent
+WEB_ASSETS_DIR = REPO_ROOT / "next_day_wind_model" / "web_assets"
+SITE_ICONS_DIR = WEB_ASSETS_DIR / "icons"
 DATA_DIR = REPO_ROOT / "data"
 ARTIFACTS_DIR = REPO_ROOT / "next_day_wind_model" / "artifacts"
 CURRENT_DAY_PLOT_ARCHIVE_DIR = ARTIFACTS_DIR / "current_day_plot_archive"
@@ -110,6 +112,14 @@ ACTIVITY_ARTIFACT_LABELS = {
     "run_speed_distribution_svg": "Run speed distribution",
     "run_wind_angle_distribution_svg": "Run wind angle distribution",
     "run_speed_profile_svg": "Run speed profile",
+}
+SITE_ICON_FILENAMES = {
+    "apple-touch-icon.png",
+    "favicon-16x16.png",
+    "favicon-32x32.png",
+    "favicon.ico",
+    "icon-192x192.png",
+    "icon-512x512.png",
 }
 
 
@@ -1596,6 +1606,23 @@ def forecast_preview():
 @app.route("/index.html")
 def legacy_index():
     return redirect(url_for("portal_home"))
+
+
+@app.route("/site.webmanifest")
+def site_manifest():
+    return send_from_directory(
+        WEB_ASSETS_DIR,
+        "site.webmanifest",
+        mimetype="application/manifest+json",
+        conditional=True,
+    )
+
+
+@app.route("/site-assets/<filename>")
+def site_asset(filename: str):
+    if filename not in SITE_ICON_FILENAMES:
+        abort(404)
+    return send_from_directory(SITE_ICONS_DIR, filename, conditional=True)
 
 
 @app.route("/dashboard-assets/<path:filename>")

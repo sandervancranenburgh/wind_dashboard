@@ -5644,6 +5644,17 @@ def _write_interactive_plot_assets(
     if script_dst.exists():
         assets["dashboard_interactive_js"] = script_dst.name
 
+    refresh_script_src = REPO_ROOT / "next_day_wind_model" / "web_dashboard" / "dashboard_refresh.js"
+    refresh_script_dst = web_out_dir / "dashboard_refresh.js"
+    if refresh_script_src.exists():
+        try:
+            if refresh_script_src.resolve() != refresh_script_dst.resolve():
+                shutil.copy2(refresh_script_src, refresh_script_dst)
+        except FileNotFoundError:
+            shutil.copy2(refresh_script_src, refresh_script_dst)
+    if refresh_script_dst.exists():
+        assets["dashboard_refresh_js"] = refresh_script_dst.name
+
     if current_day_csv.exists():
         frame = pd.read_csv(current_day_csv)
         if "time_local" in frame.columns:
@@ -5791,6 +5802,28 @@ def publish_web_dashboard(
         (current_day_direction_spider_csv, "current_day_speed_by_direction.csv"),
     ]
     copied: dict[str, str] = {}
+    web_assets_dir = REPO_ROOT / "next_day_wind_model" / "web_assets"
+    site_assets_dir = web_out_dir / "site-assets"
+    site_assets_dir.mkdir(parents=True, exist_ok=True)
+    for icon_name in [
+        "apple-touch-icon.png",
+        "favicon-16x16.png",
+        "favicon-32x32.png",
+        "favicon.ico",
+        "icon-192x192.png",
+        "icon-512x512.png",
+    ]:
+        icon_src = web_assets_dir / "icons" / icon_name
+        if icon_src.exists():
+            icon_dst = site_assets_dir / icon_name
+            shutil.copy2(icon_src, icon_dst)
+            copied[f"site-assets/{icon_name}"] = str(icon_dst)
+    manifest_src = web_assets_dir / "site.webmanifest"
+    if manifest_src.exists():
+        manifest_dst = web_out_dir / "site.webmanifest"
+        shutil.copy2(manifest_src, manifest_dst)
+        copied["site.webmanifest"] = str(manifest_dst)
+
     for src, dst_name in publish_pairs:
         if src is None:
             continue
@@ -5821,6 +5854,10 @@ def publish_web_dashboard(
         copied[interactive_assets["dashboard_interactive_js"]] = str(
             web_out_dir / interactive_assets["dashboard_interactive_js"]
         )
+    if "dashboard_refresh_js" in interactive_assets:
+        copied[interactive_assets["dashboard_refresh_js"]] = str(
+            web_out_dir / interactive_assets["dashboard_refresh_js"]
+        )
     if "current_day_json" in interactive_assets:
         copied[interactive_assets["current_day_json"]] = str(web_out_dir / interactive_assets["current_day_json"])
     if "next_day_json" in interactive_assets:
@@ -5833,17 +5870,19 @@ def publish_web_dashboard(
     cache_bust = int(datetime.now(timezone.utc).timestamp())
     refresh = max(60, int(web_refresh_seconds))
     static_refresh_interval_ms = refresh * 1000
+    foreground_min_interval_ms = 5 * 60 * 1000
     static_refresh_metadata = {
         "static_plot_generated_at_utc": static_plot_generated_at_utc,
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
         "model_last_trained_at_utc": model_trained_at_utc,
         "generated_at_utc": static_plot_generated_at_utc,
-        "static_images": [
+        "static_images": sorted(
             name
-            for name in ["current_day_predictions.png", "current_day_predictions_mobile.png"]
-            if name in copied
-        ],
+            for name in copied
+            if name.endswith((".png", ".svg")) and not name.startswith("site-assets/")
+        ),
+        "interactive_json": sorted(name for name in copied if name.endswith("_interactive_data.json")),
     }
     static_refresh_metadata_path = web_out_dir / "metadata_update.json"
     static_refresh_metadata_path.write_text(json.dumps(static_refresh_metadata, indent=2), encoding="utf-8")
@@ -5853,10 +5892,13 @@ def publish_web_dashboard(
     if companion_base:
         companion_url = html.escape(companion_base)
         companion_links = f"""
-    <nav class="dashboard-actions" aria-label="Rider portal">
       <a class="button primary" href="{companion_url}/">Rider portal</a>
       <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperience%2Fnew">New submission</a>
-      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperiences">My sessions</a>
+      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperiences">My sessions</a>"""
+    dashboard_actions = f"""
+    <nav class="dashboard-actions" aria-label="Dashboard actions">
+      <button class="button dashboard-refresh" id="dashboard-refresh" type="button" title="Check for the latest forecast" aria-label="Refresh forecast dashboard">↻ Refresh</button>
+{companion_links}
     </nav>"""
     current_day_mobile_base = (
         "current_day_predictions_mobile.png"
@@ -5879,6 +5921,7 @@ def publish_web_dashboard(
         if "dashboard_interactive.js" in copied
         else ""
     )
+    refresh_js_src = f"dashboard_refresh.js?v={cache_bust}"
     current_day_json_src = (
         f"current_day_interactive_data.json?v={cache_bust}"
         if "current_day_interactive_data.json" in copied
@@ -5941,15 +5984,24 @@ def publish_web_dashboard(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="{refresh}">
+  <meta name="theme-color" content="#062b55">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="icon" href="site-assets/favicon.ico?v=1" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="site-assets/favicon-32x32.png?v=1">
+  <link rel="icon" type="image/png" sizes="16x16" href="site-assets/favicon-16x16.png?v=1">
+  <link rel="apple-touch-icon" sizes="180x180" href="site-assets/apple-touch-icon.png?v=1">
+  <link rel="manifest" href="site.webmanifest?v=1">
   <title>Super local wind prediction Valkenburgse meer [under development]</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
     .page-header {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; flex-wrap: wrap; }}
     .dashboard-actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }}
-    .button {{ display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font-size: 15px; }}
+    .button {{ display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font: inherit; font-size: 15px; cursor: pointer; }}
     .button.primary {{ border-color: #135f86; background: #135f86; color: #fff; }}
+    .dashboard-refresh[disabled] {{ cursor: wait; opacity: 0.72; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
     .overview {{ color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }}
     .overview-mobile {{ display: none; }}
@@ -6002,9 +6054,9 @@ def publish_web_dashboard(
   <header class="page-header">
     <div>
       <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
-      <p class="meta">Last updated: {generated_local_str}</p>
+      <p class="meta" data-dashboard-version="{static_plot_generated_at_utc}">Last updated: {generated_local_str}</p>
     </div>
-{companion_links}
+{dashboard_actions}
   </header>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
@@ -6069,92 +6121,22 @@ def publish_web_dashboard(
   </p>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
     {f'<script src="{interactive_js_src}" defer></script>' if interactive_js_src else ''}
+    <script src="{refresh_js_src}" defer></script>
     <script>
         window.addEventListener("DOMContentLoaded", function () {{
             if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {{
                 window.WindDashboardInteractive.initInteractiveWindDashboard();
             }}
-            initStaticPlotRefresh();
+            if (window.WindDashboardRefresh && typeof window.WindDashboardRefresh.createController === "function") {{
+                window.__windDashboardRefresh = window.WindDashboardRefresh.createController({{
+                    metadataUrl: "metadata_update.json",
+                    currentVersion: {static_plot_generated_at_json},
+                    minimumIntervalMs: {foreground_min_interval_ms},
+                    pollIntervalMs: {static_refresh_interval_ms},
+                    refreshButton: document.getElementById("dashboard-refresh")
+                }}).start();
+            }}
         }});
-
-        function initStaticPlotRefresh() {{
-            var metadataUrl = "metadata_update.json";
-            var pollIntervalMs = {static_refresh_interval_ms};
-            var lastStaticPlotVersion = {static_plot_generated_at_json};
-
-            function metadataVersion(metadata) {{
-                if (!metadata) {{
-                    return "";
-                }}
-                return String(
-                    metadata.static_plot_generated_at_utc ||
-                    metadata.plot_refreshed_at_utc ||
-                    metadata.prediction_updated_at_utc ||
-                    metadata.prediction_generated_at_utc ||
-                    metadata.generated_at_utc ||
-                    ""
-                );
-            }}
-
-            function cacheBustedUrl(baseSrc, version) {{
-                return String(baseSrc).split("?")[0] + "?v=" + encodeURIComponent(version);
-            }}
-
-            function refreshStaticImages(version) {{
-                document.querySelectorAll("#current-day-fallback [data-static-refresh-src]").forEach(function (element) {{
-                    var baseSrc = element.getAttribute("data-static-refresh-src");
-                    if (!baseSrc || element.getAttribute("data-static-refresh-version") === version) {{
-                        return;
-                    }}
-                    var nextUrl = cacheBustedUrl(baseSrc, version);
-                    if (element.tagName.toLowerCase() === "source") {{
-                        if (element.getAttribute("srcset") !== nextUrl) {{
-                            element.setAttribute("srcset", nextUrl);
-                        }}
-                    }} else if (element.getAttribute("src") !== nextUrl) {{
-                        element.setAttribute("src", nextUrl);
-                    }}
-                    element.setAttribute("data-static-refresh-version", version);
-                }});
-            }}
-
-            function pollMetadata() {{
-                return fetch(metadataUrl + "?v=" + Date.now(), {{ cache: "no-store" }})
-                    .then(function (response) {{
-                        if (!response.ok) {{
-                            throw new Error("metadata fetch failed: " + response.status);
-                        }}
-                        return response.json();
-                    }})
-                    .then(function (metadata) {{
-                        var nextVersion = metadataVersion(metadata);
-                        if (!nextVersion) {{
-                            return;
-                        }}
-                        if (!lastStaticPlotVersion) {{
-                            lastStaticPlotVersion = nextVersion;
-                            return;
-                        }}
-                        if (nextVersion !== lastStaticPlotVersion) {{
-                            lastStaticPlotVersion = nextVersion;
-                            refreshStaticImages(nextVersion);
-                        }}
-                    }})
-                    .catch(function (error) {{
-                        if (window.console && typeof window.console.debug === "function") {{
-                            window.console.debug("Static plot metadata refresh skipped", error);
-                        }}
-                    }});
-            }}
-
-            function scheduleNextPoll() {{
-                window.setTimeout(function () {{
-                    pollMetadata().then(scheduleNextPoll, scheduleNextPoll);
-                }}, pollIntervalMs);
-            }}
-
-            pollMetadata().then(scheduleNextPoll, scheduleNextPoll);
-        }}
     </script>
 </body>
 </html>

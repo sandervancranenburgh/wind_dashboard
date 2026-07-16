@@ -1,0 +1,21 @@
+{
+  "name": "Super Local Wind Forecast",
+  "short_name": "Wind Forecast",
+  "description": "Location-independent wind-sports forecast and rider platform.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#062b55",
+  "icons": [
+    {
+      "src": "site-assets/icon-192x192.png?v=1",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "site-assets/icon-512x512.png?v=1",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

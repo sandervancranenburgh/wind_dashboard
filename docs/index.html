@@ -16,9 +16,10 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; color: #111; }
     h1 { margin: 0 0 8px 0; }
-    .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; flex-wrap: wrap; }
-    .dashboard-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .page-header { display: block; }
+    .dashboard-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; width: min(100%, 340px); margin: 10px 0 16px 0; }
     .button { display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font: inherit; font-size: 15px; cursor: pointer; }
+    .dashboard-action { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; white-space: nowrap; }
     .button.primary { border-color: #135f86; background: #135f86; color: #fff; }
     .dashboard-refresh[disabled] { cursor: wait; opacity: 0.72; }
     .meta { color: #555; margin: 0 0 16px 0; }
@@ -48,8 +49,7 @@
     .interactive-fallback-note { margin: 4px 0 8px 0; color: #666; font-size: 13px; }
     @media (max-width: 768px) {
       body { margin: 10px; }
-      .page-header { display: block; }
-      .dashboard-actions { justify-content: flex-start; margin: 8px 0 10px 0; }
+      .dashboard-actions { margin: 8px 0 10px 0; }
       h1 { font-size: 24px; margin: 0 0 6px 0; }
       h2 { font-size: 20px; margin: 0 0 6px 0; }
       .section-title { font-size: 21px; margin: 0 0 12px 0; }
@@ -73,15 +73,12 @@
   <header class="page-header">
     <div>
       <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
-      <p class="meta" data-dashboard-version="2026-07-16T19:25:06.463121+00:00">Last updated: 16 July 2026 21:25:06 CEST</p>
+      <p class="meta" data-dashboard-version="2026-07-16T19:31:12.036778+00:00">Last updated: 16 July 2026 21:31:12 CEST</p>
     </div>
 
     <nav class="dashboard-actions" aria-label="Dashboard actions">
-      <button class="button dashboard-refresh" id="dashboard-refresh" type="button" title="Check for the latest forecast" aria-label="Refresh forecast dashboard">↻ Refresh</button>
-
-      <a class="button primary" href="https://portal-cityailab.tbm.tudelft.nl/">Rider portal</a>
-      <a class="button" href="https://portal-cityailab.tbm.tudelft.nl/?login=1&amp;next=%2Fexperience%2Fnew">New submission</a>
-      <a class="button" href="https://portal-cityailab.tbm.tudelft.nl/?login=1&amp;next=%2Fexperiences">My sessions</a>
+      <a class="button primary dashboard-action" href="https://portal-cityailab.tbm.tudelft.nl/">Rider portal</a>
+      <button class="button dashboard-action dashboard-refresh" id="dashboard-refresh" type="button" title="Check for the latest forecast" aria-label="Refresh forecast dashboard">↻ Refresh</button>
     </nav>
   </header>
   <p class="overview overview-desktop">
@@ -103,15 +100,15 @@
                 data-controls-id="current-day-interactive-controls"
                 data-details-id="current-day-interactive-details"
                 data-fallback-id="current-day-fallback"
-                data-json-url="current_day_interactive_data.json?v=1784229906"
+                data-json-url="current_day_interactive_data.json?v=1784230272"
             >
                 <div class="interactive-controls" id="current-day-interactive-controls"></div>
                 <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="current-day-fallback">
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1784229906" data-static-refresh-src="current_day_predictions_mobile.png">
-        <img src="current_day_predictions.png?v=1784229906" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1784230272" data-static-refresh-src="current_day_predictions_mobile.png">
+        <img src="current_day_predictions.png?v=1784230272" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
@@ -124,15 +121,15 @@
                 data-controls-id="next-day-interactive-controls"
                 data-details-id="next-day-interactive-details"
                 data-fallback-id="next-day-fallback"
-                data-json-url="next_day_interactive_data.json?v=1784229906"
+                data-json-url="next_day_interactive_data.json?v=1784230272"
             >
                 <div class="interactive-controls" id="next-day-interactive-controls"></div>
                 <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
                 <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="next-day-fallback">
-        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1784229906">
-        <img src="next_day_predictions.png?v=1784229906" alt="Next day prediction">
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1784230272">
+        <img src="next_day_predictions.png?v=1784230272" alt="Next day prediction">
       </picture>
     </div>
 
@@ -145,7 +142,7 @@
         <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, NE, SE winds; the largest gain is 1.7 kts for E. For that sector the super-local model is close to unbiased on average. The advantage is smallest, or negative, for NW, N, SW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="current_day_direction_spider.png?v=1784229906" alt="Current-day prediction performance by wind direction">
+        <img src="current_day_direction_spider.png?v=1784230272" alt="Current-day prediction performance by wind direction">
       </div>
     </div>
 
@@ -155,7 +152,7 @@
         <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for E, NE, SE, N winds. The advantage is smallest for NW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="model_gate_direction_spider.png?v=1784229906" alt="Next-day prediction performance by wind direction">
+        <img src="model_gate_direction_spider.png?v=1784230272" alt="Next-day prediction performance by wind direction">
       </div>
     </div>
     </section>
@@ -163,7 +160,7 @@
     <div class="card">
       <h2>Model-gate evaluation history</h2>
       <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
-      <img src="model_gate_eval_history.png?v=1784229906" alt="Model gate evaluation history">
+      <img src="model_gate_eval_history.png?v=1784230272" alt="Model gate evaluation history">
     </div>
   </div>
   <p class="overview overview-mobile">
@@ -175,7 +172,7 @@
   </p>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
     
-    <script src="dashboard_refresh.js?v=1784229906" defer></script>
+    <script src="dashboard_refresh.js?v=1784230272" defer></script>
     <script>
         window.addEventListener("DOMContentLoaded", function () {
             if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {
@@ -184,7 +181,7 @@
             if (window.WindDashboardRefresh && typeof window.WindDashboardRefresh.createController === "function") {
                 window.__windDashboardRefresh = window.WindDashboardRefresh.createController({
                     metadataUrl: "metadata_update.json",
-                    currentVersion: "2026-07-16T19:25:06.463121+00:00",
+                    currentVersion: "2026-07-16T19:31:12.036778+00:00",
                     minimumIntervalMs: 300000,
                     pollIntervalMs: 900000,
                     refreshButton: document.getElementById("dashboard-refresh")

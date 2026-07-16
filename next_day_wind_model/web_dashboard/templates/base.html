@@ -92,9 +92,24 @@
       flex-wrap: wrap; margin: 0 0 16px 0;
     }
     .page-header-actions h2 { margin: 0; }
-    .scope-tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-    .scope-tabs a { border: 1px solid #bbb; border-radius: 999px; padding: 6px 10px; background: #fff; }
-    .scope-tabs a.active { border-color: #135f86; background: #eaf4f9; font-weight: 700; }
+    .portal-navigation-panel { display: grid; gap: 12px; width: min(100%, 430px); margin: 0 0 16px 0; }
+    .portal-action-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .portal-action-button { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; border-radius: 8px; padding: 9px 8px; color: #fff; font-size: 14px; font-weight: 700; line-height: 1.2; text-align: center; white-space: nowrap; }
+    .portal-action-button:hover { color: #fff; text-decoration: none; }
+    .portal-action-button:focus-visible { outline: 3px solid rgba(19, 95, 134, 0.3); outline-offset: 2px; }
+    .portal-action-new { border-color: #00C8B3; background: #00C8B3; color: #fff; }
+    .portal-action-new:hover { border-color: #00a995; background: #00a995; color: #fff; }
+    .portal-action-new:active { border-color: #008f80; background: #008f80; }
+    .portal-action-dashboard { border-color: #135f86; background: #135f86; color: #fff; }
+    .portal-action-dashboard:hover { border-color: #0f4e70; background: #0f4e70; color: #fff; }
+    .portal-action-dashboard:active { border-color: #0b3e5a; background: #0b3e5a; }
+    .submission-filter { display: grid; gap: 7px; padding: 9px 10px 10px; border: 1px solid #d5e2e6; border-radius: 8px; background: #f7fbfc; }
+    .submission-filter-label { color: #334; font-size: 14px; font-weight: 700; }
+    .segmented-toggle { box-sizing: border-box; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; width: 100%; padding: 3px; border: 1px solid #aebfc6; border-radius: 999px; background: #dfeaed; }
+    .segmented-toggle-segment { display: flex; align-items: center; justify-content: center; min-height: 38px; border-radius: 999px; color: #135f86; font-size: 14px; font-weight: 700; text-align: center; }
+    .segmented-toggle-segment:hover { background: rgba(255, 255, 255, 0.55); text-decoration: none; }
+    .segmented-toggle-segment:focus-visible { position: relative; z-index: 1; outline: 3px solid rgba(19, 95, 134, 0.32); outline-offset: 1px; }
+    .segmented-toggle-segment.active { background: #fff; color: #0c4968; box-shadow: 0 1px 4px rgba(6, 43, 85, 0.2); }
     .visibility-badge {
       display: inline-block; border: 1px solid #aaa; border-radius: 999px; padding: 2px 7px;
       color: #444; background: #f7f7f7; font-size: 12px; font-weight: 700; text-transform: capitalize;
@@ -238,6 +253,7 @@
       .detail-title { align-items: center; gap: 7px; }
     }
     @media (max-width: 340px) {
+      .portal-action-row { grid-template-columns: 1fr; }
       .form-grid { grid-template-columns: 1fr; }
       .form-rating-row, .form-perceived-row,
       .form-equipment-wing, .form-equipment-foil, .form-equipment-weight { grid-column: 1; }
@@ -257,7 +273,9 @@
       {% block meta %}{% endblock %}
     </div>
     <nav class="primary-nav" aria-label="Primary navigation">
-      <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
+      {% if request.endpoint != 'experiences' %}
+        <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
+      {% endif %}
       {% if current_user %}
         {% if request.endpoint != 'experiences' %}
           <a href="{{ url_for('experiences') }}">My submissions</a>

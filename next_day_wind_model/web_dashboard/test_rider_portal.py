@@ -262,7 +262,22 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"Logged in as", sessions_page.data)
         self.assertEqual(sessions_page.data.count(b'href="/experiences"'), 0)
         self.assertEqual(sessions_page.data.count(b'href="/experience/new"'), 1)
-        self.assertIn(b'class="page-header-actions"', sessions_page.data)
+        self.assertIn(b'class="portal-navigation-panel"', sessions_page.data)
+        self.assertIn(b'class="portal-action-row"', sessions_page.data)
+        self.assertIn(b'class="button portal-action-button portal-action-new"', sessions_page.data)
+        self.assertIn(b'class="button portal-action-button portal-action-dashboard"', sessions_page.data)
+        self.assertEqual(sessions_page.data.count(b'class="button portal-action-button'), 2)
+        self.assertIn(b".portal-action-button { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; border-radius: 8px; padding: 9px 8px; color: #fff;", sessions_page.data)
+        self.assertIn(b".portal-action-new { border-color: #00C8B3; background: #00C8B3; color: #fff;", sessions_page.data)
+        self.assertIn(b".portal-action-dashboard { border-color: #135f86; background: #135f86; color: #fff;", sessions_page.data)
+        self.assertLess(sessions_page.data.index(b">New submission</a>"), sessions_page.data.index(b">Forecast dashboard</a>"))
+        self.assertEqual(sessions_page.data.count(b">Forecast dashboard</a>"), 1)
+        self.assertIn(b">Show submissions</span>", sessions_page.data)
+        self.assertIn(b'class="segmented-toggle"', sessions_page.data)
+        self.assertEqual(sessions_page.data.count(b'class="segmented-toggle-segment'), 2)
+        self.assertEqual(sessions_page.data.count(b'aria-current="page"'), 1)
+        self.assertIn(b">My</a>", sessions_page.data)
+        self.assertIn(b">All</a>", sessions_page.data)
         self.assertIn(f'href="/experiences/{legacy_submission}"'.encode(), sessions_page.data)
 
         root_handoff = self.client.get("/?next=/experience/new")
@@ -920,11 +935,18 @@ class RiderPortalTest(unittest.TestCase):
             direction_spider_csv=None,
             current_day_direction_spider_png=None,
             current_day_direction_spider_csv=None,
+            companion_app_base_url="https://portal.example",
         )
 
         html = (output_dir / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="dashboard-refresh"', html)
         self.assertIn("↻ Refresh", html)
+        self.assertNotIn(">New submission</a>", html)
+        self.assertNotIn(">My sessions</a>", html)
+        self.assertIn('class="button primary dashboard-action"', html)
+        self.assertIn('class="button dashboard-action dashboard-refresh"', html)
+        self.assertLess(html.index(">Rider portal</a>"), html.index("↻ Refresh</button>"))
+        self.assertIn("grid-template-columns: repeat(auto-fit, minmax(140px, 1fr))", html)
         self.assertNotIn('http-equiv="refresh"', html)
         self.assertIn('rel="apple-touch-icon"', html)
         self.assertIn('href="site-assets/favicon.ico?v=1"', html)
@@ -1764,6 +1786,10 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b">01-02-2026</a>", mine.data)
         self.assertIn(b"data-sort=\"2026-02-01\"", mine.data)
 
+        self.assertIn(b'class="segmented-toggle-segment active" aria-current="page" href="/experiences?scope=mine">My</a>', mine.data)
+        self.assertIn(b'class="segmented-toggle-segment" href="/experiences?scope=all">All</a>', mine.data)
+        self.assertEqual(mine.data.count(b'aria-current="page"'), 1)
+
         mine_by_rider = self.client.get("/experiences?scope=mine&sort=rider&dir=asc")
         self.assertEqual(mine_by_rider.status_code, 200)
         self.assertIn(b"sort=rider", mine_by_rider.data)
@@ -1780,6 +1806,10 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b"other-rider", all_submissions.data)
         self.assertNotIn(b"Other Public", all_submissions.data)
         self.assertNotIn(b"<h2>All submissions</h2>", all_submissions.data)
+
+        self.assertIn(b'class="segmented-toggle-segment" href="/experiences?scope=mine">My</a>', all_submissions.data)
+        self.assertIn(b'class="segmented-toggle-segment active" aria-current="page" href="/experiences?scope=all">All</a>', all_submissions.data)
+        self.assertEqual(all_submissions.data.count(b'aria-current="page"'), 1)
 
         all_by_visibility = self.client.get("/experiences?scope=all&sort=visibility&dir=asc")
         self.assertEqual(all_by_visibility.status_code, 200)

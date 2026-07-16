@@ -11,13 +11,19 @@
 {%- endmacro %}
 {% block content %}
   <main class="page submissions-page">
-    <div class="page-header-actions">
-      <nav class="scope-tabs" aria-label="Submission scope">
-        <a class="{{ 'active' if scope == 'mine' else '' }}" href="{{ url_for('experiences', scope='mine') }}">My submissions</a>
-        <a class="{{ 'active' if scope == 'all' else '' }}" href="{{ url_for('experiences', scope='all') }}">All submissions</a>
+    <section class="portal-navigation-panel" aria-label="Submission navigation">
+      <nav class="portal-action-row" aria-label="Submission actions">
+        <a class="button portal-action-button portal-action-new" href="{{ url_for('new_experience') }}">New submission</a>
+        <a class="button portal-action-button portal-action-dashboard" href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
       </nav>
-      <a class="button primary" href="{{ url_for('new_experience') }}">New submission</a>
-    </div>
+      <div class="submission-filter">
+        <span class="submission-filter-label" id="submission-scope-label">Show submissions</span>
+        <nav class="segmented-toggle" aria-labelledby="submission-scope-label">
+          <a class="segmented-toggle-segment{% if scope == 'mine' %} active{% endif %}"{% if scope == 'mine' %} aria-current="page"{% endif %} href="{{ url_for('experiences', scope='mine') }}">My</a>
+          <a class="segmented-toggle-segment{% if scope == 'all' %} active{% endif %}"{% if scope == 'all' %} aria-current="page"{% endif %} href="{{ url_for('experiences', scope='all') }}">All</a>
+        </nav>
+      </div>
+    </section>
     <div class="table-wrap">
       <table>
         <thead>

@@ -5891,14 +5891,11 @@ def publish_web_dashboard(
     companion_links = ""
     if companion_base:
         companion_url = html.escape(companion_base)
-        companion_links = f"""
-      <a class="button primary" href="{companion_url}/">Rider portal</a>
-      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperience%2Fnew">New submission</a>
-      <a class="button" href="{companion_url}/?login=1&amp;next=%2Fexperiences">My sessions</a>"""
+        companion_links = f"""      <a class="button primary dashboard-action" href="{companion_url}/">Rider portal</a>
+"""
     dashboard_actions = f"""
     <nav class="dashboard-actions" aria-label="Dashboard actions">
-      <button class="button dashboard-refresh" id="dashboard-refresh" type="button" title="Check for the latest forecast" aria-label="Refresh forecast dashboard">↻ Refresh</button>
-{companion_links}
+{companion_links}      <button class="button dashboard-action dashboard-refresh" id="dashboard-refresh" type="button" title="Check for the latest forecast" aria-label="Refresh forecast dashboard">↻ Refresh</button>
     </nav>"""
     current_day_mobile_base = (
         "current_day_predictions_mobile.png"
@@ -5997,9 +5994,10 @@ def publish_web_dashboard(
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
-    .page-header {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; flex-wrap: wrap; }}
-    .dashboard-actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }}
+    .page-header {{ display: block; }}
+    .dashboard-actions {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; width: min(100%, 340px); margin: 10px 0 16px 0; }}
     .button {{ display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font: inherit; font-size: 15px; cursor: pointer; }}
+    .dashboard-action {{ box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; white-space: nowrap; }}
     .button.primary {{ border-color: #135f86; background: #135f86; color: #fff; }}
     .dashboard-refresh[disabled] {{ cursor: wait; opacity: 0.72; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
@@ -6029,8 +6027,7 @@ def publish_web_dashboard(
     .interactive-fallback-note {{ margin: 4px 0 8px 0; color: #666; font-size: 13px; }}
     @media (max-width: 768px) {{
       body {{ margin: 10px; }}
-      .page-header {{ display: block; }}
-      .dashboard-actions {{ justify-content: flex-start; margin: 8px 0 10px 0; }}
+      .dashboard-actions {{ margin: 8px 0 10px 0; }}
       h1 {{ font-size: 24px; margin: 0 0 6px 0; }}
       h2 {{ font-size: 20px; margin: 0 0 6px 0; }}
       .section-title {{ font-size: 21px; margin: 0 0 12px 0; }}

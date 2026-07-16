@@ -289,6 +289,18 @@ class RiderPortalTest(unittest.TestCase):
         self.assertIn(b"<h2>New submission</h2>", new_submission.data)
         self.assertEqual(new_submission.data.count(b'href="/experiences"'), 1)
         self.assertEqual(new_submission.data.count(b'href="/experience/new"'), 0)
+        self.assertIn(b'class="primary-nav portal-action-row submission-form-nav"', new_submission.data)
+        self.assertIn(b'class="button portal-action-button portal-action-new" href="/experiences">Submissions</a>', new_submission.data)
+        self.assertIn(b'class="button portal-action-button portal-action-dashboard"', new_submission.data)
+        self.assertNotIn(b">My submissions</a>", new_submission.data)
+        self.assertLess(new_submission.data.index(b">Submissions</a>"), new_submission.data.index(b">Forecast dashboard</a>"))
+
+        edit_submission = self.client.get(f"/experiences/{legacy_submission}/edit")
+        self.assertEqual(edit_submission.status_code, 200)
+        self.assertIn(b"<h2>Modify submission</h2>", edit_submission.data)
+        self.assertIn(b'class="primary-nav portal-action-row submission-form-nav"', edit_submission.data)
+        self.assertIn(b'class="button portal-action-button portal-action-new" href="/experiences">Submissions</a>', edit_submission.data)
+        self.assertIn(b'class="button portal-action-button portal-action-dashboard"', edit_submission.data)
 
         profile_page = self.client.get("/profile")
         self.assertEqual(profile_page.status_code, 200)
@@ -935,12 +947,22 @@ class RiderPortalTest(unittest.TestCase):
             direction_spider_csv=None,
             current_day_direction_spider_png=None,
             current_day_direction_spider_csv=None,
+            spot_name="Valkenburgse meer",
             companion_app_base_url="https://portal.example",
         )
 
         html = (output_dir / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="dashboard-refresh"', html)
         self.assertIn("↻ Refresh", html)
+        self.assertEqual(updater._site_display_name("valkenburgsemeer"), "Valkenburgse meer")
+        self.assertIn("<title>Super local wind prediction - Valkenburgse meer</title>", html)
+        self.assertIn("<h1>Super local wind prediction</h1>", html)
+        self.assertNotIn("<h1>Super local wind prediction Valkenburgse meer", html)
+        self.assertIn('<p class="development-status"># Under development #</p>', html)
+        self.assertIn('<strong data-dashboard-spot>Valkenburgse meer</strong>', html)
+        self.assertLess(html.index("<h1>Super local wind prediction</h1>"), html.index("# Under development #"))
+        self.assertLess(html.index("# Under development #"), html.index("data-dashboard-spot"))
+        self.assertLess(html.index("data-dashboard-spot"), html.index("Last updated:"))
         self.assertNotIn(">New submission</a>", html)
         self.assertNotIn(">My sessions</a>", html)
         self.assertIn('class="button primary dashboard-action"', html)

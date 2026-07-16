@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from db_store import (
+    SPOT_TO_SITE,
     init_db,
     load_next_day_realized_detail_rows,
     load_prediction_evaluation_summary,
@@ -5755,6 +5756,14 @@ def _write_interactive_plot_assets(
     return assets
 
 
+def _site_display_name(site: str) -> str:
+    site_id = str(site or "").strip()
+    for display_name, mapped_site in SPOT_TO_SITE.items():
+        if mapped_site == site_id:
+            return display_name
+    return site_id
+
+
 def publish_web_dashboard(
     web_out_dir: Path,
     local_tz: str,
@@ -5774,6 +5783,7 @@ def publish_web_dashboard(
     direction_spider_csv: Path | None,
     current_day_direction_spider_png: Path | None,
     current_day_direction_spider_csv: Path | None,
+    spot_name: str,
     current_day_prior_prediction_tables: list[pd.DataFrame] | None = None,
     prediction_generated_at_utc: str | None = None,
     prediction_updated_at_utc: str | None = None,
@@ -5865,6 +5875,7 @@ def publish_web_dashboard(
 
     generated_local = datetime.now(ZoneInfo(local_tz))
     generated_local_str = generated_local.strftime("%d %B %Y %H:%M:%S %Z")
+    spot_display = html.escape(str(spot_name).strip())
     static_plot_generated_at_utc = datetime.now(timezone.utc).isoformat()
     static_plot_generated_at_json = json.dumps(static_plot_generated_at_utc)
     cache_bust = int(datetime.now(timezone.utc).timestamp())
@@ -5990,7 +6001,7 @@ def publish_web_dashboard(
   <link rel="icon" type="image/png" sizes="16x16" href="site-assets/favicon-16x16.png?v=1">
   <link rel="apple-touch-icon" sizes="180x180" href="site-assets/apple-touch-icon.png?v=1">
   <link rel="manifest" href="site.webmanifest?v=1">
-  <title>Super local wind prediction Valkenburgse meer [under development]</title>
+  <title>Super local wind prediction - {spot_display}</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
     h1 {{ margin: 0 0 8px 0; }}
@@ -6000,6 +6011,9 @@ def publish_web_dashboard(
     .dashboard-action {{ box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; white-space: nowrap; }}
     .button.primary {{ border-color: #135f86; background: #135f86; color: #fff; }}
     .dashboard-refresh[disabled] {{ cursor: wait; opacity: 0.72; }}
+    .development-status {{ margin: 0 0 8px 0; color: #777; font-size: 15px; font-style: italic; }}
+    .spot-line {{ margin: 0 0 6px 0; color: #222; font-size: 16px; font-weight: 600; }}
+    .page-header .meta {{ margin: 0; }}
     .meta {{ color: #555; margin: 0 0 16px 0; }}
     .overview {{ color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }}
     .overview-mobile {{ display: none; }}
@@ -6050,7 +6064,9 @@ def publish_web_dashboard(
 <body>
   <header class="page-header">
     <div>
-      <h1>Super local wind prediction Valkenburgse meer [under development]</h1>
+      <h1>Super local wind prediction</h1>
+      <p class="development-status"># Under development #</p>
+      <p class="spot-line"><span>Spot:</span> <strong data-dashboard-spot>{spot_display}</strong></p>
       <p class="meta" data-dashboard-version="{static_plot_generated_at_utc}">Last updated: {generated_local_str}</p>
     </div>
 {dashboard_actions}
@@ -6521,6 +6537,7 @@ def run_dashboard_stage_from_cached_artifacts(
             direction_spider_csv=gate_eval_direction_csv_src,
             current_day_direction_spider_png=current_day_direction_spider_png_src,
             current_day_direction_spider_csv=current_day_direction_csv_src,
+            spot_name=_site_display_name(args.site),
             current_day_prior_prediction_tables=current_day_prior_prediction_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,
@@ -8072,6 +8089,7 @@ def main() -> None:
             direction_spider_csv=gate_eval_direction_csv_src,
             current_day_direction_spider_png=current_day_direction_spider_png_src,
             current_day_direction_spider_csv=current_day_direction_csv_src,
+            spot_name=_site_display_name(args.site),
             current_day_prior_prediction_tables=current_day_prior_prediction_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,

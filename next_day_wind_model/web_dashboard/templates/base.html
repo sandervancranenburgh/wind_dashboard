@@ -94,6 +94,7 @@
     .page-header-actions h2 { margin: 0; }
     .portal-navigation-panel { display: grid; gap: 12px; width: min(100%, 430px); margin: 0 0 16px 0; }
     .portal-action-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .submission-form-nav { align-self: start; width: min(100%, 430px); padding-top: 2px; }
     .portal-action-button { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; border-radius: 8px; padding: 9px 8px; color: #fff; font-size: 14px; font-weight: 700; line-height: 1.2; text-align: center; white-space: nowrap; }
     .portal-action-button:hover { color: #fff; text-decoration: none; }
     .portal-action-button:focus-visible { outline: 3px solid rgba(19, 95, 134, 0.3); outline-offset: 2px; }
@@ -272,16 +273,21 @@
       <p class="meta">Companion app for the Super local wind forecast dashboard</p>
       {% block meta %}{% endblock %}
     </div>
-    <nav class="primary-nav" aria-label="Primary navigation">
-      {% if request.endpoint != 'experiences' %}
-        <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
-      {% endif %}
-      {% if current_user %}
+    <nav class="primary-nav{% if request.endpoint in ['new_experience', 'edit_experience'] %} portal-action-row submission-form-nav{% endif %}" aria-label="Primary navigation">
+      {% if request.endpoint in ['new_experience', 'edit_experience'] %}
+        <a class="button portal-action-button portal-action-new" href="{{ url_for('experiences') }}">Submissions</a>
+        <a class="button portal-action-button portal-action-dashboard" href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
+      {% else %}
         {% if request.endpoint != 'experiences' %}
-          <a href="{{ url_for('experiences') }}">My submissions</a>
+          <a href="{{ forecast_dashboard_base_url }}">Forecast dashboard</a>
         {% endif %}
-        {% if request.endpoint not in ['experiences', 'new_experience'] %}
-          <a href="{{ url_for('new_experience') }}">New submission</a>
+        {% if current_user %}
+          {% if request.endpoint != 'experiences' %}
+            <a href="{{ url_for('experiences') }}">My submissions</a>
+          {% endif %}
+          {% if request.endpoint != 'experiences' %}
+            <a href="{{ url_for('new_experience') }}">New submission</a>
+          {% endif %}
         {% endif %}
       {% endif %}
     </nav>

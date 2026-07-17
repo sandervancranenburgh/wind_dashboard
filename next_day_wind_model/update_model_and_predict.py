@@ -13,6 +13,24 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# The normal six-minute command is classified before importing the scientific
+# and ML stack. Full/recovery modes re-enter this file in a child process with
+# the gate marker set; no-change exits here without loading those modules.
+if __name__ == "__main__" and os.environ.get("WIND_PIPELINE_OPERATIONAL_GATE_CHILD") != "1":
+    from next_day_wind_model.operational_update import launch_operational_update
+
+    raise SystemExit(launch_operational_update(Path(__file__).resolve(), sys.argv[1:]))
+
+MEASURED_ONLY_CHILD = (
+    __name__ == "__main__"
+    and os.environ.get("WIND_PIPELINE_OPERATIONAL_GATE_CHILD") == "1"
+    and "--operational-measured-only" in sys.argv[1:]
+)
+
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
@@ -20,49 +38,46 @@ from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea, VPacker
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
-import torch
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+if not MEASURED_ONLY_CHILD:
+    import torch
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from db_store import (
-    SPOT_TO_SITE,
-    init_db,
-    load_next_day_realized_detail_rows,
-    load_prediction_evaluation_summary,
-    log_prediction_batch,
-    materialize_prediction_log_evaluation,
-    summarize_next_day_vs_harmonie,
-    summarize_next_day_vs_harmonie_by_horizon,
-    summarize_next_day_vs_harmonie_by_issued_day,
-)
-from data_pipeline import (
-    DatasetConfig,
-    _angle_add_deg,
-    _apply_standardizer,
-    _fit_standardizer,
-    _fit_target_scaler,
-    build_anchor_forecast_context,
-    build_anchor_forecast_timeline,
-    build_all_direction_training_arrays,
-    build_all_training_arrays,
-    build_next_day_inference_input,
-)
-from intraday_model import (
-    IntradayBundle,
-    align_intraday_holdout_frames,
-    build_intraday_holdout_context_split,
-    build_intraday_holdout_evaluation_frame,
-    load_intraday_model,
-    predict_intraday_day_speed,
-    save_intraday_model,
-    summarize_intraday_champion_vs_challenger,
-    train_intraday_model,
-)
-from train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
+    from db_store import (
+        SPOT_TO_SITE,
+        init_db,
+        load_next_day_realized_detail_rows,
+        load_prediction_evaluation_summary,
+        log_prediction_batch,
+        materialize_prediction_log_evaluation,
+        summarize_next_day_vs_harmonie,
+        summarize_next_day_vs_harmonie_by_horizon,
+        summarize_next_day_vs_harmonie_by_issued_day,
+    )
+    from data_pipeline import (
+        DatasetConfig,
+        _angle_add_deg,
+        _apply_standardizer,
+        _fit_standardizer,
+        _fit_target_scaler,
+        build_anchor_forecast_context,
+        build_anchor_forecast_timeline,
+        build_all_direction_training_arrays,
+        build_all_training_arrays,
+        build_next_day_inference_input,
+    )
+    from intraday_model import (
+        IntradayBundle,
+        align_intraday_holdout_frames,
+        build_intraday_holdout_context_split,
+        build_intraday_holdout_evaluation_frame,
+        load_intraday_model,
+        predict_intraday_day_speed,
+        save_intraday_model,
+        summarize_intraday_champion_vs_challenger,
+        train_intraday_model,
+    )
+    from train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
 
 
 LSTM_HIGHLIGHT_COLOR = "#d7191c"
@@ -231,6 +246,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--git-remote", default="origin", help="Git remote name for auto-push.")
     parser.add_argument("--git-branch", default="main", help="Git branch name for auto-push.")
+    parser.add_argument(
+        "--operational-measured-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
@@ -6709,12 +6729,29 @@ def main() -> None:
         "dashboard=run"
     )
 
+    if args.operational_measured_only:
+        from next_day_wind_model.measured_update import run_measured_only_stage
+
+        run_measured_only_stage(
+            args=args,
+            db_path=db_path,
+            out_dir=out_dir,
+            build_plot_frame=_build_current_day_plot_frame,
+            save_current_day_plot=save_current_day_plot,
+            load_prediction_history=load_current_day_prediction_history,
+            write_interactive_assets=_write_interactive_plot_assets,
+            load_harmonie_metadata=_load_latest_harmonie_metadata_time,
+            auto_push=auto_push_dashboard_changes,
+        )
+        return
+
     cfg = DatasetConfig(
         site=args.site,
         model=args.model,
         window_hours=args.window_hours,
         target_hours=args.target_hours,
     )
+
     if args.skip_prediction:
         try:
             run_dashboard_stage_from_cached_artifacts(

@@ -20,8 +20,13 @@ from zoneinfo import ZoneInfo
 
 GATE_CHILD_ENV = "WIND_PIPELINE_OPERATIONAL_GATE_CHILD"
 STATE_SCHEMA_VERSION = 1
-FINGERPRINT_SCHEMA_VERSION = 1
+FORECAST_FINGERPRINT_VERSION = 1
 FORECAST_SOURCE = "windsurfice"
+
+
+def _is_valid_forecast_fingerprint(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
 
 MODEL_ARTIFACT_NAMES = (
     "next_day_lstm_speed_residual.pt",
@@ -247,7 +252,7 @@ def compute_forecast_fingerprint(
         raise ValueError("forecast payload has no usable rows")
 
     document: dict[str, Any] = {
-        "schema": FINGERPRINT_SCHEMA_VERSION,
+        "schema": FORECAST_FINGERPRINT_VERSION,
         "site": str(site).strip().lower(),
         "source": str(source).strip().lower(),
         "model": str(model).strip().upper(),
@@ -468,9 +473,13 @@ def load_success_state(path: Path, *, site: str, model: str) -> dict[str, Any] |
         return None
     if payload.get("schema_version") != STATE_SCHEMA_VERSION:
         return None
+    if payload.get("fingerprint_version") != FORECAST_FINGERPRINT_VERSION:
+        return None
     if payload.get("site") != site or payload.get("model") != model:
         return None
     if payload.get("status") != "success":
+        return None
+    if not _is_valid_forecast_fingerprint(payload.get("forecast_fingerprint")):
         return None
     return payload
 
@@ -481,7 +490,7 @@ def decide_execution_mode(
 ) -> ExecutionDecision:
     if state is None:
         return ExecutionDecision("recovery_missing_state", "no successful operational state", True, False)
-    if snapshot.forecast is None:
+    if snapshot.forecast is None or not _is_valid_forecast_fingerprint(snapshot.forecast.fingerprint):
         return ExecutionDecision("recovery_forecast_identity", "forecast identity unavailable", True, False)
     if snapshot.model_fingerprint is None:
         return ExecutionDecision("recovery_model_artifacts", "model artifact set is incomplete", True, False)
@@ -540,13 +549,18 @@ def write_success_state(
     execution_mode: str,
     successful_at_utc: datetime | None = None,
 ) -> None:
-    if snapshot.forecast is None or snapshot.model_fingerprint is None:
-        raise ValueError("cannot mark success without forecast and model identities")
+    if (
+        snapshot.forecast is None
+        or not _is_valid_forecast_fingerprint(snapshot.forecast.fingerprint)
+        or snapshot.model_fingerprint is None
+    ):
+        raise ValueError("cannot mark success without valid forecast and model identities")
     if not snapshot.cached_artifacts.valid or snapshot.cached_artifacts.fingerprint is None:
         raise ValueError("cannot mark success without valid cached prediction artifacts")
     timestamp = (successful_at_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
+        "fingerprint_version": FORECAST_FINGERPRINT_VERSION,
         "status": "success",
         "site": snapshot.site,
         "model": snapshot.model,

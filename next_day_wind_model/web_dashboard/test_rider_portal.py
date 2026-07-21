@@ -1226,8 +1226,15 @@ class RiderPortalTest(unittest.TestCase):
         self.assertNotIn(b'class="primary share-button"', detail)
         self.assertIn(b"<dt>Date</dt><dd>Thursday 15 January 2026</dd>", detail)
         self.assertNotIn(b'class="form-actions"', detail)
+        self.assertIn(b'class="primary-nav portal-action-row submission-form-nav"', detail)
+        self.assertIn(b'class="button portal-action-button portal-action-new" href="/experiences">Submissions</a>', detail)
+        self.assertIn(b'class="button portal-action-button portal-action-dashboard"', detail)
+        self.assertEqual(detail.count(b'class="button portal-action-button'), 2)
+        self.assertNotIn(b">My submissions</a>", detail)
+        self.assertNotIn(b">New submission</a>", detail)
+        self.assertLess(detail.index(b">Submissions</a>"), detail.index(b">Forecast dashboard</a>"))
         self.assertEqual(detail.count(b'href="/experiences"'), 1)
-        self.assertEqual(detail.count(b'href="/experience/new"'), 1)
+        self.assertEqual(detail.count(b'href="/experience/new"'), 0)
 
     def test_current_day_archive_lookup_supports_daily_and_timestamped_names(self) -> None:
         archive_dir = Path(self.temp_dir.name) / "current_day_plot_archive"
@@ -1324,6 +1331,8 @@ class RiderPortalTest(unittest.TestCase):
         self.assertLess(detail.index(b"<h2>Wind variability</h2>"), detail.index(b"<h2>Measured wind full day from archive</h2>"))
         self.assertIn(b"Variability: 1.45", detail)
         self.assertIn(b"30-min avg", detail)
+        self.assertIn(b'.wind-plot img { width: 100%; height: auto;', detail)
+        self.assertNotIn(b"aspect-ratio: 820 / 380", detail)
 
     def test_visibility_defaults_and_form_validation(self) -> None:
         default_private_id = self._create_submission(self.user_id, "Default Private", "2026-01-10")

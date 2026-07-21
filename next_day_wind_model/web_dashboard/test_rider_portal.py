@@ -134,6 +134,36 @@ class RiderPortalTest(unittest.TestCase):
         payload.seek(0)
         return (payload, filename)
 
+    def test_forecast_session_lookup_has_matching_range_index(self) -> None:
+        conn = db_store.connect_db(self.temp_dir.name)
+        index_columns = [
+            (row[2], row[3])
+            for row in conn.execute("PRAGMA index_xinfo(idx_fc_site_target_fetched)").fetchall()
+            if row[5]
+        ]
+        plan = conn.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT target_ts, payload
+            FROM forecasts
+            WHERE site = ?
+              AND target_ts >= ?
+              AND target_ts <= ?
+            ORDER BY target_ts, fetched_ts DESC
+            """,
+            ("valkenburgsemeer", 0, 1),
+        ).fetchall()
+        conn.close()
+
+        self.assertEqual(
+            index_columns,
+            [("site", 0), ("target_ts", 0), ("fetched_ts", 1)],
+        )
+        self.assertIn(
+            "USING INDEX idx_fc_site_target_fetched",
+            " ".join(str(row[3]) for row in plan),
+        )
+
     def _mock_analysis_payload(self, input_file, output_dir, wind_context=None, raise_on_error=False, **_kwargs):
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)

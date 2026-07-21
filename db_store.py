@@ -102,6 +102,15 @@ def _create_forecasts_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_fc_site_model_target ON {FORECASTS_TABLE}(site, model, target_ts)"
     )
+    # Rider Portal session summaries look up every forecast model for a narrow
+    # target-time window. The model-specific index above cannot range-search
+    # target_ts when model is intentionally unconstrained, which otherwise
+    # turns the first authenticated portal request into a scan of every
+    # forecast row for the site.
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_fc_site_target_fetched "
+        f"ON {FORECASTS_TABLE}(site, target_ts, fetched_ts DESC)"
+    )
 
 
 def _create_prediction_log_table(conn: sqlite3.Connection) -> None:

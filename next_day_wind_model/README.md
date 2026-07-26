@@ -117,6 +117,43 @@ The forecast dashboard and the rider/session features are intentionally deployed
 - Forecast dashboard: static HTML/images/CSVs, suitable for GitHub Pages.
 - Rider portal: separate Flask app for login, profiles, surf experience submission, measured-wind attachment, and submissions/detail/delete.
 
+### Preview worktree using production Rider Portal data
+
+This helper is intended only for temporary UI validation. A separate preview worktree normally has no Rider Portal database, uploads, analyses, or archived current-day plots. The helper links those runtime paths to the production checkout so the UI can be checked against representative live data without copying private or generated files.
+
+Run this from anywhere inside the preview worktree:
+
+```bash
+./scripts/setup_rider_portal_preview.sh \
+  ~/Documents/repos/wind_fetcher2
+```
+
+The production path is optional. Without it, the helper uses the single other Git worktree on the `main` branch when one can be identified, then falls back to `~/Documents/repos/wind_fetcher2`.
+
+Review the planned changes safely before configuring anything:
+
+```bash
+./scripts/setup_rider_portal_preview.sh \
+  --dry-run \
+  ~/Documents/repos/wind_fetcher2
+```
+
+By default, the helper does not replace `data/.wind_dashboard_secret`. Using a different Flask secret for the preview is harmless, but existing browser sessions will not carry over and a fresh login is expected. Link the production secret only when needed:
+
+```bash
+./scripts/setup_rider_portal_preview.sh \
+  --link-secret \
+  --force
+```
+
+Use `--force` only after reviewing the output if local non-symlink files or directories must be replaced. Running the helper again is safe; correctly configured links are left unchanged. Remove only links owned by the helper and restore tracked paths afterward with:
+
+```bash
+./scripts/setup_rider_portal_preview.sh --undo
+```
+
+**Warning:** the preview instance reads from and may write to the live production Rider Portal database and shared runtime directories. Avoid creating, editing, or deleting submissions during visual testing, and do not stage or commit the linked runtime paths. When `--link-secret` is used, the production secret is also shared with the preview.
+
 Each normal model run (non-test mode) updates the static dashboard folder:
 
 - `next_day_wind_model/web_dashboard/index.html`

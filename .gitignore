@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 
 # Local runtime data
+.rider_portal_preview_state*
 data/**/*.csv
 data/**/*.db
 data/**/*.db-shm

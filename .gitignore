@@ -26,7 +26,15 @@ next_day_wind_model/web_dashboard/*.csv
 next_day_wind_model/web_dashboard/*.png
 next_day_wind_model/web_dashboard/*.html
 docs/*.csv
-docs/*.png
+/docs/current_day_direction_spider.png
+/docs/current_day_predictions.png
+/docs/current_day_predictions_mobile.png
+/docs/daily_mae_history.png
+/docs/daily_mae_history_mobile.png
+/docs/model_gate_direction_spider.png
+/docs/model_gate_eval_history.png
+/docs/next_day_predictions.png
+/docs/next_day_predictions_mobile.png
 docs/index.html
 docs_dev/
 

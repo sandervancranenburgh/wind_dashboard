@@ -1,9 +1,14 @@
 {
-  "static_plot_generated_at_utc": "2026-08-09T20:43:22.017790+00:00",
+  "generated_at_utc": "2026-08-09T20:44:05.040533+00:00",
+  "interactive_json": [
+    "current_day_interactive_data.json",
+    "next_day_interactive_data.json"
+  ],
+  "latest_observation_time_utc": "2026-08-09T20:39:43+00:00",
+  "measured_only_update": true,
+  "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
   "prediction_generated_at_utc": "2026-08-09T20:40:10.160067+00:00",
   "prediction_updated_at_utc": "2026-08-09T20:00:00+00:00",
-  "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
-  "generated_at_utc": "2026-08-09T20:43:22.017790+00:00",
   "static_images": [
     "current_day_direction_spider.png",
     "current_day_predictions.png",
@@ -15,8 +20,5 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "interactive_json": [
-    "current_day_interactive_data.json",
-    "next_day_interactive_data.json"
-  ]
+  "static_plot_generated_at_utc": "2026-08-09T20:44:05.040533+00:00"
 }

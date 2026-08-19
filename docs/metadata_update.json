@@ -1,10 +1,10 @@
 {
-  "generated_at_utc": "2026-08-19T10:14:04.148358+00:00",
+  "generated_at_utc": "2026-08-19T10:20:03.589012+00:00",
   "interactive_json": [
     "current_day_interactive_data.json",
     "next_day_interactive_data.json"
   ],
-  "latest_observation_time_utc": "2026-08-19T10:11:16+00:00",
+  "latest_observation_time_utc": "2026-08-19T10:17:16+00:00",
   "measured_only_update": true,
   "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
   "prediction_generated_at_utc": "2026-08-19T09:40:25.354950+00:00",
@@ -20,5 +20,5 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-08-19T10:14:04.148358+00:00"
+  "static_plot_generated_at_utc": "2026-08-19T10:20:03.589012+00:00"
 }

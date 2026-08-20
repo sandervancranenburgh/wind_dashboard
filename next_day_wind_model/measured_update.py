@@ -296,7 +296,13 @@ def run_measured_only_stage(
         _metadata_value(metadata, "model_last_trained_at_utc")
         or _metadata_value(metadata, "trained_at_utc")
     )
-    harmonie_time_utc, harmonie_time_kind = load_harmonie_metadata(db_path, args.site)
+    harmonie_time_utc = _metadata_value(metadata, "harmonie_fetched_at_utc")
+    harmonie_time_kind = _metadata_value(metadata, "harmonie_time_kind") or "fetched"
+    if harmonie_time_utc is None:
+        harmonie_time_utc, harmonie_time_kind = load_harmonie_metadata(db_path, args.site)
+    plot_update_interval_minutes = int(getattr(args, "plot_update_interval_minutes", 6))
+    harmonie_update_interval_minutes = int(getattr(args, "harmonie_update_interval_minutes", 60))
+    plot_updated_at_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     target_day = pd.to_datetime(composed["time_local"]).dt.tz_convert(
         ZoneInfo(args.local_timezone)
     ).iloc[0].date()
@@ -326,6 +332,9 @@ def run_measured_only_stage(
             model_trained_at_utc=model_trained_at_utc,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_updated_at_utc=plot_updated_at_utc,
+            plot_update_interval_minutes=plot_update_interval_minutes,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
         )
@@ -338,6 +347,9 @@ def run_measured_only_stage(
             model_trained_at_utc=model_trained_at_utc,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_updated_at_utc=plot_updated_at_utc,
+            plot_update_interval_minutes=plot_update_interval_minutes,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
             mobile=True,
@@ -356,9 +368,12 @@ def run_measured_only_stage(
             current_day_prior_prediction_tables=prior_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,
+            plot_updated_at_utc=plot_updated_at_utc,
             model_trained_at_utc=model_trained_at_utc,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_update_interval_minutes=plot_update_interval_minutes,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
         )
 
         web_out_dir = Path(args.web_out_dir)
@@ -403,10 +418,15 @@ def run_measured_only_stage(
             web_metadata.update(
                 {
                     "static_plot_generated_at_utc": generated_at,
+                    "plot_updated_at_utc": plot_updated_at_utc,
                     "generated_at_utc": generated_at,
                     "latest_observation_time_utc": latest_observation_utc,
                     "prediction_generated_at_utc": prediction_generated_at_utc,
                     "prediction_updated_at_utc": prediction_updated_at_utc,
+                    "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
+                    "harmonie_time_kind": harmonie_time_kind,
+                    "plot_update_interval_minutes": plot_update_interval_minutes,
+                    "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
                     "model_last_trained_at_utc": model_trained_at_utc,
                     "measured_only_update": True,
                 }

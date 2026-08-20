@@ -273,7 +273,7 @@ def fetch_site(site_config: SiteConfig, out_dir="."):
         n_obs = upsert_observations(conn, site, obs)
         print(f"Upserted {n_obs} observation rows into SQLite")
     except Exception as e:
-        print(f"Failed to upsert observations into DB: {e}")
+        raise RuntimeError(f"Failed to upsert observations into DB: {e}") from e
     finally:
         try:
             conn.close()
@@ -319,7 +319,7 @@ def fetch_site(site_config: SiteConfig, out_dir="."):
         )
         print(f"Upserted {n_fc} forecast rows into SQLite")
     except Exception as e:
-        print(f"Failed to upsert forecasts into DB: {e}")
+        raise RuntimeError(f"Failed to upsert forecasts into DB: {e}") from e
     finally:
         try:
             conn.close()

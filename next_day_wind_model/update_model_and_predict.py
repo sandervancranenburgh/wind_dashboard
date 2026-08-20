@@ -84,6 +84,8 @@ LSTM_HIGHLIGHT_COLOR = "#d7191c"
 MODEL_GATE_CHAMPION_COLOR = "#ff7f0e"
 SUPERLOCAL_FORECAST_COLOR = MODEL_GATE_CHAMPION_COLOR
 SUFFICIENT_WIND_THRESHOLD_KTS = 10.0
+DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES = 6
+DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES = 60
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +194,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Sampling interval (minutes) for current-day forecast/prediction plot grid.",
+    )
+    parser.add_argument(
+        "--plot-update-interval-minutes",
+        type=int,
+        default=DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+        help="Configured production dashboard refresh cadence shown in plot metadata.",
+    )
+    parser.add_argument(
+        "--harmonie-update-interval-minutes",
+        type=int,
+        default=DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+        help="Nominal HARMONIE arrival cadence used for expected prediction/fetch times.",
     )
     parser.add_argument(
         "--skip-data-refresh-check",
@@ -1806,6 +1820,26 @@ def _parse_harmonie_ms_utc(value: object) -> datetime | None:
 def _load_latest_harmonie_metadata_time(db_path: Path, site: str) -> tuple[datetime | None, str]:
     conn = sqlite3.connect(str(db_path))
     try:
+        if _sqlite_table_exists(conn, "forecasts"):
+            row = conn.execute(
+                """
+                SELECT fetched_ts, run_ts
+                FROM forecasts
+                WHERE site = ?
+                  AND model = 'HARMONIE'
+                ORDER BY run_ts DESC, target_ts ASC
+                LIMIT 1
+                """,
+                (site,),
+            ).fetchone()
+            if row is not None:
+                fetched_dt = _parse_harmonie_ms_utc(row[0])
+                if fetched_dt is not None:
+                    return fetched_dt, "fetched"
+                run_dt = _parse_harmonie_ms_utc(row[1])
+                if run_dt is not None:
+                    return run_dt, "run"
+
         if _sqlite_table_exists(conn, "harmonie_knmi_features"):
             row = conn.execute(
                 """
@@ -1883,44 +1917,96 @@ def _format_harmonie_metadata_text(
     harmonie_time_utc: datetime | pd.Timestamp | str | None,
     harmonie_time_kind: str,
     local_tz: str,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
 ) -> str:
     harmonie_dt = _parse_iso_utc(None if harmonie_time_utc is None else str(harmonie_time_utc))
     kind = "run" if harmonie_time_kind == "run" else "fetched"
-    label = "HARMONIE run" if kind == "run" else "HARMONIE fetched"
+    label = "Last HARMONIE run" if kind == "run" else "Last HARMONIE fetch"
     if harmonie_dt is None:
-        return f"{label}: unknown"
+        return f"{label}: unknown - Next expected fetch: unknown"
     tz = ZoneInfo(local_tz)
     local_dt = harmonie_dt.astimezone(tz)
+    next_local = local_dt + timedelta(minutes=max(1, int(harmonie_update_interval_minutes)))
+    harmonie_txt = _format_compact_local_time(local_dt, tz)
+    next_txt = _format_compact_local_time(next_local, tz)
+    return f"{label}: {harmonie_txt} - Next expected fetch: ~{next_txt}"
+
+
+def _format_compact_local_time(value: datetime, tz: ZoneInfo) -> str:
+    local_dt = value.astimezone(tz)
     if local_dt.date() == datetime.now(tz).date():
-        harmonie_txt = local_dt.strftime("%H:%M")
+        return local_dt.strftime("%H:%M")
+    return f"{local_dt.day} {local_dt.strftime('%B %H:%M')}"
+
+
+def _format_update_line(
+    label: str,
+    value_utc: datetime | pd.Timestamp | str | None,
+    *,
+    local_tz: str,
+    interval_minutes: int,
+    expected: bool,
+) -> str:
+    value_dt = _parse_iso_utc(None if value_utc is None else str(value_utc))
+    next_label = "Next expected update" if expected else "Next update"
+    if value_dt is None:
+        return f"Last {label}: unknown - {next_label}: unknown"
+    tz = ZoneInfo(local_tz)
+    local_dt = value_dt.astimezone(tz)
+    next_local = local_dt + timedelta(minutes=max(1, int(interval_minutes)))
+    prefix = "~" if expected else ""
+    return (
+        f"Last {label}: {_format_compact_local_time(local_dt, tz)} - "
+        f"{next_label}: {prefix}{_format_compact_local_time(next_local, tz)}"
+    )
+
+
+def _format_prediction_update_line(
+    prediction_updated_at_utc: datetime | pd.Timestamp | str | None,
+    harmonie_time_utc: datetime | pd.Timestamp | str | None,
+    *,
+    local_tz: str,
+    harmonie_update_interval_minutes: int,
+) -> str:
+    prediction_dt = _parse_iso_utc(
+        None if prediction_updated_at_utc is None else str(prediction_updated_at_utc)
+    )
+    harmonie_dt = _parse_iso_utc(None if harmonie_time_utc is None else str(harmonie_time_utc))
+    tz = ZoneInfo(local_tz)
+    prediction_txt = (
+        _format_compact_local_time(prediction_dt, tz) if prediction_dt is not None else "unknown"
+    )
+    if harmonie_dt is None:
+        next_txt = "unknown"
     else:
-        harmonie_txt = f"{local_dt.day} {local_dt.strftime('%B %H:%M')}"
-    return f"{label}: {harmonie_txt} local"
+        next_dt = harmonie_dt + timedelta(
+            minutes=max(1, int(harmonie_update_interval_minutes))
+        )
+        next_txt = f"~{_format_compact_local_time(next_dt, tz)}"
+    return f"Last prediction update: {prediction_txt} - Next expected update: {next_txt}"
 
 
 def _format_plot_meta_text(
-    prediction_generated_at_utc: str,
+    plot_updated_at_utc: datetime | pd.Timestamp | str | None,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
     local_tz: str,
     harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_time_kind: str = "fetched",
+    plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
 ) -> str:
-    pred_dt = _parse_iso_utc(prediction_generated_at_utc)
-    pred_upd_dt = _parse_iso_utc(prediction_updated_at_utc)
     train_dt = _parse_iso_utc(model_trained_at_utc)
     tz = ZoneInfo(local_tz)
-    pred_txt = pred_dt.astimezone(tz).strftime("%H:%M") if pred_dt is not None else "unknown"
-    pred_upd_txt = pred_upd_dt.astimezone(tz).strftime("%H:%M") if pred_upd_dt is not None else "unknown"
     train_txt = (
         f"{train_dt.astimezone(tz).day} {train_dt.astimezone(tz).strftime('%B %H:%M')}"
         if train_dt is not None
         else "unknown"
     )
     return (
-        f"Last plot update: {pred_txt}\n"
-        f"Last prediction update: {pred_upd_txt}\n"
-        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz)}\n"
+        f"{_format_update_line('plot update', plot_updated_at_utc, local_tz=local_tz, interval_minutes=plot_update_interval_minutes, expected=False)}\n"
+        f"{_format_prediction_update_line(prediction_updated_at_utc, harmonie_time_utc, local_tz=local_tz, harmonie_update_interval_minutes=harmonie_update_interval_minutes)}\n"
+        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz, harmonie_update_interval_minutes)}\n"
         f"Champion model trained & promoted: {train_txt}"
     )
 
@@ -1953,11 +2039,13 @@ def save_prediction_plot(
     table: pd.DataFrame,
     plot_path: Path,
     local_tz: str,
-    prediction_generated_at_utc: str,
+    plot_updated_at_utc: datetime | pd.Timestamp | str | None,
     prediction_updated_at_utc: str | None,
     model_trained_at_utc: str | None,
     harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_time_kind: str = "fetched",
+    plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     mobile: bool = False,
 ) -> None:
     table = table.copy()
@@ -2059,12 +2147,14 @@ def save_prediction_plot(
         0.015,
         meta_y,
         _format_plot_meta_text(
-            prediction_generated_at_utc,
+            plot_updated_at_utc,
             prediction_updated_at_utc,
             model_trained_at_utc,
             local_tz,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_update_interval_minutes=plot_update_interval_minutes,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
         ),
         transform=ax.transAxes,
         ha="left",
@@ -2398,6 +2488,36 @@ def build_current_day_table(
     return table, issued_hourly_predictions
 
 
+def _current_day_direction_arrow_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Select hourly model arrows and the nearest real observation per hour."""
+    exact_hour = (
+        table["time_local"].dt.minute.eq(0)
+        & table["time_local"].dt.second.eq(0)
+        & table["time_local"].dt.microsecond.eq(0)
+    )
+    forecast_mask = exact_hour
+    if "is_forecast_grid" in table.columns:
+        forecast_mask = forecast_mask & table["is_forecast_grid"].astype(bool)
+    forecast_rows = table[forecast_mask].drop_duplicates(subset=["time_local"], keep="last")
+
+    actual_mask = pd.to_numeric(table["actual_wind_dir_deg"], errors="coerce").notna()
+    if "is_actual_observation" in table.columns:
+        actual_mask = actual_mask & table["is_actual_observation"].astype(bool)
+    actual_rows = table[actual_mask].copy()
+    if not actual_rows.empty:
+        actual_rows["_arrow_hour"] = actual_rows["time_local"].dt.round("h")
+        actual_rows["_arrow_distance"] = (
+            actual_rows["time_local"] - actual_rows["_arrow_hour"]
+        ).abs()
+        actual_rows = (
+            actual_rows.sort_values(["_arrow_distance", "time_local"])
+            .drop_duplicates(subset=["_arrow_hour"], keep="first")
+            .sort_values("time_local")
+            .drop(columns=["_arrow_hour", "_arrow_distance"])
+        )
+    return forecast_rows, actual_rows
+
+
 def save_current_day_plot(
     table: pd.DataFrame,
     plot_path: Path,
@@ -2407,6 +2527,9 @@ def save_current_day_plot(
     model_trained_at_utc: str | None,
     harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_time_kind: str = "fetched",
+    plot_updated_at_utc: datetime | pd.Timestamp | str | None = None,
+    plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     prior_prediction_tables: list[pd.DataFrame] | None = None,
     live_monitoring_metric: dict | None = None,
     mobile: bool = False,
@@ -3221,12 +3344,14 @@ def save_current_day_plot(
         0.015,
         meta_text_y,
         _format_plot_meta_text(
-            prediction_generated_at_utc,
+            plot_updated_at_utc,
             prediction_updated_at_utc,
             model_trained_at_utc,
             local_tz,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_update_interval_minutes=plot_update_interval_minutes,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
         ),
         transform=ax.transAxes,
         ha="left",
@@ -3240,22 +3365,14 @@ def save_current_day_plot(
     y_base = 0.26
     arrow_len = 0.22 if mobile else 0.24
     arrow_dx_scale = 0.22 / 24.0
-    arrow_mask = (
-        table["time_local"].dt.minute.eq(0)
-        & table["time_local"].dt.second.eq(0)
-        & table["time_local"].dt.microsecond.eq(0)
-    )
-    if "is_forecast_grid" in table.columns:
-        arrow_mask = arrow_mask & table["is_forecast_grid"].astype(bool)
-    arrow_rows = table[arrow_mask].drop_duplicates(subset=["time_local"], keep="last")
-    for _, row in arrow_rows.iterrows():
+    forecast_arrow_rows, actual_arrow_rows = _current_day_direction_arrow_rows(table)
+    for _, row in forecast_arrow_rows.iterrows():
         row_x = float(mdates.date2num(pd.Timestamp(row["time_local"]).to_pydatetime()))
         fdir = row["forecast_wind_dir_deg"]
         ldir = row["lstm_pred_wind_dir_deg"]
-        adir = row["actual_wind_dir_deg"]
         if pd.isna(ldir):
             ldir = row["lstm_pred_wind_dir_deg_full"]
-        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, SUPERLOCAL_FORECAST_COLOR, 4), (adir, "magenta", 6)]:
+        for direction_deg, color, z in [(fdir, "gray", 3), (ldir, SUPERLOCAL_FORECAST_COLOR, 4)]:
             if pd.isna(direction_deg):
                 continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -3271,6 +3388,22 @@ def save_current_day_plot(
                 clip_on=False,
                 zorder=z,
             )
+    for _, row in actual_arrow_rows.iterrows():
+        direction_deg = row["actual_wind_dir_deg"]
+        row_x = float(mdates.date2num(pd.Timestamp(row["time_local"]).to_pydatetime()))
+        theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
+        dx = arrow_dx_scale * np.sin(theta)
+        dy = arrow_len * np.cos(theta)
+        direction_ax.annotate(
+            "",
+            xy=(row_x + dx, y_base + dy),
+            xytext=(row_x, y_base),
+            xycoords=direction_ax.transData,
+            textcoords=direction_ax.transData,
+            arrowprops={"arrowstyle": "-|>", "color": "magenta", "lw": 1.6, "shrinkA": 0, "shrinkB": 0},
+            clip_on=False,
+            zorder=6,
+        )
 
     layout_top = 0.78 if mobile else 0.82
     layout_bottom = 0.08 if mobile else 0.075
@@ -5648,9 +5781,12 @@ def _write_interactive_plot_assets(
     current_day_prior_prediction_tables: list[pd.DataFrame] | None = None,
     prediction_generated_at_utc: str | None = None,
     prediction_updated_at_utc: str | None = None,
+    plot_updated_at_utc: datetime | pd.Timestamp | str | None = None,
     model_trained_at_utc: str | None = None,
     harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_time_kind: str = "fetched",
+    plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
 ) -> dict:
     assets: dict[str, str] = {}
 
@@ -5709,12 +5845,14 @@ def _write_interactive_plot_assets(
             if active_anchor_local is None:
                 active_anchor_local = current_issue_anchor_local
             plot_meta_text = _format_plot_meta_text(
-                prediction_generated_at_utc or "",
+                plot_updated_at_utc,
                 prediction_updated_at_utc,
                 model_trained_at_utc,
                 local_tz,
                 harmonie_time_utc=harmonie_time_utc,
                 harmonie_time_kind=harmonie_time_kind,
+                plot_update_interval_minutes=plot_update_interval_minutes,
+                harmonie_update_interval_minutes=harmonie_update_interval_minutes,
             )
 
             prior_payload_rows: list[dict] = []
@@ -5807,9 +5945,12 @@ def publish_web_dashboard(
     current_day_prior_prediction_tables: list[pd.DataFrame] | None = None,
     prediction_generated_at_utc: str | None = None,
     prediction_updated_at_utc: str | None = None,
+    plot_updated_at_utc: datetime | pd.Timestamp | str | None = None,
     model_trained_at_utc: str | None = None,
     harmonie_time_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_time_kind: str = "fetched",
+    plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
+    harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -5876,9 +6017,12 @@ def publish_web_dashboard(
         current_day_prior_prediction_tables=current_day_prior_prediction_tables,
         prediction_generated_at_utc=prediction_generated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
+        plot_updated_at_utc=plot_updated_at_utc,
         model_trained_at_utc=model_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=plot_update_interval_minutes,
+        harmonie_update_interval_minutes=harmonie_update_interval_minutes,
     )
     if "dashboard_interactive_js" in interactive_assets:
         copied[interactive_assets["dashboard_interactive_js"]] = str(
@@ -5904,8 +6048,13 @@ def publish_web_dashboard(
     foreground_min_interval_ms = 5 * 60 * 1000
     static_refresh_metadata = {
         "static_plot_generated_at_utc": static_plot_generated_at_utc,
+        "plot_updated_at_utc": None if plot_updated_at_utc is None else str(plot_updated_at_utc),
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
+        "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
+        "harmonie_time_kind": harmonie_time_kind,
+        "plot_update_interval_minutes": int(plot_update_interval_minutes),
+        "harmonie_update_interval_minutes": int(harmonie_update_interval_minutes),
         "model_last_trained_at_utc": model_trained_at_utc,
         "generated_at_utc": static_plot_generated_at_utc,
         "static_images": sorted(
@@ -6366,13 +6515,14 @@ def run_dashboard_stage_from_cached_artifacts(
     current_day_table = cached["current_day_table"]
     prediction_generated_at_utc, prediction_updated_at_utc, model_last_trained_at_utc, intraday_model_last_trained_at_utc = _cached_plot_metadata(metadata)
 
-    harmonie_time_utc: datetime | None = None
-    harmonie_time_kind = "fetched"
-    if db_path.exists():
+    harmonie_time_utc: datetime | str | None = _cached_metadata_value(metadata, "harmonie_fetched_at_utc")
+    harmonie_time_kind = _cached_metadata_value(metadata, "harmonie_time_kind") or "fetched"
+    if harmonie_time_utc is None and db_path.exists():
         try:
             harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
         except Exception as exc:
             print(f"Cached dashboard stage: Harmonie metadata lookup skipped: {exc}")
+    plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
 
     print("Stage plan: training=skipped, prediction=skipped, dashboard=running from cached artifacts")
     print(f"Cached next-day table: {cached['paths']['next_day_predictions_csv']}")
@@ -6385,21 +6535,25 @@ def run_dashboard_stage_from_cached_artifacts(
         table,
         plot_path,
         local_tz=args.local_timezone,
-        prediction_generated_at_utc=prediction_generated_at_utc,
+        plot_updated_at_utc=plot_updated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
     )
     save_prediction_plot(
         table,
         plot_path_mobile,
         local_tz=args.local_timezone,
-        prediction_generated_at_utc=prediction_generated_at_utc,
+        plot_updated_at_utc=plot_updated_at_utc,
         prediction_updated_at_utc=prediction_updated_at_utc,
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         mobile=True,
     )
 
@@ -6459,6 +6613,9 @@ def run_dashboard_stage_from_cached_artifacts(
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_updated_at_utc=plot_updated_at_utc,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
     )
@@ -6471,6 +6628,9 @@ def run_dashboard_stage_from_cached_artifacts(
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_updated_at_utc=plot_updated_at_utc,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
@@ -6561,9 +6721,12 @@ def run_dashboard_stage_from_cached_artifacts(
             current_day_prior_prediction_tables=current_day_prior_prediction_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,
+            plot_updated_at_utc=plot_updated_at_utc,
             model_trained_at_utc=model_last_trained_at_utc,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_update_interval_minutes=args.plot_update_interval_minutes,
+            harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
@@ -6584,7 +6747,12 @@ def run_dashboard_stage_from_cached_artifacts(
             "skip_prediction": True,
             "skip_training": True,
             "use_existing_artifacts": bool(args.use_existing_artifacts),
-            "plot_refreshed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "plot_refreshed_at_utc": plot_updated_at_utc,
+            "plot_updated_at_utc": plot_updated_at_utc,
+            "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
+            "harmonie_time_kind": harmonie_time_kind,
+            "plot_update_interval_minutes": int(args.plot_update_interval_minutes),
+            "harmonie_update_interval_minutes": int(args.harmonie_update_interval_minutes),
             "output_artifact_dir": str(out_dir.resolve()),
             "model_artifact_dir": str(model_artifact_dir.resolve()),
             "web_dashboard_dir": None if web_publish is None else str(Path(args.web_out_dir).resolve()),
@@ -6625,6 +6793,24 @@ def auto_push_dashboard_changes(
 ) -> dict:
     if not (repo_root / ".git").exists():
         return {"enabled": True, "pushed": False, "reason": "not_a_git_repo"}
+
+    try:
+        current_branch = subprocess.run(
+            ["git", "-C", str(repo_root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        return {"enabled": True, "pushed": False, "reason": f"git_branch_check_failed:{exc.returncode}"}
+    if current_branch != branch:
+        return {
+            "enabled": True,
+            "pushed": False,
+            "reason": "current_branch_mismatch",
+            "current_branch": current_branch,
+            "configured_branch": branch,
+        }
 
     try:
         rel_web_dir = web_out_dir.resolve().relative_to(repo_root.resolve())
@@ -7715,12 +7901,7 @@ def main() -> None:
     is_test_mode = args.test_now_local_hour is not None
     prediction_generated_at_dt = datetime.now(timezone.utc)
     prediction_generated_at_utc = prediction_generated_at_dt.isoformat()
-    prediction_update_local = prediction_generated_at_dt.astimezone(ZoneInfo(args.local_timezone)).replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    prediction_updated_at_utc = prediction_update_local.astimezone(timezone.utc).isoformat()
+    prediction_updated_at_utc: str | None = None
     harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
     next_day_prediction_log_rows = 0
     current_day_prediction_log_rows = 0
@@ -7780,27 +7961,6 @@ def main() -> None:
 
     plot_path = out_dir / "next_day_predictions.png"
     plot_path_mobile = out_dir / "next_day_predictions_mobile.png"
-    save_prediction_plot(
-        table,
-        plot_path,
-        local_tz=args.local_timezone,
-        prediction_generated_at_utc=prediction_generated_at_utc,
-        prediction_updated_at_utc=prediction_updated_at_utc,
-        model_trained_at_utc=model_last_trained_at_utc,
-        harmonie_time_utc=harmonie_time_utc,
-        harmonie_time_kind=harmonie_time_kind,
-    )
-    save_prediction_plot(
-        table,
-        plot_path_mobile,
-        local_tz=args.local_timezone,
-        prediction_generated_at_utc=prediction_generated_at_utc,
-        prediction_updated_at_utc=prediction_updated_at_utc,
-        model_trained_at_utc=model_last_trained_at_utc,
-        harmonie_time_utc=harmonie_time_utc,
-        harmonie_time_kind=harmonie_time_kind,
-        mobile=True,
-    )
 
     test_suffix = f"_test_hour_{int(args.test_now_local_hour):02d}" if is_test_mode else ""
     current_day_prior_prediction_tables: list[pd.DataFrame] = []
@@ -7941,6 +8101,35 @@ def main() -> None:
             if current_day_direction_spider_png.exists():
                 current_day_direction_spider_png_src = current_day_direction_spider_png
 
+    # Both super-local prediction tables have now been generated successfully.
+    prediction_updated_at_utc = datetime.now(timezone.utc).isoformat()
+    plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
+    save_prediction_plot(
+        table,
+        plot_path,
+        local_tz=args.local_timezone,
+        plot_updated_at_utc=plot_updated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+    )
+    save_prediction_plot(
+        table,
+        plot_path_mobile,
+        local_tz=args.local_timezone,
+        plot_updated_at_utc=plot_updated_at_utc,
+        prediction_updated_at_utc=prediction_updated_at_utc,
+        model_trained_at_utc=model_last_trained_at_utc,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        mobile=True,
+    )
+
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"
     current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
     save_current_day_plot(
@@ -7952,6 +8141,9 @@ def main() -> None:
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_updated_at_utc=plot_updated_at_utc,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
     )
@@ -7964,6 +8156,9 @@ def main() -> None:
         model_trained_at_utc=model_last_trained_at_utc,
         harmonie_time_utc=harmonie_time_utc,
         harmonie_time_kind=harmonie_time_kind,
+        plot_updated_at_utc=plot_updated_at_utc,
+        plot_update_interval_minutes=args.plot_update_interval_minutes,
+        harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
@@ -8130,9 +8325,12 @@ def main() -> None:
             current_day_prior_prediction_tables=current_day_prior_prediction_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,
+            plot_updated_at_utc=plot_updated_at_utc,
             model_trained_at_utc=model_last_trained_at_utc,
             harmonie_time_utc=harmonie_time_utc,
             harmonie_time_kind=harmonie_time_kind,
+            plot_update_interval_minutes=args.plot_update_interval_minutes,
+            harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
@@ -8225,6 +8423,11 @@ def main() -> None:
         "prediction_day_start": inference_input_speed["prediction_day_start"],
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
+        "plot_updated_at_utc": plot_updated_at_utc,
+        "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
+        "harmonie_time_kind": harmonie_time_kind,
+        "plot_update_interval_minutes": int(args.plot_update_interval_minutes),
+        "harmonie_update_interval_minutes": int(args.harmonie_update_interval_minutes),
         "model_last_trained_at_utc": model_last_trained_at_utc,
         "intraday_model_last_trained_at_utc": intraday_model_last_trained_at_utc,
         "next_day_prediction_log_rows": int(next_day_prediction_log_rows),

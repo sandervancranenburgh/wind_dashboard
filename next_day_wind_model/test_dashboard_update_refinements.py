@@ -15,8 +15,10 @@ from PIL import Image, ImageDraw
 import source_fetch
 from next_day_wind_model.update_model_and_predict import (
     _current_day_direction_arrow_rows,
+    _estimate_next_harmonie_arrival,
     _format_plot_meta_text,
     _load_latest_harmonie_metadata_time,
+    _load_recent_harmonie_arrivals,
     auto_push_dashboard_changes,
 )
 from scripts.regenerate_favicons import remove_exterior_white_matte
@@ -114,6 +116,117 @@ class UpdateMetadataTests(unittest.TestCase):
 
         self.assertEqual(kind, "fetched")
         self.assertEqual(value, datetime.fromtimestamp(1_787_250_061, tz=timezone.utc))
+
+    def test_recent_arrival_phase_estimates_normal_cadence_for_both_lines(self) -> None:
+        arrivals = [
+            "2026-08-20T16:43:00+00:00",
+            "2026-08-20T17:42:00+00:00",
+            "2026-08-20T18:44:00+00:00",
+            "2026-08-20T19:42:00+00:00",
+        ]
+
+        estimate = _estimate_next_harmonie_arrival(arrivals, arrivals[-1])
+
+        self.assertEqual(estimate.method, "median_recent_arrival_phase")
+        self.assertEqual(
+            estimate.expected_at_utc,
+            datetime(2026, 8, 20, 20, 42, 30, tzinfo=timezone.utc),
+        )
+        text = _format_plot_meta_text(
+            "2026-08-20T19:48:00+00:00",
+            "2026-08-20T19:47:00+00:00",
+            None,
+            "Europe/Amsterdam",
+            harmonie_time_utc=arrivals[-1],
+            harmonie_expected_next_at_utc=estimate.expected_at_utc,
+        )
+        self.assertIn("Last prediction update: 21:47 - Next expected update: ~22:42", text)
+        self.assertIn("Last HARMONIE fetch: 21:42 - Next expected fetch: ~22:42", text)
+
+    def test_one_delayed_cycle_does_not_pull_the_median_estimate(self) -> None:
+        arrivals = [
+            "2026-08-20T15:42:00+00:00",
+            "2026-08-20T16:43:00+00:00",
+            "2026-08-20T17:58:00+00:00",
+            "2026-08-20T18:42:00+00:00",
+            "2026-08-20T19:44:00+00:00",
+        ]
+
+        estimate = _estimate_next_harmonie_arrival(arrivals, arrivals[-1])
+
+        self.assertEqual(estimate.method, "median_recent_arrival_phase")
+        self.assertEqual(
+            estimate.expected_at_utc,
+            datetime(2026, 8, 20, 20, 43, tzinfo=timezone.utc),
+        )
+
+    def test_insufficient_arrival_history_falls_back_to_nominal_interval(self) -> None:
+        arrivals = [
+            "2026-08-20T18:43:00+00:00",
+            "2026-08-20T19:42:00+00:00",
+        ]
+
+        estimate = _estimate_next_harmonie_arrival(arrivals, arrivals[-1])
+
+        self.assertEqual(estimate.method, "nominal_interval_fallback")
+        self.assertEqual(
+            estimate.expected_at_utc,
+            datetime(2026, 8, 20, 20, 42, tzinfo=timezone.utc),
+        )
+
+    def test_repeated_poll_contents_count_as_one_arrival(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "fixture.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE forecasts (
+                    site TEXT, model TEXT, run_ts INTEGER, fetched_ts INTEGER,
+                    target_ts INTEGER, wind_speed REAL, wind_gust REAL,
+                    wind_dir REAL, payload TEXT
+                )
+                """
+            )
+            poll_times = [
+                "2026-08-20T18:42:00+00:00",
+                "2026-08-20T18:48:00+00:00",
+                "2026-08-20T19:42:00+00:00",
+                "2026-08-20T19:48:00+00:00",
+            ]
+            for poll_index, poll_time in enumerate(poll_times):
+                fetched_ms = int(pd.Timestamp(poll_time).timestamp() * 1000)
+                forecast_version = 0 if poll_index < 2 else 1
+                for target_index in range(24):
+                    target_ms = int(
+                        (pd.Timestamp("2026-08-21T00:00:00+00:00") + pd.Timedelta(hours=target_index)).timestamp()
+                        * 1000
+                    )
+                    conn.execute(
+                        "INSERT INTO forecasts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            "site",
+                            "HARMONIE",
+                            fetched_ms,
+                            fetched_ms,
+                            target_ms,
+                            10.0 + forecast_version,
+                            14.0 + forecast_version,
+                            220.0,
+                            "{}",
+                        ),
+                    )
+            conn.commit()
+            conn.close()
+
+            arrivals = _load_recent_harmonie_arrivals(db_path, "site")
+
+        self.assertEqual(
+            arrivals,
+            [
+                datetime(2026, 8, 20, 18, 42, tzinfo=timezone.utc),
+                datetime(2026, 8, 20, 19, 42, tzinfo=timezone.utc),
+            ],
+        )
 
 
 class MeasuredDirectionArrowTests(unittest.TestCase):

@@ -9,8 +9,10 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -86,6 +88,17 @@ SUPERLOCAL_FORECAST_COLOR = MODEL_GATE_CHAMPION_COLOR
 SUFFICIENT_WIND_THRESHOLD_KTS = 10.0
 DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES = 6
 DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES = 60
+HARMONIE_ARRIVAL_HISTORY_POLL_RUNS = 384
+HARMONIE_ARRIVAL_HISTORY_MAX_EVENTS = 48
+HARMONIE_ARRIVAL_ESTIMATE_SAMPLE_EVENTS = 24
+HARMONIE_ARRIVAL_ESTIMATE_MIN_EVENTS = 4
+
+
+@dataclass(frozen=True)
+class HarmonieArrivalEstimate:
+    expected_at_utc: datetime | None
+    arrivals_utc: tuple[datetime, ...]
+    method: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -1913,11 +1926,164 @@ def _load_latest_harmonie_metadata_time(db_path: Path, site: str) -> tuple[datet
     return None, "fetched"
 
 
+def _load_recent_harmonie_arrivals(
+    db_path: Path,
+    site: str,
+    *,
+    model: str = "HARMONIE",
+    max_poll_runs: int = HARMONIE_ARRIVAL_HISTORY_POLL_RUNS,
+    max_arrivals: int = HARMONIE_ARRIVAL_HISTORY_MAX_EVENTS,
+) -> list[datetime]:
+    """Return first-seen times for recent distinct forecast contents."""
+    from next_day_wind_model.operational_update import compute_forecast_fingerprint
+
+    resolved = db_path.resolve()
+    conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    try:
+        run_rows = conn.execute(
+            """
+            SELECT run_ts
+            FROM forecasts
+            WHERE site = ? AND model = ?
+            GROUP BY run_ts
+            ORDER BY run_ts DESC
+            LIMIT ?
+            """,
+            (site, model, max(1, int(max_poll_runs))),
+        ).fetchall()
+        if not run_rows:
+            return []
+        first_run_ts = min(int(row[0]) for row in run_rows)
+        rows = conn.execute(
+            """
+            SELECT run_ts, fetched_ts, target_ts, wind_speed, wind_gust, wind_dir, payload
+            FROM forecasts
+            WHERE site = ? AND model = ? AND run_ts >= ?
+            ORDER BY run_ts, target_ts
+            """,
+            (site, model, first_run_ts),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    arrivals: list[datetime] = []
+    previous_fingerprint: str | None = None
+    index = 0
+    while index < len(rows):
+        run_ts = int(rows[index][0])
+        run_rows_for_timestamp = []
+        while index < len(rows) and int(rows[index][0]) == run_ts:
+            run_rows_for_timestamp.append(rows[index])
+            index += 1
+        if len(run_rows_for_timestamp) < 24:
+            continue
+
+        records: list[dict] = []
+        fetched_values: list[int] = []
+        try:
+            for _, fetched_ts, target_ts, wind_speed, wind_gust, wind_dir, payload_raw in run_rows_for_timestamp:
+                payload = json.loads(payload_raw) if payload_raw else {}
+                record = dict(payload) if isinstance(payload, dict) else {}
+                record["target_ts"] = int(target_ts)
+                record["_db_wind_speed"] = wind_speed
+                record["_db_wind_gust"] = wind_gust
+                record["_db_wind_dir"] = wind_dir
+                records.append(record)
+                fetched_values.append(int(fetched_ts))
+            fetched_ts = max(fetched_values)
+            source_run_ts = run_ts if run_ts != fetched_ts else None
+            fingerprint = compute_forecast_fingerprint(
+                records,
+                site=site,
+                model=model,
+                source_run_ts=source_run_ts,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+        if fingerprint != previous_fingerprint:
+            arrival = _parse_harmonie_ms_utc(fetched_ts)
+            if arrival is not None:
+                arrivals.append(arrival)
+            previous_fingerprint = fingerprint
+    return arrivals[-max(1, int(max_arrivals)) :]
+
+
+def _estimate_next_harmonie_arrival(
+    arrival_times_utc: list[datetime | pd.Timestamp | str],
+    latest_arrival_utc: datetime | pd.Timestamp | str | None,
+    *,
+    nominal_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    min_events: int = HARMONIE_ARRIVAL_ESTIMATE_MIN_EVENTS,
+    sample_events: int = HARMONIE_ARRIVAL_ESTIMATE_SAMPLE_EVENTS,
+) -> HarmonieArrivalEstimate:
+    latest = _parse_iso_utc(None if latest_arrival_utc is None else str(latest_arrival_utc))
+    if latest is None:
+        return HarmonieArrivalEstimate(None, (), "unavailable")
+
+    cadence_seconds = max(60, int(nominal_interval_minutes) * 60)
+    parsed = sorted(
+        {
+            value
+            for raw in arrival_times_utc
+            if (value := _parse_iso_utc(None if raw is None else str(raw))) is not None
+            and value <= latest + timedelta(seconds=1)
+        }
+    )
+    # An arrival first observed after the overnight polling gap is censored: it
+    # may have become available hours earlier, so its within-cycle phase is not
+    # useful for estimating the next daytime arrival.
+    usable = [
+        value
+        for position, value in enumerate(parsed)
+        if position == 0
+        or (value - parsed[position - 1]).total_seconds() <= cadence_seconds * 3
+    ][-max(1, int(sample_events)) :]
+
+    if len(usable) < max(1, int(min_events)):
+        return HarmonieArrivalEstimate(
+            latest + timedelta(seconds=cadence_seconds),
+            tuple(usable),
+            "nominal_interval_fallback",
+        )
+
+    phase_seconds = median(value.timestamp() % cadence_seconds for value in usable)
+    latest_cycle = int(latest.timestamp() // cadence_seconds)
+    expected_timestamp = (latest_cycle + 1) * cadence_seconds + phase_seconds
+    while expected_timestamp <= latest.timestamp():
+        expected_timestamp += cadence_seconds
+    return HarmonieArrivalEstimate(
+        datetime.fromtimestamp(expected_timestamp, tz=timezone.utc),
+        tuple(usable),
+        "median_recent_arrival_phase",
+    )
+
+
+def _load_harmonie_arrival_estimate(
+    db_path: Path,
+    site: str,
+    latest_arrival_utc: datetime | pd.Timestamp | str | None,
+    *,
+    model: str = "HARMONIE",
+    nominal_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+) -> HarmonieArrivalEstimate:
+    arrivals = _load_recent_harmonie_arrivals(db_path, site, model=model)
+    effective_latest = arrivals[-1] if arrivals else latest_arrival_utc
+    return _estimate_next_harmonie_arrival(
+        arrivals,
+        effective_latest,
+        nominal_interval_minutes=nominal_interval_minutes,
+    )
+
+
 def _format_harmonie_metadata_text(
     harmonie_time_utc: datetime | pd.Timestamp | str | None,
     harmonie_time_kind: str,
     local_tz: str,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
 ) -> str:
     harmonie_dt = _parse_iso_utc(None if harmonie_time_utc is None else str(harmonie_time_utc))
     kind = "run" if harmonie_time_kind == "run" else "fetched"
@@ -1926,9 +2092,15 @@ def _format_harmonie_metadata_text(
         return f"{label}: unknown - Next expected fetch: unknown"
     tz = ZoneInfo(local_tz)
     local_dt = harmonie_dt.astimezone(tz)
-    next_local = local_dt + timedelta(minutes=max(1, int(harmonie_update_interval_minutes)))
+    next_dt = _parse_iso_utc(
+        None if harmonie_expected_next_at_utc is None else str(harmonie_expected_next_at_utc)
+    )
+    if next_dt is None:
+        next_dt = harmonie_dt + timedelta(
+            minutes=max(1, int(harmonie_update_interval_minutes))
+        )
     harmonie_txt = _format_compact_local_time(local_dt, tz)
-    next_txt = _format_compact_local_time(next_local, tz)
+    next_txt = _format_compact_local_time(next_dt, tz)
     return f"{label}: {harmonie_txt} - Next expected fetch: ~{next_txt}"
 
 
@@ -1967,6 +2139,7 @@ def _format_prediction_update_line(
     *,
     local_tz: str,
     harmonie_update_interval_minutes: int,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
 ) -> str:
     prediction_dt = _parse_iso_utc(
         None if prediction_updated_at_utc is None else str(prediction_updated_at_utc)
@@ -1976,13 +2149,17 @@ def _format_prediction_update_line(
     prediction_txt = (
         _format_compact_local_time(prediction_dt, tz) if prediction_dt is not None else "unknown"
     )
-    if harmonie_dt is None:
-        next_txt = "unknown"
-    else:
-        next_dt = harmonie_dt + timedelta(
+    expected_dt = _parse_iso_utc(
+        None if harmonie_expected_next_at_utc is None else str(harmonie_expected_next_at_utc)
+    )
+    if expected_dt is None and harmonie_dt is not None:
+        expected_dt = harmonie_dt + timedelta(
             minutes=max(1, int(harmonie_update_interval_minutes))
         )
-        next_txt = f"~{_format_compact_local_time(next_dt, tz)}"
+    if expected_dt is None:
+        next_txt = "unknown"
+    else:
+        next_txt = f"~{_format_compact_local_time(expected_dt, tz)}"
     return f"Last prediction update: {prediction_txt} - Next expected update: {next_txt}"
 
 
@@ -1995,6 +2172,7 @@ def _format_plot_meta_text(
     harmonie_time_kind: str = "fetched",
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
 ) -> str:
     train_dt = _parse_iso_utc(model_trained_at_utc)
     tz = ZoneInfo(local_tz)
@@ -2005,8 +2183,8 @@ def _format_plot_meta_text(
     )
     return (
         f"{_format_update_line('plot update', plot_updated_at_utc, local_tz=local_tz, interval_minutes=plot_update_interval_minutes, expected=False)}\n"
-        f"{_format_prediction_update_line(prediction_updated_at_utc, harmonie_time_utc, local_tz=local_tz, harmonie_update_interval_minutes=harmonie_update_interval_minutes)}\n"
-        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz, harmonie_update_interval_minutes)}\n"
+        f"{_format_prediction_update_line(prediction_updated_at_utc, harmonie_time_utc, local_tz=local_tz, harmonie_update_interval_minutes=harmonie_update_interval_minutes, harmonie_expected_next_at_utc=harmonie_expected_next_at_utc)}\n"
+        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz, harmonie_update_interval_minutes, harmonie_expected_next_at_utc)}\n"
         f"Champion model trained & promoted: {train_txt}"
     )
 
@@ -2046,6 +2224,7 @@ def save_prediction_plot(
     harmonie_time_kind: str = "fetched",
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
     mobile: bool = False,
 ) -> None:
     table = table.copy()
@@ -2155,6 +2334,7 @@ def save_prediction_plot(
             harmonie_time_kind=harmonie_time_kind,
             plot_update_interval_minutes=plot_update_interval_minutes,
             harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ),
         transform=ax.transAxes,
         ha="left",
@@ -2530,6 +2710,7 @@ def save_current_day_plot(
     plot_updated_at_utc: datetime | pd.Timestamp | str | None = None,
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
     prior_prediction_tables: list[pd.DataFrame] | None = None,
     live_monitoring_metric: dict | None = None,
     mobile: bool = False,
@@ -3352,6 +3533,7 @@ def save_current_day_plot(
             harmonie_time_kind=harmonie_time_kind,
             plot_update_interval_minutes=plot_update_interval_minutes,
             harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ),
         transform=ax.transAxes,
         ha="left",
@@ -5787,6 +5969,7 @@ def _write_interactive_plot_assets(
     harmonie_time_kind: str = "fetched",
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
 ) -> dict:
     assets: dict[str, str] = {}
 
@@ -5853,6 +6036,7 @@ def _write_interactive_plot_assets(
                 harmonie_time_kind=harmonie_time_kind,
                 plot_update_interval_minutes=plot_update_interval_minutes,
                 harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+                harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             )
 
             prior_payload_rows: list[dict] = []
@@ -5951,6 +6135,9 @@ def publish_web_dashboard(
     harmonie_time_kind: str = "fetched",
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
+    harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
+    harmonie_arrival_estimate_method: str | None = None,
+    harmonie_arrival_history_utc: list[str] | None = None,
     companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -6023,6 +6210,7 @@ def publish_web_dashboard(
         harmonie_time_kind=harmonie_time_kind,
         plot_update_interval_minutes=plot_update_interval_minutes,
         harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
     )
     if "dashboard_interactive_js" in interactive_assets:
         copied[interactive_assets["dashboard_interactive_js"]] = str(
@@ -6053,6 +6241,12 @@ def publish_web_dashboard(
         "prediction_updated_at_utc": prediction_updated_at_utc,
         "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
         "harmonie_time_kind": harmonie_time_kind,
+        "harmonie_expected_next_at_utc": (
+            None if harmonie_expected_next_at_utc is None else str(harmonie_expected_next_at_utc)
+        ),
+        "harmonie_arrival_estimate_method": harmonie_arrival_estimate_method,
+        "harmonie_arrival_history_utc": list(harmonie_arrival_history_utc or []),
+        "harmonie_arrival_sample_count": len(harmonie_arrival_history_utc or []),
         "plot_update_interval_minutes": int(plot_update_interval_minutes),
         "harmonie_update_interval_minutes": int(harmonie_update_interval_minutes),
         "model_last_trained_at_utc": model_trained_at_utc,
@@ -6522,6 +6716,29 @@ def run_dashboard_stage_from_cached_artifacts(
             harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
         except Exception as exc:
             print(f"Cached dashboard stage: Harmonie metadata lookup skipped: {exc}")
+    harmonie_arrival_estimate = _estimate_next_harmonie_arrival(
+        [],
+        harmonie_time_utc,
+        nominal_interval_minutes=args.harmonie_update_interval_minutes,
+    )
+    if db_path.exists():
+        try:
+            harmonie_arrival_estimate = _load_harmonie_arrival_estimate(
+                db_path,
+                cfg.site,
+                harmonie_time_utc,
+                model=cfg.model,
+                nominal_interval_minutes=args.harmonie_update_interval_minutes,
+            )
+        except Exception as exc:
+            print(f"Cached dashboard stage: Harmonie arrival estimate fell back to nominal cadence: {exc}")
+    if harmonie_arrival_estimate.arrivals_utc:
+        harmonie_time_utc = harmonie_arrival_estimate.arrivals_utc[-1]
+        harmonie_time_kind = "fetched"
+    harmonie_expected_next_at_utc = harmonie_arrival_estimate.expected_at_utc
+    harmonie_arrival_history_utc = [
+        value.isoformat() for value in harmonie_arrival_estimate.arrivals_utc
+    ]
     plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
 
     print("Stage plan: training=skipped, prediction=skipped, dashboard=running from cached artifacts")
@@ -6542,6 +6759,7 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_time_kind=harmonie_time_kind,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
     )
     save_prediction_plot(
         table,
@@ -6554,6 +6772,7 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_time_kind=harmonie_time_kind,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         mobile=True,
     )
 
@@ -6616,6 +6835,7 @@ def run_dashboard_stage_from_cached_artifacts(
         plot_updated_at_utc=plot_updated_at_utc,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
     )
@@ -6631,6 +6851,7 @@ def run_dashboard_stage_from_cached_artifacts(
         plot_updated_at_utc=plot_updated_at_utc,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
@@ -6727,6 +6948,9 @@ def run_dashboard_stage_from_cached_artifacts(
             harmonie_time_kind=harmonie_time_kind,
             plot_update_interval_minutes=args.plot_update_interval_minutes,
             harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+            harmonie_arrival_estimate_method=harmonie_arrival_estimate.method,
+            harmonie_arrival_history_utc=harmonie_arrival_history_utc,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
@@ -6751,6 +6975,12 @@ def run_dashboard_stage_from_cached_artifacts(
             "plot_updated_at_utc": plot_updated_at_utc,
             "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
             "harmonie_time_kind": harmonie_time_kind,
+            "harmonie_expected_next_at_utc": (
+                None if harmonie_expected_next_at_utc is None else str(harmonie_expected_next_at_utc)
+            ),
+            "harmonie_arrival_estimate_method": harmonie_arrival_estimate.method,
+            "harmonie_arrival_history_utc": harmonie_arrival_history_utc,
+            "harmonie_arrival_sample_count": len(harmonie_arrival_history_utc),
             "plot_update_interval_minutes": int(args.plot_update_interval_minutes),
             "harmonie_update_interval_minutes": int(args.harmonie_update_interval_minutes),
             "output_artifact_dir": str(out_dir.resolve()),
@@ -6928,6 +7158,7 @@ def main() -> None:
             write_interactive_assets=_write_interactive_plot_assets,
             load_harmonie_metadata=_load_latest_harmonie_metadata_time,
             auto_push=auto_push_dashboard_changes,
+            load_harmonie_arrival_estimate=_load_harmonie_arrival_estimate,
         )
         return
 
@@ -7903,6 +8134,20 @@ def main() -> None:
     prediction_generated_at_utc = prediction_generated_at_dt.isoformat()
     prediction_updated_at_utc: str | None = None
     harmonie_time_utc, harmonie_time_kind = _load_latest_harmonie_metadata_time(db_path, cfg.site)
+    harmonie_arrival_estimate = _load_harmonie_arrival_estimate(
+        db_path,
+        cfg.site,
+        harmonie_time_utc,
+        model=cfg.model,
+        nominal_interval_minutes=args.harmonie_update_interval_minutes,
+    )
+    if harmonie_arrival_estimate.arrivals_utc:
+        harmonie_time_utc = harmonie_arrival_estimate.arrivals_utc[-1]
+        harmonie_time_kind = "fetched"
+    harmonie_expected_next_at_utc = harmonie_arrival_estimate.expected_at_utc
+    harmonie_arrival_history_utc = [
+        value.isoformat() for value in harmonie_arrival_estimate.arrivals_utc
+    ]
     next_day_prediction_log_rows = 0
     current_day_prediction_log_rows = 0
     prediction_evaluation_rows_materialized = 0
@@ -8115,6 +8360,7 @@ def main() -> None:
         harmonie_time_kind=harmonie_time_kind,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
     )
     save_prediction_plot(
         table,
@@ -8127,6 +8373,7 @@ def main() -> None:
         harmonie_time_kind=harmonie_time_kind,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         mobile=True,
     )
 
@@ -8144,6 +8391,7 @@ def main() -> None:
         plot_updated_at_utc=plot_updated_at_utc,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
     )
@@ -8159,6 +8407,7 @@ def main() -> None:
         plot_updated_at_utc=plot_updated_at_utc,
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
@@ -8331,6 +8580,9 @@ def main() -> None:
             harmonie_time_kind=harmonie_time_kind,
             plot_update_interval_minutes=args.plot_update_interval_minutes,
             harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+            harmonie_arrival_estimate_method=harmonie_arrival_estimate.method,
+            harmonie_arrival_history_utc=harmonie_arrival_history_utc,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
@@ -8426,6 +8678,12 @@ def main() -> None:
         "plot_updated_at_utc": plot_updated_at_utc,
         "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
         "harmonie_time_kind": harmonie_time_kind,
+        "harmonie_expected_next_at_utc": (
+            None if harmonie_expected_next_at_utc is None else str(harmonie_expected_next_at_utc)
+        ),
+        "harmonie_arrival_estimate_method": harmonie_arrival_estimate.method,
+        "harmonie_arrival_history_utc": harmonie_arrival_history_utc,
+        "harmonie_arrival_sample_count": len(harmonie_arrival_history_utc),
         "plot_update_interval_minutes": int(args.plot_update_interval_minutes),
         "harmonie_update_interval_minutes": int(args.harmonie_update_interval_minutes),
         "model_last_trained_at_utc": model_last_trained_at_utc,

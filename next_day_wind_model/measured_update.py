@@ -257,6 +257,7 @@ def run_measured_only_stage(
     write_interactive_assets: Callable[..., dict[str, str]],
     load_harmonie_metadata: Callable[..., tuple[Any, str]],
     auto_push: Callable[..., dict[str, Any]],
+    load_harmonie_arrival_estimate: Callable[..., Any] | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     current_csv = out_dir / "current_day_predictions.csv"
@@ -302,6 +303,32 @@ def run_measured_only_stage(
         harmonie_time_utc, harmonie_time_kind = load_harmonie_metadata(db_path, args.site)
     plot_update_interval_minutes = int(getattr(args, "plot_update_interval_minutes", 6))
     harmonie_update_interval_minutes = int(getattr(args, "harmonie_update_interval_minutes", 60))
+    harmonie_expected_next_at_utc = _metadata_value(metadata, "harmonie_expected_next_at_utc")
+    harmonie_arrival_estimate_method = _metadata_value(
+        metadata, "harmonie_arrival_estimate_method"
+    )
+    raw_arrival_history = metadata.get("harmonie_arrival_history_utc")
+    harmonie_arrival_history_utc = (
+        [str(value) for value in raw_arrival_history]
+        if isinstance(raw_arrival_history, list)
+        else []
+    )
+    if load_harmonie_arrival_estimate is not None:
+        estimate = load_harmonie_arrival_estimate(
+            db_path,
+            args.site,
+            harmonie_time_utc,
+            model=getattr(args, "model", "HARMONIE"),
+            nominal_interval_minutes=harmonie_update_interval_minutes,
+        )
+        if estimate.arrivals_utc:
+            harmonie_time_utc = estimate.arrivals_utc[-1]
+            harmonie_time_kind = "fetched"
+        harmonie_expected_next_at_utc = estimate.expected_at_utc
+        harmonie_arrival_estimate_method = estimate.method
+        harmonie_arrival_history_utc = [
+            value.isoformat() for value in estimate.arrivals_utc
+        ]
     plot_updated_at_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     target_day = pd.to_datetime(composed["time_local"]).dt.tz_convert(
         ZoneInfo(args.local_timezone)
@@ -335,6 +362,7 @@ def run_measured_only_stage(
             plot_updated_at_utc=plot_updated_at_utc,
             plot_update_interval_minutes=plot_update_interval_minutes,
             harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
         )
@@ -350,6 +378,7 @@ def run_measured_only_stage(
             plot_updated_at_utc=plot_updated_at_utc,
             plot_update_interval_minutes=plot_update_interval_minutes,
             harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
             mobile=True,
@@ -374,6 +403,7 @@ def run_measured_only_stage(
             harmonie_time_kind=harmonie_time_kind,
             plot_update_interval_minutes=plot_update_interval_minutes,
             harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         )
 
         web_out_dir = Path(args.web_out_dir)
@@ -425,6 +455,14 @@ def run_measured_only_stage(
                     "prediction_updated_at_utc": prediction_updated_at_utc,
                     "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
                     "harmonie_time_kind": harmonie_time_kind,
+                    "harmonie_expected_next_at_utc": (
+                        None
+                        if harmonie_expected_next_at_utc is None
+                        else str(harmonie_expected_next_at_utc)
+                    ),
+                    "harmonie_arrival_estimate_method": harmonie_arrival_estimate_method,
+                    "harmonie_arrival_history_utc": harmonie_arrival_history_utc,
+                    "harmonie_arrival_sample_count": len(harmonie_arrival_history_utc),
                     "plot_update_interval_minutes": plot_update_interval_minutes,
                     "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
                     "model_last_trained_at_utc": model_trained_at_utc,

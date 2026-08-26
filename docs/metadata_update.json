@@ -1,8 +1,13 @@
 {
-  "generated_at_utc": "2026-08-26T17:36:10.373996+00:00",
+  "static_plot_generated_at_utc": "2026-08-26T17:48:32.629544+00:00",
+  "plot_updated_at_utc": "2026-08-26T17:45:24.634723+00:00",
+  "prediction_generated_at_utc": "2026-08-26T17:44:41.363146+00:00",
+  "prediction_updated_at_utc": "2026-08-26T17:45:24.634710+00:00",
+  "harmonie_fetched_at_utc": "2026-08-26 17:42:06.393000+00:00",
+  "harmonie_time_kind": "fetched",
+  "harmonie_expected_next_at_utc": "2026-08-26 18:36:06.693000+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
-    "2026-08-25T08:36:02.914000+00:00",
     "2026-08-25T09:36:06.752000+00:00",
     "2026-08-25T10:42:05.495000+00:00",
     "2026-08-25T11:36:04.915000+00:00",
@@ -25,24 +30,14 @@
     "2026-08-26T13:48:05.655000+00:00",
     "2026-08-26T14:54:06.265000+00:00",
     "2026-08-26T15:42:11.507000+00:00",
-    "2026-08-26T16:36:06.676000+00:00"
+    "2026-08-26T16:36:06.676000+00:00",
+    "2026-08-26T17:42:06.393000+00:00"
   ],
   "harmonie_arrival_sample_count": 24,
-  "harmonie_expected_next_at_utc": "2026-08-26 17:36:06.673500+00:00",
-  "harmonie_fetched_at_utc": "2026-08-26 16:36:06.676000+00:00",
-  "harmonie_time_kind": "fetched",
-  "harmonie_update_interval_minutes": 60,
-  "interactive_json": [
-    "current_day_interactive_data.json",
-    "next_day_interactive_data.json"
-  ],
-  "latest_observation_time_utc": "2026-08-26T17:33:28+00:00",
-  "measured_only_update": true,
-  "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
   "plot_update_interval_minutes": 6,
-  "plot_updated_at_utc": "2026-08-26T17:36:08.419047+00:00",
-  "prediction_generated_at_utc": "2026-08-26T16:38:54.263861+00:00",
-  "prediction_updated_at_utc": "2026-08-26T16:39:33.028560+00:00",
+  "harmonie_update_interval_minutes": 60,
+  "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
+  "generated_at_utc": "2026-08-26T17:48:32.629544+00:00",
   "static_images": [
     "current_day_direction_spider.png",
     "current_day_predictions.png",
@@ -54,5 +49,8 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-08-26T17:36:10.373996+00:00"
+  "interactive_json": [
+    "current_day_interactive_data.json",
+    "next_day_interactive_data.json"
+  ]
 }

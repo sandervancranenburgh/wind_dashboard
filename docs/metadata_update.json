@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-08-26T17:24:10.068229+00:00",
+  "generated_at_utc": "2026-08-26T17:30:10.296824+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
     "2026-08-25T08:36:02.914000+00:00",
@@ -36,11 +36,11 @@
     "current_day_interactive_data.json",
     "next_day_interactive_data.json"
   ],
-  "latest_observation_time_utc": "2026-08-26T17:21:28+00:00",
+  "latest_observation_time_utc": "2026-08-26T17:27:30+00:00",
   "measured_only_update": true,
   "model_last_trained_at_utc": "2026-08-06T05:22:28.672956+00:00",
   "plot_update_interval_minutes": 6,
-  "plot_updated_at_utc": "2026-08-26T17:24:08.141257+00:00",
+  "plot_updated_at_utc": "2026-08-26T17:30:08.202668+00:00",
   "prediction_generated_at_utc": "2026-08-26T16:38:54.263861+00:00",
   "prediction_updated_at_utc": "2026-08-26T16:39:33.028560+00:00",
   "static_images": [
@@ -54,5 +54,5 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-08-26T17:24:10.068229+00:00"
+  "static_plot_generated_at_utc": "2026-08-26T17:30:10.296824+00:00"
 }

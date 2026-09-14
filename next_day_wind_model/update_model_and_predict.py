@@ -7485,6 +7485,7 @@ def main() -> None:
             model_label="speed",
             device=device,
         )
+        _log_rss("speed_model_fit_complete", samples=len(speed_X_train))
         speed_calibration_start = _validation_start_index(len(speed_X_train), args.validation_split)
         challenger_speed_calibration = fit_speed_regime_calibration(
             pred_speed=_predict_speed_batch(
@@ -7523,12 +7524,15 @@ def main() -> None:
             model_label="direction",
             device=device,
         )
+        _log_rss("direction_model_fit_complete", samples=len(direction_X_train))
 
         intraday_train_contexts, intraday_eval_contexts = build_intraday_holdout_context_split(
             db_path=db_path,
             cfg=cfg,
             holdout_eval_split=float(args.intraday_challenge_eval_split),
             holdout_min_contexts=int(args.intraday_challenge_min_eval_contexts),
+            forecast_lookup=training_forecast_lookup,
+            observations=training_observations,
         )
         intraday_bundle_challenger, intraday_train_stats = train_intraday_model(
             db_path=db_path,
@@ -7612,6 +7616,8 @@ def main() -> None:
                     cfg,
                     target_mode="residual",
                     feature_schema=champion_speed_feature_schema,
+                    forecast_lookup=training_forecast_lookup,
+                    observations=training_observations,
                 )
                 champion_eval_start = _eval_start_index(
                     int(champion_speed_arrays_full["X_all"].shape[0]),
@@ -7654,6 +7660,8 @@ def main() -> None:
                     db_path,
                     cfg,
                     feature_schema=champion_direction_feature_schema,
+                    forecast_lookup=training_forecast_lookup,
+                    observations=training_observations,
                 )
                 champion_direction_eval_start = _eval_start_index(
                     int(champion_direction_arrays_full["X_all"].shape[0]),
@@ -8120,6 +8128,12 @@ def main() -> None:
             f"challenger={float(intraday_promotion_summary['intraday_mae_challenger']):.4f}, "
             f"promoted={promote_intraday}"
         )
+
+    if not args.skip_training:
+        del training_forecast_lookup
+        del training_observations
+        gc.collect()
+        _log_rss("training_resources_released")
 
     _log_rss("model_and_scaler_loading_complete", skip_training=args.skip_training)
     _log_rss("next_day_inference_input_start")

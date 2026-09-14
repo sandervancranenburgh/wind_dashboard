@@ -808,9 +808,8 @@ class TrainingForecastLookup:
         anchor_ts_ms: int,
     ) -> pd.DataFrame | None:
         target_mss = np.asarray([_target_ms(ts) for ts in target_times], dtype=np.int64)
-        for run_idx in range(len(self.run_starts) - 1, -1, -1):
-            if int(self.run_available_ts[run_idx]) > int(anchor_ts_ms):
-                continue
+        eligible_runs = np.flatnonzero(self.run_available_ts <= int(anchor_ts_ms))
+        for run_idx in eligible_runs[::-1]:
             start = int(self.run_starts[run_idx])
             end = int(self.run_ends[run_idx])
             run_targets = self.target_ts[start:end]
@@ -1085,6 +1084,7 @@ def load_training_forecast_lookup(
         int(target_ts): (int(start), int(end))
         for target_ts, start, end in zip(unique_targets, target_starts, target_ends)
     }
+    del ordered_targets, unique_targets, target_starts, target_ends, run_values
 
     lookup = TrainingForecastLookup(
         run_ts=run_ts_array,
@@ -1239,7 +1239,7 @@ def _build_training_history_forecast_frame(
     history_times: pd.DatetimeIndex,
     anchor_ts_ms: int,
 ) -> pd.DataFrame | None:
-    if isinstance(forecast_lookup, TrainingForecastLookup):
+    if hasattr(forecast_lookup, "latest_target_as_of"):
         if len(history_times) == 0:
             return pd.DataFrame(index=history_times)
         records: List[Dict[str, float | int | pd.Timestamp]] = []
@@ -1267,7 +1267,7 @@ def _select_training_complete_run_frame(
     target_times: pd.DatetimeIndex,
     anchor_ts_ms: int,
 ) -> pd.DataFrame | None:
-    if isinstance(forecast_lookup, TrainingForecastLookup):
+    if hasattr(forecast_lookup, "latest_complete_run_frame"):
         return forecast_lookup.latest_complete_run_frame(target_times, anchor_ts_ms)
     return _select_latest_complete_run_frame(
         forecast_lookup["run_entries"],

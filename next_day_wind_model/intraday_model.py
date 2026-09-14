@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +10,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from data_pipeline import DatasetConfig, _load_observations, build_anchor_forecast_context
+from data_pipeline import (
+    DatasetConfig,
+    TrainingForecastLookup,
+    _log_rss,
+    build_training_forecast_context,
+    load_training_forecast_lookup,
+    load_training_observations,
+)
 
 
 FEATURE_COLS = [
@@ -84,34 +90,52 @@ def _fit_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-def _load_hourly_observations(db_path: Path, cfg: DatasetConfig) -> pd.DataFrame:
-    conn = sqlite3.connect(str(db_path))
-    try:
-        obs = _load_observations(conn, cfg.site)
-    finally:
-        conn.close()
-    return obs.sort_index()
+def _load_hourly_observations(
+    db_path: Path,
+    cfg: DatasetConfig,
+    *,
+    read_only: bool = False,
+) -> pd.DataFrame:
+    return load_training_observations(db_path, cfg, read_only=read_only)
 
 
 def _build_intraday_anchor_contexts(
     db_path: Path,
     cfg: DatasetConfig,
     max_horizon: int = INTRADAY_CALIBRATION_HORIZON,
+    *,
+    forecast_lookup: TrainingForecastLookup | dict | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> list[dict]:
-    obs = _load_hourly_observations(db_path, cfg)
+    obs = (
+        _load_hourly_observations(db_path, cfg, read_only=read_only)
+        if observations is None
+        else observations
+    )
     if obs.empty:
         raise ValueError("No rows available for intraday model training.")
+    if forecast_lookup is None:
+        forecast_lookup = load_training_forecast_lookup(
+            db_path,
+            cfg,
+            read_only=read_only,
+        )
 
     contexts: list[dict] = []
     total = len(obs)
     horizon = int(max_horizon)
+    _log_rss(
+        "intraday_training_array_construction_start",
+        candidate_anchors=max(0, total - horizon - 2),
+        horizon=horizon,
+    )
     for i in range(2, total - horizon):
         anchor_time = obs.index[i]
         history_times = obs.index[i - 2 : i + 1]
         target_times = obs.index[i + 1 : i + 1 + horizon]
-        context = build_anchor_forecast_context(
-            db_path=db_path,
-            cfg=cfg,
+        context = build_training_forecast_context(
+            forecast_lookup=forecast_lookup,
             anchor_time=anchor_time,
             history_times=history_times,
             target_times=target_times,
@@ -164,6 +188,11 @@ def _build_intraday_anchor_contexts(
 
     if len(contexts) < 50:
         raise ValueError("Not enough rows to train intraday model.")
+    _log_rss(
+        "intraday_training_array_construction_complete",
+        contexts=len(contexts),
+        horizon=horizon,
+    )
     return contexts
 
 
@@ -230,8 +259,22 @@ def build_intraday_training_xy(
     db_path: Path,
     cfg: DatasetConfig,
     contexts: list[dict] | None = None,
+    *,
+    forecast_lookup: TrainingForecastLookup | dict | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    contexts = _build_intraday_anchor_contexts(db_path, cfg) if contexts is None else contexts
+    contexts = (
+        _build_intraday_anchor_contexts(
+            db_path,
+            cfg,
+            forecast_lookup=forecast_lookup,
+            observations=observations,
+            read_only=read_only,
+        )
+        if contexts is None
+        else contexts
+    )
 
     X_list: list[np.ndarray] = []
     y_list: list[float] = []
@@ -692,6 +735,10 @@ def build_intraday_holdout_context_split(
     holdout_eval_split: float,
     holdout_min_contexts: int,
     max_horizon: int = INTRADAY_CALIBRATION_HORIZON,
+    *,
+    forecast_lookup: TrainingForecastLookup | dict | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """
     Build the canonical chronological intraday train/holdout context split.
@@ -704,6 +751,9 @@ def build_intraday_holdout_context_split(
         db_path=db_path,
         cfg=cfg,
         max_horizon=max_horizon,
+        forecast_lookup=forecast_lookup,
+        observations=observations,
+        read_only=read_only,
     )
     return split_intraday_contexts_for_holdout(
         contexts=contexts,
@@ -938,17 +988,25 @@ def train_intraday_model(
     learning_rate: float = 1e-3,
     recency_power: float = 1.0,
     contexts: list[dict] | None = None,
+    *,
+    forecast_lookup: TrainingForecastLookup | dict | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> tuple[IntradayBundle, dict]:
     training_contexts = (
         _build_intraday_anchor_contexts(
             db_path=db_path,
             cfg=cfg,
             max_horizon=INTRADAY_CALIBRATION_HORIZON,
+            forecast_lookup=forecast_lookup,
+            observations=observations,
+            read_only=read_only,
         )
         if contexts is None
         else contexts
     )
     X_all, y_all = build_intraday_training_xy(db_path, cfg, contexts=training_contexts)
+    _log_rss("intraday_training_xy_complete", samples=len(X_all), features=X_all.shape[1])
     n = len(X_all)
     split_idx = int(n * (1.0 - validation_split))
     split_idx = max(20, min(split_idx, n - 20))
@@ -973,6 +1031,7 @@ def train_intraday_model(
         params=params,
         device=device,
     )
+    _log_rss("intraday_model_fit_complete", samples=n, best_val_loss=f"{best_val:.6f}")
     bundle.rollout_calibration = _fit_intraday_rollout_calibration(
         bundle=bundle,
         contexts=training_contexts,

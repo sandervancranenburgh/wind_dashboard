@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import resource
 import sqlite3
+import sys
+from array import array
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -75,7 +79,47 @@ def _forecast_value(payload: Dict, db_value, keys: Sequence[str]) -> float | Non
     return _to_float(db_value)
 
 
-def load_forecast_vintages(conn: sqlite3.Connection, site: str, model: str) -> pd.DataFrame:
+def _current_rss_mib() -> float:
+    """Return current resident memory without adding a runtime dependency."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+    except (OSError, IndexError, ValueError):
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+
+
+def _peak_rss_mib() -> float:
+    peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if sys.platform == "darwin":
+        peak /= 1024.0
+    return peak / 1024.0
+
+
+def _log_rss(phase: str, **details: object) -> None:
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    suffix = f" {detail_text}" if detail_text else ""
+    print(
+        f"RSS phase={phase} rss_mib={_current_rss_mib():.1f} "
+        f"peak_rss_mib={_peak_rss_mib():.1f}{suffix}",
+        flush=True,
+    )
+
+
+def _connect_sqlite(db_path: Path | str, *, read_only: bool = False) -> sqlite3.Connection:
+    if not read_only:
+        return sqlite3.connect(str(db_path))
+    resolved = Path(db_path).resolve()
+    return sqlite3.connect(f"file:{resolved}?mode=ro&immutable=1", uri=True)
+
+
+def load_forecast_vintages(
+    conn: sqlite3.Connection,
+    site: str,
+    model: str,
+    target_start_ts_ms: int | None = None,
+    target_end_ts_ms: int | None = None,
+) -> pd.DataFrame:
     """
     Load immutable forecast vintages from SQLite.
 
@@ -84,15 +128,28 @@ def load_forecast_vintages(conn: sqlite3.Connection, site: str, model: str) -> p
     Preserving both matters because fair historical evaluation must compare
     against the specific Harmonie vintage that was available at the time.
     """
-    query = """
+    filters = ["site = ?", "model = ?", "target_ts IS NOT NULL"]
+    params: list[object] = [site, model]
+    if target_start_ts_ms is not None:
+        filters.append("target_ts >= ?")
+        params.append(int(target_start_ts_ms))
+    if target_end_ts_ms is not None:
+        filters.append("target_ts <= ?")
+        params.append(int(target_end_ts_ms))
+
+    query = f"""
     SELECT run_ts, fetched_ts, target_ts, horizon_hr, wind_speed, wind_gust, wind_dir, payload
     FROM forecasts
-    WHERE site = ?
-      AND model = ?
-      AND target_ts IS NOT NULL
+    WHERE {' AND '.join(filters)}
     ORDER BY run_ts ASC, target_ts ASC
     """
-    rows = conn.execute(query, (site, model)).fetchall()
+    _log_rss(
+        "forecast_vintage_query_start",
+        target_start_ts_ms=target_start_ts_ms,
+        target_end_ts_ms=target_end_ts_ms,
+    )
+    rows = conn.execute(query, params).fetchall()
+    _log_rss("forecast_vintage_query_complete", rows=len(rows))
     if not rows:
         raise ValueError("No forecast rows found for selected site/model.")
 
@@ -154,7 +211,9 @@ def load_forecast_vintages(conn: sqlite3.Connection, site: str, model: str) -> p
     forecast_df["run_dt"] = pd.to_datetime(forecast_df["run_ts"], unit="ms", utc=True)
     forecast_df["fetched_dt"] = pd.to_datetime(forecast_df["fetched_ts"], unit="ms", utc=True)
     forecast_df["target_dt"] = pd.to_datetime(forecast_df["target_ts"], unit="ms", utc=True)
-    return forecast_df.sort_values(["run_dt", "target_dt"]).reset_index(drop=True)
+    forecast_df = forecast_df.sort_values(["run_dt", "target_dt"]).reset_index(drop=True)
+    _log_rss("forecast_vintage_dataframe_complete", rows=len(forecast_df))
+    return forecast_df
 
 
 def _collapse_latest_forecast_view(forecast_vintages: pd.DataFrame) -> pd.DataFrame:
@@ -254,7 +313,30 @@ def _load_observations(conn: sqlite3.Connection, site: str) -> pd.DataFrame:
 
     # Observations are sub-hourly; aggregate to hourly means for stable supervision.
     hourly = obs_df.resample("1h").mean(numeric_only=True)
-    return hourly[["actual_avg", "actual_max", "actual_dir"]]
+    result = hourly[["actual_avg", "actual_max", "actual_dir"]]
+    result.attrs["raw_row_count"] = int(len(rows))
+    return result
+
+
+def load_training_observations(
+    db_path: Path,
+    cfg: DatasetConfig,
+    *,
+    read_only: bool = False,
+) -> pd.DataFrame:
+    """Load and resample observations once for all daily training stages."""
+    _log_rss("training_observation_load_start")
+    conn = _connect_sqlite(db_path, read_only=read_only)
+    try:
+        observations = _load_observations(conn, cfg.site)
+    finally:
+        conn.close()
+    _log_rss(
+        "training_observation_load_complete",
+        raw_rows=observations.attrs.get("raw_row_count", "unknown"),
+        hourly_rows=len(observations),
+    )
+    return observations
 
 
 def _build_aligned_hourly_frame(conn: sqlite3.Connection, cfg: DatasetConfig) -> pd.DataFrame:
@@ -560,10 +642,44 @@ def _latest_observation_time(conn: sqlite3.Connection, site: str) -> pd.Timestam
 
 
 @lru_cache(maxsize=8)
-def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict[str, object]:
+def _load_inference_vintage_lookup_bundle(
+    db_path_str: str,
+    site: str,
+    model: str,
+    target_start_ts_ms: int | None = None,
+    target_end_ts_ms: int | None = None,
+) -> Dict[str, object]:
     conn = sqlite3.connect(db_path_str)
     try:
-        forecast_vintages = load_forecast_vintages(conn, site, model)
+        forecast_vintages = load_forecast_vintages(
+            conn,
+            site,
+            model,
+            target_start_ts_ms=target_start_ts_ms,
+            target_end_ts_ms=target_end_ts_ms,
+        )
+        run_available_by_ts: Dict[int, int] = {}
+        if target_start_ts_ms is not None or target_end_ts_ms is not None:
+            run_timestamps = sorted({int(value) for value in forecast_vintages["run_ts"].tolist()})
+            # Stay below SQLite's commonly configured parameter limit while
+            # preserving the original full-run availability check.
+            for start in range(0, len(run_timestamps), 500):
+                batch = run_timestamps[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                availability_rows = conn.execute(
+                    f"""
+                    SELECT run_ts, MAX(fetched_ts)
+                    FROM forecasts
+                    WHERE site = ?
+                      AND model = ?
+                      AND run_ts IN ({placeholders})
+                    GROUP BY run_ts
+                    """,
+                    [site, model, *batch],
+                ).fetchall()
+                run_available_by_ts.update(
+                    {int(run_ts): int(available_ts) for run_ts, available_ts in availability_rows}
+                )
     finally:
         conn.close()
 
@@ -590,7 +706,7 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
         run_entries.append(
             {
                 "run_ts": int(run_ts),
-                "available_ts": int(group["fetched_ts"].max()),
+                "available_ts": int(run_available_by_ts.get(int(run_ts), int(group["fetched_ts"].max()))),
                 "row_fetched_ts": group["fetched_ts"].astype(np.int64).to_numpy(),
                 "target_index": {int(ts): idx for idx, ts in enumerate(target_values.tolist())},
                 "forecast_avg": pd.to_numeric(group["forecast_avg"], errors="coerce").to_numpy(dtype=np.float32),
@@ -604,11 +720,396 @@ def _load_vintage_lookup_bundle(db_path_str: str, site: str, model: str) -> Dict
             run_entries[-1][col] = pd.to_numeric(group[col], errors="coerce").to_numpy(dtype=np.float32)
     run_entries.sort(key=lambda entry: (int(entry["run_ts"]), int(entry["available_ts"])))
     run_available_ts = np.asarray([int(entry["available_ts"]) for entry in run_entries], dtype=np.int64)
-    return {
+    bundle = {
         "target_lookup": target_lookup,
         "run_entries": run_entries,
         "run_available_ts": run_available_ts,
+        "loaded_row_count": int(len(forecast_vintages)),
+        "target_start_ts_ms": target_start_ts_ms,
+        "target_end_ts_ms": target_end_ts_ms,
     }
+    _log_rss(
+        "inference_forecast_lookup_complete",
+        rows=len(forecast_vintages),
+        targets=len(target_lookup),
+        runs=len(run_entries),
+    )
+    return bundle
+
+
+_TRAINING_FLOAT_COLUMNS = (
+    "horizon_hr",
+    "forecast_avg",
+    "forecast_min",
+    "forecast_max",
+    "forecast_dir",
+    *FORECAST_METEO_COLUMNS,
+)
+
+
+@dataclass
+class TrainingForecastLookup:
+    """One compact canonical row store plus indexes used only by training."""
+
+    run_ts: np.ndarray
+    fetched_ts: np.ndarray
+    target_ts: np.ndarray
+    float_columns: Dict[str, np.ndarray]
+    target_order: np.ndarray
+    target_slices: Dict[int, tuple[int, int]]
+    run_starts: np.ndarray
+    run_ends: np.ndarray
+    run_available_ts: np.ndarray
+    loaded_row_count: int
+    sql_query_count: int
+    target_start_ts_ms: int | None = None
+    target_end_ts_ms: int | None = None
+
+    @property
+    def compact_nbytes(self) -> int:
+        arrays = [
+            self.run_ts,
+            self.fetched_ts,
+            self.target_ts,
+            self.target_order,
+            self.run_starts,
+            self.run_ends,
+            self.run_available_ts,
+            *self.float_columns.values(),
+        ]
+        return int(sum(value.nbytes for value in arrays))
+
+    def latest_target_as_of(
+        self,
+        target_ts_ms: int,
+        anchor_ts_ms: int,
+    ) -> Dict[str, float | int] | None:
+        span = self.target_slices.get(int(target_ts_ms))
+        if span is None:
+            return None
+        row_indices = self.target_order[span[0] : span[1]]
+        eligible = row_indices[self.fetched_ts[row_indices] <= int(anchor_ts_ms)]
+        if eligible.size == 0:
+            return None
+        order = np.lexsort((self.fetched_ts[eligible], self.run_ts[eligible]))
+        row_index = int(eligible[int(order[-1])])
+        return {
+            "run_ts": int(self.run_ts[row_index]),
+            "fetched_ts": int(self.fetched_ts[row_index]),
+            **{
+                name: float(values[row_index])
+                for name, values in self.float_columns.items()
+            },
+        }
+
+    def latest_complete_run_frame(
+        self,
+        target_times: pd.DatetimeIndex,
+        anchor_ts_ms: int,
+    ) -> pd.DataFrame | None:
+        target_mss = np.asarray([_target_ms(ts) for ts in target_times], dtype=np.int64)
+        for run_idx in range(len(self.run_starts) - 1, -1, -1):
+            if int(self.run_available_ts[run_idx]) > int(anchor_ts_ms):
+                continue
+            start = int(self.run_starts[run_idx])
+            end = int(self.run_ends[run_idx])
+            run_targets = self.target_ts[start:end]
+            positions = np.searchsorted(run_targets, target_mss)
+            if np.any(positions >= len(run_targets)):
+                continue
+            row_indices = start + positions
+            if not np.array_equal(self.target_ts[row_indices], target_mss):
+                continue
+            if np.any(self.fetched_ts[row_indices] > int(anchor_ts_ms)):
+                continue
+
+            target_frame = pd.DataFrame(
+                {
+                    "run_ts": np.full(
+                        len(target_times),
+                        int(self.run_ts[start]),
+                        dtype=np.int64,
+                    ),
+                    "fetched_ts": self.fetched_ts[row_indices],
+                    **{
+                        name: values[row_indices]
+                        for name, values in self.float_columns.items()
+                    },
+                },
+                index=target_times,
+            )
+            target_frame.index.name = "target_dt"
+            if target_frame[["forecast_avg", "forecast_max", "forecast_dir"]].isna().any().any():
+                continue
+            return target_frame
+        return None
+
+
+def _lower_payload_value(
+    lower_payload: Dict[str, object],
+    db_value: object,
+    keys: Sequence[str],
+) -> float | None:
+    for key in keys:
+        lowered = key.lower()
+        if lowered in lower_payload:
+            value = _to_float(lower_payload[lowered])
+            return value if value is not None else _to_float(db_value)
+    return _to_float(db_value)
+
+
+def _readonly_array_view(values: array, dtype: np.dtype) -> np.ndarray:
+    result = np.frombuffer(values, dtype=dtype)
+    result.flags.writeable = False
+    return result
+
+
+def load_training_forecast_lookup(
+    db_path: Path,
+    cfg: DatasetConfig,
+    *,
+    target_start_ts_ms: int | None = None,
+    target_end_ts_ms: int | None = None,
+    chunk_size: int = 4096,
+    read_only: bool = False,
+) -> TrainingForecastLookup:
+    """
+    Stream historical vintages into one compact training-only row store.
+
+    Full-history training uses one SQL query. Optional target bounds are used by
+    equivalence tests and any future explicit training window; in that case a
+    separate unbounded per-run availability query preserves the legacy rule.
+    """
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be positive.")
+
+    filters = ["site = ?", "model = ?", "target_ts IS NOT NULL"]
+    params: list[object] = [cfg.site, cfg.model]
+    if target_start_ts_ms is not None:
+        filters.append("target_ts >= ?")
+        params.append(int(target_start_ts_ms))
+    if target_end_ts_ms is not None:
+        filters.append("target_ts <= ?")
+        params.append(int(target_end_ts_ms))
+
+    bounded = target_start_ts_ms is not None or target_end_ts_ms is not None
+    sql_query_count = 0
+    availability_by_run: Dict[int, int] = {}
+    run_ts_values = array("q")
+    fetched_ts_values = array("q")
+    target_ts_values = array("q")
+    float_values = {name: array("f") for name in _TRAINING_FLOAT_COLUMNS}
+    streamed_run_available = array("q")
+    current_run_ts: int | None = None
+    current_run_available: int | None = None
+    loaded_row_count = 0
+    next_progress_row = 250_000
+
+    _log_rss(
+        "training_forecast_loader_start",
+        target_start_ts_ms=target_start_ts_ms,
+        target_end_ts_ms=target_end_ts_ms,
+        chunk_size=chunk_size,
+    )
+    conn = _connect_sqlite(db_path, read_only=read_only)
+    try:
+        if bounded:
+            availability_cursor = conn.execute(
+                """
+                SELECT run_ts, MAX(fetched_ts)
+                FROM forecasts
+                WHERE site = ?
+                  AND model = ?
+                GROUP BY run_ts
+                ORDER BY run_ts ASC
+                """,
+                (cfg.site, cfg.model),
+            )
+            sql_query_count += 1
+            while True:
+                availability_rows = availability_cursor.fetchmany(int(chunk_size))
+                if not availability_rows:
+                    break
+                for run_ts, available_ts in availability_rows:
+                    availability_by_run[int(run_ts)] = int(available_ts)
+
+        cursor = conn.execute(
+            f"""
+            SELECT
+                run_ts,
+                fetched_ts,
+                target_ts,
+                horizon_hr,
+                wind_speed,
+                wind_gust,
+                wind_dir,
+                payload
+            FROM forecasts
+            WHERE {' AND '.join(filters)}
+            ORDER BY run_ts ASC, target_ts ASC
+            """,
+            params,
+        )
+        sql_query_count += 1
+        while True:
+            rows = cursor.fetchmany(int(chunk_size))
+            if not rows:
+                break
+            for (
+                run_ts,
+                fetched_ts,
+                target_ts,
+                horizon_hr,
+                wind_speed,
+                wind_gust,
+                wind_dir,
+                payload_raw,
+            ) in rows:
+                row_run_ts = int(run_ts)
+                row_fetched_ts = int(fetched_ts)
+                if current_run_ts is None:
+                    current_run_ts = row_run_ts
+                    current_run_available = row_fetched_ts
+                elif row_run_ts != current_run_ts:
+                    streamed_run_available.append(int(current_run_available))
+                    current_run_ts = row_run_ts
+                    current_run_available = row_fetched_ts
+                else:
+                    current_run_available = max(int(current_run_available), row_fetched_ts)
+
+                payload = json.loads(payload_raw) if payload_raw else {}
+                lower_payload = {str(key).lower(): value for key, value in payload.items()}
+                forecast_values = {
+                    "horizon_hr": _to_float(horizon_hr),
+                    "forecast_avg": _lower_payload_value(
+                        lower_payload,
+                        wind_speed,
+                        ["WindForecastAvr", "wind_speed", "windspeed", "WS", "ff", "speed"],
+                    ),
+                    "forecast_min": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["WindForecastMin", "wind_min", "windspeed_min", "WS_min", "ff_min", "speed_min"],
+                    ),
+                    "forecast_max": _lower_payload_value(
+                        lower_payload,
+                        wind_gust,
+                        ["WindForecastMax", "wind_gust", "gust", "WG", "fg"],
+                    ),
+                    "forecast_dir": _lower_payload_value(
+                        lower_payload,
+                        wind_dir,
+                        ["WindDirection", "wind_dir", "winddirection", "WD", "DD", "dir", "direction"],
+                    ),
+                    "forecast_temperature": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["Temperature", "temperature", "temp", "air_temperature"],
+                    ),
+                    "forecast_pressure": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["Pressure", "pressure", "msl_pressure", "mslp"],
+                    ),
+                    "forecast_rain": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["Rain", "rain", "precipitation", "precipitation_rate", "total_precipitation_rate"],
+                    ),
+                    "forecast_rh": _lower_payload_value(lower_payload, None, ["RH", "rh", "relative_humidity"]),
+                    "forecast_clouds": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["Clouds", "clouds", "cloud_cover"],
+                    ),
+                    "forecast_low_cloud_cover": _lower_payload_value(lower_payload, None, ["low_cloud_cover"]),
+                    "forecast_medium_cloud_cover": _lower_payload_value(
+                        lower_payload,
+                        None,
+                        ["medium_cloud_cover"],
+                    ),
+                    "forecast_high_cloud_cover": _lower_payload_value(lower_payload, None, ["high_cloud_cover"]),
+                    "forecast_cloud_base": _lower_payload_value(lower_payload, None, ["cloud_base"]),
+                    "forecast_global_radiation": _lower_payload_value(lower_payload, None, ["global_radiation"]),
+                }
+
+                run_ts_values.append(row_run_ts)
+                fetched_ts_values.append(row_fetched_ts)
+                target_ts_values.append(int(target_ts))
+                for name in _TRAINING_FLOAT_COLUMNS:
+                    value = forecast_values[name]
+                    float_values[name].append(np.nan if value is None else float(value))
+                loaded_row_count += 1
+
+            if loaded_row_count >= next_progress_row:
+                _log_rss("training_forecast_loader_progress", rows=loaded_row_count)
+                next_progress_row += 250_000
+    finally:
+        conn.close()
+
+    if loaded_row_count == 0:
+        raise ValueError("No forecast rows found for selected training site/model.")
+    if current_run_ts is not None:
+        streamed_run_available.append(int(current_run_available))
+
+    run_ts_array = _readonly_array_view(run_ts_values, np.dtype(np.int64))
+    fetched_ts_array = _readonly_array_view(fetched_ts_values, np.dtype(np.int64))
+    target_ts_array = _readonly_array_view(target_ts_values, np.dtype(np.int64))
+    float_arrays = {
+        name: _readonly_array_view(values, np.dtype(np.float32))
+        for name, values in float_values.items()
+    }
+
+    run_values, run_starts = np.unique(run_ts_array, return_index=True)
+    run_starts = run_starts.astype(np.int64, copy=False)
+    run_ends = np.concatenate((run_starts[1:], np.asarray([loaded_row_count], dtype=np.int64)))
+    if bounded:
+        run_available_ts = np.asarray(
+            [availability_by_run[int(run_ts)] for run_ts in run_values],
+            dtype=np.int64,
+        )
+    else:
+        run_available_ts = _readonly_array_view(streamed_run_available, np.dtype(np.int64))
+    if len(run_available_ts) != len(run_starts):
+        raise ValueError("Training forecast run availability index is inconsistent.")
+
+    target_order_int64 = np.argsort(target_ts_array, kind="stable")
+    target_order = target_order_int64.astype(np.int32)
+    del target_order_int64
+    ordered_targets = target_ts_array[target_order]
+    unique_targets, target_starts = np.unique(ordered_targets, return_index=True)
+    target_ends = np.concatenate(
+        (target_starts[1:], np.asarray([loaded_row_count], dtype=target_starts.dtype))
+    )
+    target_slices = {
+        int(target_ts): (int(start), int(end))
+        for target_ts, start, end in zip(unique_targets, target_starts, target_ends)
+    }
+
+    lookup = TrainingForecastLookup(
+        run_ts=run_ts_array,
+        fetched_ts=fetched_ts_array,
+        target_ts=target_ts_array,
+        float_columns=float_arrays,
+        target_order=target_order,
+        target_slices=target_slices,
+        run_starts=run_starts,
+        run_ends=run_ends,
+        run_available_ts=run_available_ts,
+        loaded_row_count=loaded_row_count,
+        sql_query_count=sql_query_count,
+        target_start_ts_ms=target_start_ts_ms,
+        target_end_ts_ms=target_end_ts_ms,
+    )
+    _log_rss(
+        "training_forecast_lookup_complete",
+        rows=lookup.loaded_row_count,
+        targets=len(lookup.target_slices),
+        runs=len(lookup.run_starts),
+        compact_mib=f"{lookup.compact_nbytes / (1024.0 * 1024.0):.1f}",
+        sql_queries=lookup.sql_query_count,
+    )
+    return lookup
 
 
 def _target_ms(ts: pd.Timestamp) -> int:
@@ -733,7 +1234,81 @@ def _select_latest_complete_run_frame(
     return None
 
 
-def build_anchor_forecast_context(
+def _build_training_history_forecast_frame(
+    forecast_lookup: TrainingForecastLookup | Dict[str, object],
+    history_times: pd.DatetimeIndex,
+    anchor_ts_ms: int,
+) -> pd.DataFrame | None:
+    if isinstance(forecast_lookup, TrainingForecastLookup):
+        if len(history_times) == 0:
+            return pd.DataFrame(index=history_times)
+        records: List[Dict[str, float | int | pd.Timestamp]] = []
+        for target_time in history_times:
+            row = forecast_lookup.latest_target_as_of(_target_ms(target_time), anchor_ts_ms)
+            if row is None:
+                return None
+            records.append({"target_dt": target_time, **row})
+        history_frame = pd.DataFrame.from_records(records).set_index("target_dt").sort_index()
+        history_frame = _interpolate_missing_features(history_frame)
+        history_frame = _add_calendar_features(history_frame)
+        required_cols = ["forecast_avg", "forecast_max", "forecast_dir", "month_sin", "month_cos"]
+        if history_frame[required_cols].isna().any().any():
+            return None
+        return history_frame
+    return _build_history_forecast_frame(
+        forecast_lookup["target_lookup"],
+        history_times,
+        anchor_ts_ms,
+    )
+
+
+def _select_training_complete_run_frame(
+    forecast_lookup: TrainingForecastLookup | Dict[str, object],
+    target_times: pd.DatetimeIndex,
+    anchor_ts_ms: int,
+) -> pd.DataFrame | None:
+    if isinstance(forecast_lookup, TrainingForecastLookup):
+        return forecast_lookup.latest_complete_run_frame(target_times, anchor_ts_ms)
+    return _select_latest_complete_run_frame(
+        forecast_lookup["run_entries"],
+        target_times,
+        anchor_ts_ms,
+    )
+
+
+def build_training_forecast_context(
+    forecast_lookup: TrainingForecastLookup | Dict[str, object],
+    anchor_time: pd.Timestamp,
+    history_times: pd.DatetimeIndex,
+    target_times: pd.DatetimeIndex,
+) -> Dict[str, object]:
+    """Build a historical training context without executing SQL."""
+    anchor_time_utc = pd.Timestamp(anchor_time)
+    if anchor_time_utc.tzinfo is None:
+        anchor_time_utc = anchor_time_utc.tz_localize("UTC")
+    else:
+        anchor_time_utc = anchor_time_utc.tz_convert("UTC")
+    history_times_utc = pd.to_datetime(history_times, utc=True)
+    target_times_utc = pd.to_datetime(target_times, utc=True)
+    anchor_ts_ms = _target_ms(anchor_time_utc)
+    history_frame = _build_training_history_forecast_frame(
+        forecast_lookup,
+        history_times_utc,
+        anchor_ts_ms,
+    )
+    target_frame = _select_training_complete_run_frame(
+        forecast_lookup,
+        target_times_utc,
+        anchor_ts_ms,
+    )
+    return {
+        "anchor_time": anchor_time_utc,
+        "history_frame": history_frame,
+        "target_frame": target_frame,
+    }
+
+
+def build_inference_forecast_context(
     db_path: Path,
     cfg: DatasetConfig,
     anchor_time: pd.Timestamp,
@@ -741,7 +1316,7 @@ def build_anchor_forecast_context(
     target_times: pd.DatetimeIndex,
 ) -> Dict[str, object]:
     """
-    Build the forecast context that would have been knowable at anchor_time.
+    Build one bounded inference context that was knowable at anchor_time.
 
     anchor_time:
         Historical issue time for the sample or evaluation point.
@@ -764,7 +1339,16 @@ def build_anchor_forecast_context(
 
     history_times_utc = pd.to_datetime(history_times, utc=True)
     target_times_utc = pd.to_datetime(target_times, utc=True)
-    bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
+    requested_times = history_times_utc.union(target_times_utc)
+    bundle = None
+    if len(requested_times) > 0:
+        bundle = _load_inference_vintage_lookup_bundle(
+            str(db_path),
+            cfg.site,
+            cfg.model,
+            _target_ms(requested_times.min()),
+            _target_ms(requested_times.max()),
+        )
     anchor_ts_ms = _target_ms(anchor_time_utc)
 
     history_frame = (
@@ -784,7 +1368,7 @@ def build_anchor_forecast_context(
     }
 
 
-def build_anchor_forecast_timeline(
+def build_inference_forecast_timeline(
     db_path: Path,
     cfg: DatasetConfig,
     anchor_time: pd.Timestamp,
@@ -802,7 +1386,7 @@ def build_anchor_forecast_timeline(
 
     history_times = timeline_utc[timeline_utc <= anchor_time_utc]
     future_times = timeline_utc[timeline_utc > anchor_time_utc]
-    context = build_anchor_forecast_context(
+    context = build_inference_forecast_context(
         db_path=db_path,
         cfg=cfg,
         anchor_time=anchor_time_utc,
@@ -836,6 +1420,10 @@ def _build_vintage_aware_samples(
     actual_col: str,
     forecast_target_col: str,
     feature_schema: str = "legacy",
+    *,
+    forecast_lookup: TrainingForecastLookup | Dict[str, object] | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -850,12 +1438,22 @@ def _build_vintage_aware_samples(
     np.ndarray,
 ]:
     schema = str(feature_schema).strip().lower()
-    bundle = _load_vintage_lookup_bundle(str(db_path), cfg.site, cfg.model)
-    conn = sqlite3.connect(str(db_path))
-    try:
-        obs = _load_observations(conn, cfg.site)
-    finally:
-        conn.close()
+    if forecast_lookup is None:
+        forecast_lookup = load_training_forecast_lookup(
+            db_path,
+            cfg,
+            read_only=read_only,
+        )
+    obs = (
+        load_training_observations(db_path, cfg, read_only=read_only)
+        if observations is None
+        else observations
+    )
+    _log_rss(
+        "next_day_training_array_construction_start",
+        target=actual_col,
+        observation_hours=len(obs),
+    )
 
     feature_cols: list[str] | None = None
     X_list: List[np.ndarray] = []
@@ -872,8 +1470,6 @@ def _build_vintage_aware_samples(
     window = cfg.window_hours
     horizon = cfg.target_hours
     total = len(obs)
-    target_lookup = bundle["target_lookup"]
-    run_entries = bundle["run_entries"]
     # Forecasts are selected as they were actually available at each anchor time.
     # Historical features use the latest forecast known by that anchor, while the
     # future Harmonie baseline comes from the latest complete run available then.
@@ -883,13 +1479,21 @@ def _build_vintage_aware_samples(
         target_times = obs.index[i + 1 : i + 1 + horizon]
         anchor_ts_ms = _target_ms(anchor_time)
 
-        history_frame = _build_history_forecast_frame(target_lookup, history_times, anchor_ts_ms)
+        history_frame = _build_training_history_forecast_frame(
+            forecast_lookup,
+            history_times,
+            anchor_ts_ms,
+        )
         if history_frame is None:
             continue
         if schema == "speed_v3_actual_history":
             history_frame = history_frame.join(obs[["actual_avg", "actual_max", "actual_dir"]], how="left")
             history_frame = _interpolate_missing_features(history_frame)
-        target_frame = _select_latest_complete_run_frame(run_entries, target_times, anchor_ts_ms)
+        target_frame = _select_training_complete_run_frame(
+            forecast_lookup,
+            target_times,
+            anchor_ts_ms,
+        )
         if target_frame is None:
             continue
 
@@ -935,6 +1539,13 @@ def _build_vintage_aware_samples(
     target_run_ts_all = np.stack(target_run_ts_list).astype(np.int64)
     target_fetched_ts_all = np.stack(target_fetched_ts_list).astype(np.int64)
     target_horizon_hr_all = np.stack(target_horizon_hr_list).astype(np.float32)
+    _log_rss(
+        "next_day_training_array_construction_complete",
+        target=actual_col,
+        samples=len(X_raw),
+        timesteps=X_raw.shape[1],
+        features=X_raw.shape[2],
+    )
     return (
         X_raw,
         y_actual_raw,
@@ -955,6 +1566,10 @@ def build_all_training_arrays(
     cfg: DatasetConfig,
     target_mode: str = "absolute",
     feature_schema: str = "speed_v2",
+    *,
+    forecast_lookup: TrainingForecastLookup | Dict[str, object] | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> Dict[str, np.ndarray | List[str]]:
     target_mode = _resolve_target_mode(target_mode)
     schema = str(feature_schema).strip().lower()
@@ -977,6 +1592,9 @@ def build_all_training_arrays(
         actual_col=target_col,
         forecast_target_col="forecast_avg",
         feature_schema=schema,
+        forecast_lookup=forecast_lookup,
+        observations=observations,
+        read_only=read_only,
     )
     if target_mode == "residual":
         y_target_raw = y_actual_raw - y_forecast_raw
@@ -1018,6 +1636,10 @@ def build_training_arrays(
     cfg: DatasetConfig,
     target_mode: str = "absolute",
     feature_schema: str = "speed_v2",
+    *,
+    forecast_lookup: TrainingForecastLookup | Dict[str, object] | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> Dict[str, np.ndarray | Dict | List[str]]:
     target_mode = _resolve_target_mode(target_mode)
     schema = str(feature_schema).strip().lower()
@@ -1040,6 +1662,9 @@ def build_training_arrays(
         actual_col=target_col,
         forecast_target_col="forecast_avg",
         feature_schema=schema,
+        forecast_lookup=forecast_lookup,
+        observations=observations,
+        read_only=read_only,
     )
     if target_mode == "residual":
         y_target_raw = y_actual_raw - y_forecast_raw
@@ -1093,6 +1718,10 @@ def build_all_direction_training_arrays(
     db_path: Path,
     cfg: DatasetConfig,
     feature_schema: str = "direction_v2",
+    *,
+    forecast_lookup: TrainingForecastLookup | Dict[str, object] | None = None,
+    observations: pd.DataFrame | None = None,
+    read_only: bool = False,
 ) -> Dict[str, np.ndarray | List[str]]:
     schema = str(feature_schema).strip().lower()
     (
@@ -1113,6 +1742,9 @@ def build_all_direction_training_arrays(
         actual_col="actual_dir",
         forecast_target_col="forecast_dir",
         feature_schema=schema,
+        forecast_lookup=forecast_lookup,
+        observations=observations,
+        read_only=read_only,
     )
     y_target_raw = _angle_diff_deg(y_actual_raw, y_forecast_raw)
 
@@ -1184,7 +1816,7 @@ def build_next_day_inference_input(
     history_times = history_times_local.tz_convert("UTC")
     anchor_ts_ms = _target_ms(anchor_time)
 
-    context = build_anchor_forecast_context(
+    context = build_inference_forecast_context(
         db_path=db_path,
         cfg=cfg,
         anchor_time=anchor_time,

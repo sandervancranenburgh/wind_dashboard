@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import html
 import json
 import os
+import resource
 import shutil
 import sqlite3
 import subprocess
@@ -62,11 +64,13 @@ if not MEASURED_ONLY_CHILD:
         _apply_standardizer,
         _fit_standardizer,
         _fit_target_scaler,
-        build_anchor_forecast_context,
-        build_anchor_forecast_timeline,
         build_all_direction_training_arrays,
         build_all_training_arrays,
+        build_inference_forecast_context,
+        build_inference_forecast_timeline,
         build_next_day_inference_input,
+        load_training_forecast_lookup,
+        load_training_observations,
     )
     from intraday_model import (
         IntradayBundle,
@@ -92,6 +96,32 @@ HARMONIE_ARRIVAL_HISTORY_POLL_RUNS = 384
 HARMONIE_ARRIVAL_HISTORY_MAX_EVENTS = 48
 HARMONIE_ARRIVAL_ESTIMATE_SAMPLE_EVENTS = 24
 HARMONIE_ARRIVAL_ESTIMATE_MIN_EVENTS = 4
+
+
+def _current_rss_mib() -> float:
+    """Return current resident memory without adding a runtime dependency."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+    except (OSError, IndexError, ValueError):
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+
+
+def _peak_rss_mib() -> float:
+    peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if sys.platform == "darwin":
+        peak /= 1024.0
+    return peak / 1024.0
+
+
+def _log_rss(phase: str, **details: object) -> None:
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    suffix = f" {detail_text}" if detail_text else ""
+    print(
+        f"RSS phase={phase} rss_mib={_current_rss_mib():.1f} peak_rss_mib={_peak_rss_mib():.1f}{suffix}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -2434,7 +2464,7 @@ def build_current_day_table(
         target_utc_index = target_local_index.tz_convert("UTC")
 
         direction_feature_schema = _direction_feature_schema_from_scalers(direction_scalers)
-        context = build_anchor_forecast_context(
+        context = build_inference_forecast_context(
             db_path=db_path,
             cfg=cfg,
             anchor_time=anchor_local_for_targets.tz_convert("UTC"),
@@ -2494,7 +2524,7 @@ def build_current_day_table(
     # Build the forecast frame that was actually available at the current issue hour.
     full_hours = pd.date_range(start=day_start_local, end=day_end_local, freq="1h", tz=tz)
     issue_anchor_utc = pd.Timestamp(now_hour_local).tz_convert("UTC")
-    forecast_frame_utc = build_anchor_forecast_timeline(
+    forecast_frame_utc = build_inference_forecast_timeline(
         db_path=db_path,
         cfg=cfg,
         anchor_time=issue_anchor_utc,
@@ -7133,6 +7163,7 @@ def main() -> None:
     model_artifact_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else out_dir
     model_artifact_dir.mkdir(parents=True, exist_ok=True)
     db_path = Path(args.db).resolve()
+    _log_rss("process_start")
 
     print(f"Output artifact directory: {out_dir.resolve()}")
     print(f"Model artifact directory: {model_artifact_dir.resolve()}")
@@ -7210,6 +7241,7 @@ def main() -> None:
                 }
             ),
         )
+    _log_rss("source_refresh_complete", refreshed=refresh_info["refreshed"])
 
     speed_model_path = model_artifact_dir / "next_day_lstm_speed_residual.pt"
     direction_model_path = model_artifact_dir / "next_day_lstm_direction_residual.pt"
@@ -7328,9 +7360,24 @@ def main() -> None:
         speed_constraint_eps = float(args.speed_constraint_eps)
         promotion_margin = max(0.0, float(args.promotion_margin_pct)) / 100.0
 
-        # Build full arrays once, then split chronologically into train/eval holdouts.
-        speed_arrays_full = build_all_training_arrays(db_path, cfg, target_mode="residual")
-        direction_arrays_full = build_all_direction_training_arrays(db_path, cfg)
+        # Load training data once, then reuse it across speed, direction, and intraday.
+        training_observations = load_training_observations(db_path, cfg)
+        training_forecast_lookup = load_training_forecast_lookup(db_path, cfg)
+        speed_arrays_full = build_all_training_arrays(
+            db_path,
+            cfg,
+            target_mode="residual",
+            forecast_lookup=training_forecast_lookup,
+            observations=training_observations,
+        )
+        _log_rss("speed_training_arrays_complete", samples=len(speed_arrays_full["X_all"]))
+        direction_arrays_full = build_all_direction_training_arrays(
+            db_path,
+            cfg,
+            forecast_lookup=training_forecast_lookup,
+            observations=training_observations,
+        )
+        _log_rss("direction_training_arrays_complete", samples=len(direction_arrays_full["X_all"]))
         n_samples_all_speed = int(speed_arrays_full["X_all"].shape[0])
         n_samples_all_direction = int(direction_arrays_full["X_all"].shape[0])
         feature_cols = speed_arrays_full["feature_cols"]
@@ -8074,6 +8121,8 @@ def main() -> None:
             f"promoted={promote_intraday}"
         )
 
+    _log_rss("model_and_scaler_loading_complete", skip_training=args.skip_training)
+    _log_rss("next_day_inference_input_start")
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
         cfg=cfg,
@@ -8082,6 +8131,7 @@ def main() -> None:
         feature_schema=_next_day_feature_schema_from_scalers(speed_arrays),
         local_tz=args.local_timezone,
     )
+    _log_rss("next_day_speed_inference_input_complete")
     inference_input_direction = build_next_day_inference_input(
         db_path=db_path,
         cfg=cfg,
@@ -8090,6 +8140,7 @@ def main() -> None:
         feature_schema=_direction_feature_schema_from_scalers(direction_arrays),
         local_tz=args.local_timezone,
     )
+    _log_rss("next_day_direction_inference_input_complete")
     speed_inference_calibration_context = _build_speed_calibration_context(
         anchor_dir_deg=float(inference_input_speed["anchor_forecast_dir"]),
         target_times_utc=pd.to_datetime([inference_input_speed["target_times"][0]], utc=True),
@@ -8126,6 +8177,7 @@ def main() -> None:
         y_std=float(direction_arrays["y_std"][0]),
         device=device,
     )
+    _log_rss("next_day_prediction_complete")
 
     table = build_prediction_table(inference_input_speed, speed_pred, direction_pred, local_tz=args.local_timezone)
     next_day_prediction_log_frame = _build_next_day_prediction_log_frame(inference_input_speed, speed_pred)
@@ -8148,6 +8200,7 @@ def main() -> None:
     harmonie_arrival_history_utc = [
         value.isoformat() for value in harmonie_arrival_estimate.arrivals_utc
     ]
+    _log_rss("harmonie_metadata_processing_complete")
     next_day_prediction_log_rows = 0
     current_day_prediction_log_rows = 0
     prediction_evaluation_rows_materialized = 0
@@ -8244,6 +8297,7 @@ def main() -> None:
     current_day_issue_anchor_utc = pd.Timestamp(current_day_issue_anchor_local).tz_convert("UTC")
 
     # --- Current day plot/table: actuals up to present + prediction for remaining day ---
+    _log_rss("current_day_inference_input_start")
     current_day_table, current_day_prediction_log_frame = build_current_day_table(
         db_path=db_path,
         cfg=cfg,
@@ -8265,6 +8319,7 @@ def main() -> None:
         current_day_interval_minutes=args.current_day_interval_minutes,
         device=device,
     )
+    _log_rss("current_day_inference_complete", rows=len(current_day_table))
 
     current_day_table_path = out_dir / f"current_day_predictions{test_suffix}.csv"
     current_day_table_csv = current_day_table.copy()
@@ -8346,6 +8401,8 @@ def main() -> None:
             if current_day_direction_spider_png.exists():
                 current_day_direction_spider_png_src = current_day_direction_spider_png
 
+    _log_rss("current_day_metrics_and_harmonie_processing_complete")
+
     # Both super-local prediction tables have now been generated successfully.
     prediction_updated_at_utc = datetime.now(timezone.utc).isoformat()
     plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
@@ -8412,6 +8469,7 @@ def main() -> None:
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
     )
+    _log_rss("plot_generation_complete")
     if not is_test_mode:
         current_day_snapshot_csv = save_current_day_snapshot(
             out_dir=out_dir,
@@ -8585,6 +8643,7 @@ def main() -> None:
             harmonie_arrival_history_utc=harmonie_arrival_history_utc,
             companion_app_base_url=args.companion_app_base_url,
         )
+        _log_rss("dashboard_rendering_complete")
         if args.git_auto_push_pages:
             repo_root = Path(__file__).resolve().parents[1]
             git_publish = auto_push_dashboard_changes(

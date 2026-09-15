@@ -306,7 +306,7 @@ def _latest_forecast_run_ts_ms(db_path: Path, site: str, model: str) -> int | No
 
 def _run_fetch_script(repo_root: Path, out_data_dir: Path) -> None:
     fetch_script = repo_root / "source_fetch.py"
-    cmd = ["python3", str(fetch_script), str(out_data_dir)]
+    cmd = [sys.executable, str(fetch_script), str(out_data_dir)]
     print(f"Refreshing source data via: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(repo_root), check=True)
 

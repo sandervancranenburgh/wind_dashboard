@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll ECMWF Open Data for production forecast vintages
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=yes
+RandomizedDelaySec=2min
+FixedRandomDelay=yes
+AccuracySec=1min
+Unit=wind-fetcher2-ecmwf.service
+
+[Install]
+WantedBy=timers.target

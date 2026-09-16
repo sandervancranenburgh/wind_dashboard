@@ -1,0 +1,29 @@
+{
+  "horizon_hours": 120,
+  "open_data_source": "google",
+  "max_completed_runs_per_site": null,
+  "availability_delay_hours": 8,
+  "sites": [
+    {
+      "site_id": "valkenburgsemeer",
+      "display_name": "Valkenburgse Meer",
+      "latitude": 52.168,
+      "longitude": 4.437,
+      "observation_site": "valkenburgsemeer",
+      "timezone": "Europe/Amsterdam"
+    },
+    {
+      "site_id": "oostvoorne",
+      "display_name": "Oostvoornse Meer",
+      "latitude": 51.9278,
+      "longitude": 4.05502,
+      "observation_site": "oostvoorne",
+      "timezone": "Europe/Amsterdam"
+    }
+  ],
+  "comparison": {
+    "site_id": "valkenburgsemeer",
+    "timezone": "Europe/Amsterdam",
+    "snapshot_hour_local": 9
+  }
+}

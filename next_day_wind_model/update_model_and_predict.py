@@ -34,6 +34,7 @@ MEASURED_ONLY_CHILD = (
     and os.environ.get("WIND_PIPELINE_OPERATIONAL_GATE_CHILD") == "1"
     and "--operational-measured-only" in sys.argv[1:]
 )
+PLOT_RENDERER_ONLY = os.environ.get("WIND_PLOT_RENDERER_ONLY") == "1"
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -42,7 +43,12 @@ from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea, VPacker
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
-if not MEASURED_ONLY_CHILD:
+from next_day_wind_model.ecmwf_dashboard import (
+    ECMWF_FORECAST_COLOR,
+    ECMWF_FORECAST_LINEWIDTH,
+    load_ecmwf_plot_data,
+)
+if not MEASURED_ONLY_CHILD and not PLOT_RENDERER_ONLY:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
@@ -136,6 +142,17 @@ def parse_args() -> argparse.Namespace:
         description="Retrain residual models (speed + direction) on all data and output next-day predictions.",
     )
     parser.add_argument("--db", default="data/wind_data_all_sites.db", help="Path to SQLite DB.")
+    parser.add_argument(
+        "--ecmwf-archive-db",
+        default="data/ecmwf_archive/ecmwf_shadow.sqlite",
+        help="Read-only ECMWF forecast-vintage archive used for dashboard overlays.",
+    )
+    parser.add_argument(
+        "--ecmwf-fallback-delay-hours",
+        type=float,
+        default=8.0,
+        help="Fallback IFS availability latency until enough completed runs exist.",
+    )
     parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
@@ -2203,6 +2220,7 @@ def _format_plot_meta_text(
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
+    additional_line_after_harmonie: str | None = None,
 ) -> str:
     train_dt = _parse_iso_utc(model_trained_at_utc)
     tz = ZoneInfo(local_tz)
@@ -2211,12 +2229,33 @@ def _format_plot_meta_text(
         if train_dt is not None
         else "unknown"
     )
-    return (
-        f"{_format_update_line('plot update', plot_updated_at_utc, local_tz=local_tz, interval_minutes=plot_update_interval_minutes, expected=False)}\n"
-        f"{_format_prediction_update_line(prediction_updated_at_utc, harmonie_time_utc, local_tz=local_tz, harmonie_update_interval_minutes=harmonie_update_interval_minutes, harmonie_expected_next_at_utc=harmonie_expected_next_at_utc)}\n"
-        f"{_format_harmonie_metadata_text(harmonie_time_utc, harmonie_time_kind, local_tz, harmonie_update_interval_minutes, harmonie_expected_next_at_utc)}\n"
-        f"Champion model trained & promoted: {train_txt}"
-    )
+    lines = [
+        _format_update_line(
+            "plot update",
+            plot_updated_at_utc,
+            local_tz=local_tz,
+            interval_minutes=plot_update_interval_minutes,
+            expected=False,
+        ),
+        _format_prediction_update_line(
+            prediction_updated_at_utc,
+            harmonie_time_utc,
+            local_tz=local_tz,
+            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ),
+        _format_harmonie_metadata_text(
+            harmonie_time_utc,
+            harmonie_time_kind,
+            local_tz,
+            harmonie_update_interval_minutes,
+            harmonie_expected_next_at_utc,
+        ),
+    ]
+    if additional_line_after_harmonie:
+        lines.append(str(additional_line_after_harmonie))
+    lines.append(f"Champion model trained & promoted: {train_txt}")
+    return "\n".join(lines)
 
 
 def _format_last_plot_update_text(plot_updated_at_utc: datetime | pd.Timestamp | str | None, local_tz: str) -> str:
@@ -2243,6 +2282,81 @@ def _format_model_id_text(model_trained_at_utc: str | None, local_tz: str) -> st
     return f"Model ID: {_format_model_id(model_trained_at_utc, local_tz)}"
 
 
+def _native_points_through_first_after_limit(
+    frame: pd.DataFrame,
+    *,
+    time_column: str,
+    left: pd.Timestamp,
+    right: pd.Timestamp,
+) -> pd.DataFrame:
+    """Keep visible native points plus the first point beyond the right limit."""
+
+    if frame is None or frame.empty or time_column not in frame:
+        return pd.DataFrame(columns=[] if frame is None else frame.columns)
+    selected = frame.copy()
+    selected[time_column] = pd.to_datetime(
+        selected[time_column], utc=True, errors="coerce"
+    ).dt.tz_convert(right.tz)
+    selected = selected.dropna(subset=[time_column]).sort_values(time_column)
+    visible = selected[
+        (selected[time_column] >= left) & (selected[time_column] <= right)
+    ]
+    after = selected[selected[time_column] > right].head(1)
+    return pd.concat([visible, after], ignore_index=True).drop_duplicates(
+        subset=[time_column], keep="last"
+    )
+
+
+def _load_dashboard_ecmwf(
+    args: argparse.Namespace,
+    *,
+    current_day_table: pd.DataFrame,
+    next_day_table: pd.DataFrame,
+    cutoff_utc: datetime,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Select one ECMWF run and only the bounded points needed by both plots."""
+
+    zone = ZoneInfo(args.local_timezone)
+    ranges: list[pd.DatetimeIndex] = []
+    if current_day_table is not None and not current_day_table.empty:
+        ranges.append(
+            pd.DatetimeIndex(
+                pd.to_datetime(current_day_table["time_local"], utc=True, errors="coerce")
+            ).tz_convert(zone)
+        )
+    if next_day_table is not None and not next_day_table.empty:
+        next_column = (
+            next_day_table["target_time_local"]
+            if "target_time_local" in next_day_table
+            else next_day_table["target_time_utc"]
+        )
+        ranges.append(
+            pd.DatetimeIndex(pd.to_datetime(next_column, utc=True, errors="coerce")).tz_convert(
+                zone
+            )
+        )
+    valid = [index.dropna() for index in ranges if len(index.dropna())]
+    if not valid:
+        return pd.DataFrame(), {
+            "available": False,
+            "reason": "dashboard tables have no usable timestamps",
+            "metadata_line": None,
+            "run_identity": None,
+        }
+    start_local = min(index.min() for index in valid)
+    # Six hours covers the first native point after either plot's 22:00 bound.
+    end_local = max(index.max() for index in valid) + pd.Timedelta(hours=6)
+    return load_ecmwf_plot_data(
+        Path(args.ecmwf_archive_db),
+        site=args.site,
+        cutoff_utc=cutoff_utc,
+        start_utc=start_local.tz_convert("UTC").to_pydatetime(),
+        end_utc=end_local.tz_convert("UTC").to_pydatetime(),
+        local_timezone=args.local_timezone,
+        fallback_availability_delay_hours=args.ecmwf_fallback_delay_hours,
+    )
+
+
 def save_prediction_plot(
     table: pd.DataFrame,
     plot_path: Path,
@@ -2256,6 +2370,8 @@ def save_prediction_plot(
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
     mobile: bool = False,
+    ecmwf_speed_series: pd.DataFrame | None = None,
+    render_diagnostics: dict[str, object] | None = None,
 ) -> None:
     table = table.copy()
     if "target_time_local" not in table.columns:
@@ -2324,6 +2440,41 @@ def save_prediction_plot(
         linewidth=2.4,
         label="Super local wind prediction - avg speed",
     )
+    ecmwf_line = None
+    ecmwf_frame = pd.DataFrame()
+    if ecmwf_speed_series is not None and not ecmwf_speed_series.empty:
+        ecmwf_frame = ecmwf_speed_series.copy()
+        source_time = "time_local" if "time_local" in ecmwf_frame else "time_utc"
+        if source_time not in ecmwf_frame or "wind_speed_knots" not in ecmwf_frame:
+            raise ValueError("ECMWF overlay requires time_local/time_utc and wind_speed_knots.")
+        ecmwf_frame["time_local"] = pd.to_datetime(
+            ecmwf_frame[source_time], utc=True, errors="coerce"
+        ).dt.tz_convert(ZoneInfo(local_tz))
+        ecmwf_frame["wind_speed_knots"] = pd.to_numeric(
+            ecmwf_frame["wind_speed_knots"], errors="coerce"
+        )
+        ecmwf_frame = ecmwf_frame.dropna(subset=["time_local", "wind_speed_knots"])
+        first_target = pd.Timestamp(table["target_time_local"].iloc[0])
+        last_target = pd.Timestamp(table["target_time_local"].iloc[-1])
+        ecmwf_frame = ecmwf_frame[
+            (ecmwf_frame["time_local"] >= first_target)
+            & (ecmwf_frame["time_local"] <= last_target)
+        ].sort_values("time_local")
+        if not ecmwf_frame.empty:
+            ecmwf_x = (
+                (ecmwf_frame["time_local"] - first_target).dt.total_seconds() / 3600.0
+            ).to_numpy(dtype=float)
+            ecmwf_line = ax.plot(
+                ecmwf_x,
+                ecmwf_frame["wind_speed_knots"].to_numpy(dtype=float),
+                color=ECMWF_FORECAST_COLOR,
+                linewidth=ECMWF_FORECAST_LINEWIDTH,
+                linestyle="-",
+                marker="D",
+                markersize=3.8 if mobile else 3.4,
+                label="ECMWF forecast",
+                zorder=2.8,
+            )[0]
     ax.set_title(day_label, fontsize=title_fs)
     ax.set_xlabel("Time", fontsize=label_fs, labelpad=24 if mobile else 26)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
@@ -2332,6 +2483,7 @@ def save_prediction_plot(
     desired_order = [
         "Super local wind prediction - avg speed",
         "Harmonie model - avg speed",
+        *(["ECMWF forecast"] if ecmwf_line is not None else []),
         "Harmonie model - max speed",
     ]
     order_map = {label: handle for handle, label in zip(handles, labels)}
@@ -2415,6 +2567,40 @@ def save_prediction_plot(
     layout_top = 0.93 if mobile else 0.965
     layout_bottom = 0.055 if mobile else 0.04
     fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
+    if render_diagnostics is not None:
+        render_diagnostics.update(
+            {
+                "x_limits": [float(value) for value in ax.get_xlim()],
+                "y_limits": [float(value) for value in ax.get_ylim()],
+                "y_ticks": [float(value) for value in ax.get_yticks()],
+                "figure_size_inches": [
+                    float(value) for value in fig.get_size_inches()
+                ],
+                "axes_position": [
+                    float(value) for value in ax.get_position().bounds
+                ],
+                "legend_labels": [
+                    item.get_text() for item in legend.get_texts()
+                ],
+                "ecmwf_plotted": ecmwf_line is not None,
+                "ecmwf_color": (
+                    None if ecmwf_line is None else str(ecmwf_line.get_color())
+                ),
+                "ecmwf_linestyle": (
+                    None if ecmwf_line is None else str(ecmwf_line.get_linestyle())
+                ),
+                "ecmwf_linewidth": (
+                    None if ecmwf_line is None else float(ecmwf_line.get_linewidth())
+                ),
+                "ecmwf_times_local": [
+                    value.isoformat()
+                    for value in pd.DatetimeIndex(
+                        ecmwf_frame.get("time_local", pd.Series(dtype="datetime64[ns]"))
+                    )
+                ],
+                "direction_annotation_count": len(ax.texts),
+            }
+        )
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -2744,6 +2930,9 @@ def save_current_day_plot(
     prior_prediction_tables: list[pd.DataFrame] | None = None,
     live_monitoring_metric: dict | None = None,
     mobile: bool = False,
+    ecmwf_speed_series: pd.DataFrame | None = None,
+    ecmwf_metadata_text: str | None = None,
+    render_diagnostics: dict[str, object] | None = None,
 ) -> None:
     def _prepare_branch_frame(
         raw_frame: pd.DataFrame,
@@ -2952,6 +3141,35 @@ def save_current_day_plot(
     if current_comparison_frame is None or current_comparison_frame.empty:
         current_comparison_frame = _prepare_branch_frame(table, fallback_issue_anchor=current_issue_anchor)[1]
         current_harmonie_anchor = current_issue_anchor
+
+    if render_diagnostics is not None:
+        def _diagnostic_series(frame: pd.DataFrame, value_column: str) -> pd.DataFrame:
+            values = pd.to_numeric(frame[value_column], errors="coerce")
+            selected = pd.DataFrame(
+                {"time_local": frame["time_local"], "value": values}
+            ).dropna(subset=["time_local", "value"])
+            return selected.sort_values("time_local").drop_duplicates(
+                subset=["time_local"], keep="last"
+            ).reset_index(drop=True)
+
+        render_diagnostics.update(
+            {
+                "current_issue_anchor_local": current_issue_anchor.isoformat(),
+                "active_anchor_local": current_harmonie_anchor.isoformat(),
+                "harmonie_update_anchors_local": [
+                    value.isoformat() for value in harmonie_update_anchors
+                ],
+                "series": {
+                    "measured_wind": _diagnostic_series(table, "actual_wind_speed"),
+                    "superlocal": _diagnostic_series(
+                        current_comparison_frame, "lstm_pred_wind_speed"
+                    ),
+                    "harmonie": _diagnostic_series(
+                        current_comparison_frame, "forecast_wind_speed"
+                    ),
+                },
+            }
+        )
 
     # Keep the static dashboard scale primarily forecast-based so it stays
     # stable through the day. Measured values are only a safeguard against
@@ -3231,6 +3449,42 @@ def save_current_day_plot(
         zorder=3,
     )
 
+    # Optional ECMWF overlay. The no-ECMWF path remains the exact established
+    # production renderer; ECMWF is deliberately excluded from the y-scale,
+    # direction arrows, variability panel, and MAE calculation.
+    ecmwf_plotted = False
+    ecmwf_frame = pd.DataFrame()
+    if ecmwf_speed_series is not None and not ecmwf_speed_series.empty:
+        ecmwf_frame = ecmwf_speed_series.copy()
+        if "time_local" not in ecmwf_frame.columns or "wind_speed_knots" not in ecmwf_frame.columns:
+            raise ValueError("ECMWF overlay requires time_local and wind_speed_knots columns.")
+        ecmwf_frame["time_local"] = pd.to_datetime(
+            ecmwf_frame["time_local"], utc=True, errors="coerce"
+        ).dt.tz_convert(plot_tz)
+        ecmwf_frame["wind_speed_knots"] = pd.to_numeric(
+            ecmwf_frame["wind_speed_knots"], errors="coerce"
+        )
+        ecmwf_frame = ecmwf_frame.dropna(subset=["time_local", "wind_speed_knots"])
+        ecmwf_frame = _native_points_through_first_after_limit(
+            ecmwf_frame,
+            time_column="time_local",
+            left=pd.Timestamp(time_index[0]),
+            right=pd.Timestamp(time_index[-1]),
+        )
+        if not ecmwf_frame.empty:
+            _plot_valid_line(
+                _date_x_values(ecmwf_frame["time_local"]),
+                ecmwf_frame["wind_speed_knots"].to_numpy(dtype=float),
+                color=ECMWF_FORECAST_COLOR,
+                linewidth=ECMWF_FORECAST_LINEWIDTH,
+                linestyle="-",
+                marker="D",
+                markersize=3.8 if mobile else 3.4,
+                label="_nolegend_",
+                zorder=2.8,
+            )
+            ecmwf_plotted = True
+
     def _first_valid_point(x_values: np.ndarray, y_values: np.ndarray) -> tuple[float, float] | None:
         valid_idx = np.where(~np.isnan(y_values))[0]
         if len(valid_idx) == 0:
@@ -3300,12 +3554,26 @@ def save_current_day_plot(
             markeredgecolor="white",
             markeredgewidth=0.7,
         ),
+        "ECMWF forecast": Line2D(
+            [0],
+            [0],
+            color=ECMWF_FORECAST_COLOR,
+            linewidth=ECMWF_FORECAST_LINEWIDTH,
+            linestyle="-",
+            marker="D",
+            markersize=4.2 if mobile else 3.8,
+            markerfacecolor=ECMWF_FORECAST_COLOR,
+            markeredgecolor="white",
+            markeredgewidth=0.7,
+        ),
     }
     desired_order = [
         "Measured wind",
         "Super local forecast",
         "Harmonie forecast",
     ]
+    if ecmwf_plotted:
+        desired_order.append("ECMWF forecast")
     ordered_handles = [order_map[label] for label in desired_order if label in order_map]
     ordered_labels = [label for label in desired_order if label in order_map]
     ax.legend(
@@ -3551,20 +3819,22 @@ def save_current_day_plot(
     mse_anchored.set_zorder(7)
     ax.add_artist(mse_anchored)
 
+    plot_meta_text = _format_plot_meta_text(
+        plot_updated_at_utc,
+        prediction_updated_at_utc,
+        model_trained_at_utc,
+        local_tz,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=plot_update_interval_minutes,
+        harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        additional_line_after_harmonie=ecmwf_metadata_text if ecmwf_plotted else None,
+    )
     ax.text(
         0.015,
-        meta_text_y,
-        _format_plot_meta_text(
-            plot_updated_at_utc,
-            prediction_updated_at_utc,
-            model_trained_at_utc,
-            local_tz,
-            harmonie_time_utc=harmonie_time_utc,
-            harmonie_time_kind=harmonie_time_kind,
-            plot_update_interval_minutes=plot_update_interval_minutes,
-            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
-            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
-        ),
+        meta_text_y + (0.025 if ecmwf_plotted else 0.0),
+        plot_meta_text,
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -3626,6 +3896,56 @@ def save_current_day_plot(
         top=layout_top,
         hspace=subplot_hspace,
     )
+    if render_diagnostics is not None:
+        legend = ax.get_legend()
+        render_diagnostics.update(
+            {
+                "figure_size_inches": [float(value) for value in fig.get_size_inches()],
+                "save_dpi": 150,
+                "axes_positions": [
+                    [float(value) for value in axis.get_position().bounds]
+                    for axis in (ax, variability_ax, direction_ax)
+                ],
+                "x_limits": [float(value) for value in ax.get_xlim()],
+                "speed_y_limits": [float(value) for value in ax.get_ylim()],
+                "variability_y_limits": [
+                    float(value) for value in variability_ax.get_ylim()
+                ],
+                "speed_y_ticks": [float(value) for value in ax.get_yticks()],
+                "variability_y_ticks": [
+                    float(value) for value in variability_ax.get_yticks()
+                ],
+                "legend_labels": (
+                    [item.get_text() for item in legend.get_texts()]
+                    if legend is not None
+                    else []
+                ),
+                "metadata_lines": plot_meta_text.splitlines(),
+                "axis_line_colors": [
+                    [str(line.get_color()) for line in axis.lines]
+                    for axis in (ax, variability_ax, direction_ax)
+                ],
+                "axis_annotation_counts": [
+                    len(axis.texts) for axis in (ax, variability_ax, direction_ax)
+                ],
+                "ecmwf_plotted": ecmwf_plotted,
+                "ecmwf_color": ECMWF_FORECAST_COLOR if ecmwf_plotted else None,
+                "ecmwf_linestyle": "-" if ecmwf_plotted else None,
+                "ecmwf_linewidth": (
+                    ECMWF_FORECAST_LINEWIDTH if ecmwf_plotted else None
+                ),
+                "ecmwf_times_local": [
+                    value.isoformat()
+                    for value in pd.DatetimeIndex(
+                        ecmwf_frame.get("time_local", pd.Series(dtype="datetime64[ns]"))
+                    )
+                ],
+                "metadata_position_axes": [
+                    0.015,
+                    meta_text_y + (0.025 if ecmwf_plotted else 0.0),
+                ],
+            }
+        )
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
 
@@ -6168,6 +6488,7 @@ def publish_web_dashboard(
     harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
     harmonie_arrival_estimate_method: str | None = None,
     harmonie_arrival_history_utc: list[str] | None = None,
+    ecmwf_metadata: dict[str, object] | None = None,
     companion_app_base_url: str | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
@@ -6267,6 +6588,15 @@ def publish_web_dashboard(
     static_refresh_metadata = {
         "static_plot_generated_at_utc": static_plot_generated_at_utc,
         "plot_updated_at_utc": None if plot_updated_at_utc is None else str(plot_updated_at_utc),
+        "ecmwf": dict(ecmwf_metadata or {}),
+        "ecmwf_run_time_utc": (ecmwf_metadata or {}).get("run_time_utc"),
+        "ecmwf_last_fetch_utc": (ecmwf_metadata or {}).get("last_fetch_utc"),
+        "ecmwf_next_expected_fetch_utc": (
+            (ecmwf_metadata or {}).get("next_expected_fetch_utc")
+        ),
+        "ecmwf_arrival_estimate_method": (
+            (ecmwf_metadata or {}).get("arrival_estimate_method")
+        ),
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
         "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
@@ -6769,7 +7099,15 @@ def run_dashboard_stage_from_cached_artifacts(
     harmonie_arrival_history_utc = [
         value.isoformat() for value in harmonie_arrival_estimate.arrivals_utc
     ]
-    plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
+    plot_updated_at_dt = datetime.now(timezone.utc)
+    plot_updated_at_utc = plot_updated_at_dt.isoformat()
+    ecmwf_speed_series, ecmwf_metadata = _load_dashboard_ecmwf(
+        args,
+        current_day_table=current_day_table,
+        next_day_table=table,
+        cutoff_utc=plot_updated_at_dt,
+    )
+    ecmwf_metadata_text = ecmwf_metadata.get("metadata_line")
 
     print("Stage plan: training=skipped, prediction=skipped, dashboard=running from cached artifacts")
     print(f"Cached next-day table: {cached['paths']['next_day_predictions_csv']}")
@@ -6790,6 +7128,7 @@ def run_dashboard_stage_from_cached_artifacts(
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ecmwf_speed_series=ecmwf_speed_series,
     )
     save_prediction_plot(
         table,
@@ -6803,6 +7142,7 @@ def run_dashboard_stage_from_cached_artifacts(
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ecmwf_speed_series=ecmwf_speed_series,
         mobile=True,
     )
 
@@ -6868,6 +7208,10 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
+        ecmwf_speed_series=ecmwf_speed_series,
+        ecmwf_metadata_text=(
+            str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+        ),
     )
     save_current_day_plot(
         current_day_table,
@@ -6885,6 +7229,10 @@ def run_dashboard_stage_from_cached_artifacts(
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
+        ecmwf_speed_series=ecmwf_speed_series,
+        ecmwf_metadata_text=(
+            str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+        ),
     )
 
     daily_mae_csv_src: Path | None = None
@@ -6981,6 +7329,7 @@ def run_dashboard_stage_from_cached_artifacts(
             harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             harmonie_arrival_estimate_method=harmonie_arrival_estimate.method,
             harmonie_arrival_history_utc=harmonie_arrival_history_utc,
+            ecmwf_metadata=ecmwf_metadata,
             companion_app_base_url=args.companion_app_base_url,
         )
         if args.git_auto_push_pages:
@@ -7003,6 +7352,8 @@ def run_dashboard_stage_from_cached_artifacts(
             "use_existing_artifacts": bool(args.use_existing_artifacts),
             "plot_refreshed_at_utc": plot_updated_at_utc,
             "plot_updated_at_utc": plot_updated_at_utc,
+            "ecmwf": ecmwf_metadata,
+            "ecmwf_run_identity": ecmwf_metadata.get("run_identity"),
             "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
             "harmonie_time_kind": harmonie_time_kind,
             "harmonie_expected_next_at_utc": (
@@ -7190,6 +7541,8 @@ def main() -> None:
             load_harmonie_metadata=_load_latest_harmonie_metadata_time,
             auto_push=auto_push_dashboard_changes,
             load_harmonie_arrival_estimate=_load_harmonie_arrival_estimate,
+            save_next_day_plot=save_prediction_plot,
+            load_ecmwf_overlay=_load_dashboard_ecmwf,
         )
         return
 
@@ -8419,7 +8772,15 @@ def main() -> None:
 
     # Both super-local prediction tables have now been generated successfully.
     prediction_updated_at_utc = datetime.now(timezone.utc).isoformat()
-    plot_updated_at_utc = datetime.now(timezone.utc).isoformat()
+    plot_updated_at_dt = datetime.now(timezone.utc)
+    plot_updated_at_utc = plot_updated_at_dt.isoformat()
+    ecmwf_speed_series, ecmwf_metadata = _load_dashboard_ecmwf(
+        args,
+        current_day_table=current_day_table,
+        next_day_table=table,
+        cutoff_utc=plot_updated_at_dt,
+    )
+    ecmwf_metadata_text = ecmwf_metadata.get("metadata_line")
     save_prediction_plot(
         table,
         plot_path,
@@ -8432,6 +8793,7 @@ def main() -> None:
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ecmwf_speed_series=ecmwf_speed_series,
     )
     save_prediction_plot(
         table,
@@ -8445,6 +8807,7 @@ def main() -> None:
         plot_update_interval_minutes=args.plot_update_interval_minutes,
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ecmwf_speed_series=ecmwf_speed_series,
         mobile=True,
     )
 
@@ -8465,6 +8828,10 @@ def main() -> None:
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
+        ecmwf_speed_series=ecmwf_speed_series,
+        ecmwf_metadata_text=(
+            str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+        ),
     )
     save_current_day_plot(
         current_day_table,
@@ -8482,6 +8849,10 @@ def main() -> None:
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
+        ecmwf_speed_series=ecmwf_speed_series,
+        ecmwf_metadata_text=(
+            str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+        ),
     )
     _log_rss("plot_generation_complete")
     if not is_test_mode:
@@ -8655,6 +9026,7 @@ def main() -> None:
             harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             harmonie_arrival_estimate_method=harmonie_arrival_estimate.method,
             harmonie_arrival_history_utc=harmonie_arrival_history_utc,
+            ecmwf_metadata=ecmwf_metadata,
             companion_app_base_url=args.companion_app_base_url,
         )
         _log_rss("dashboard_rendering_complete")
@@ -8749,6 +9121,8 @@ def main() -> None:
         "prediction_generated_at_utc": prediction_generated_at_utc,
         "prediction_updated_at_utc": prediction_updated_at_utc,
         "plot_updated_at_utc": plot_updated_at_utc,
+        "ecmwf": ecmwf_metadata,
+        "ecmwf_run_identity": ecmwf_metadata.get("run_identity"),
         "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
         "harmonie_time_kind": harmonie_time_kind,
         "harmonie_expected_next_at_utc": (

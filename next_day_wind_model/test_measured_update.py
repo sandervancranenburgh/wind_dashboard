@@ -319,5 +319,85 @@ class MeasuredStageTests(unittest.TestCase):
             self.assertEqual(result["observation_rows"], 3)
 
 
+    def test_new_ecmwf_identity_refreshes_both_plots_without_prediction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path, out_dir, web_dir, args = self._prepare(Path(directory))
+            next_times = pd.date_range("2026-07-18T08:00:00+02:00", periods=3, freq="1h")
+            pd.DataFrame(
+                {
+                    "target_time_utc": next_times.tz_convert("UTC"),
+                    "target_time_local": next_times,
+                    "lstm_pred_wind_speed": [8.0, 9.0, 10.0],
+                }
+            ).to_csv(out_dir / "next_day_predictions.csv", index=False)
+            metadata_path = out_dir / "metadata_update.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["ecmwf_run_identity"] = "old-run"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            overlay = pd.DataFrame(
+                {
+                    "time_local": pd.to_datetime(
+                        ["2026-07-17T09:00:00Z", "2026-07-18T09:00:00Z"],
+                        utc=True,
+                    ),
+                    "wind_speed_knots": [8.0, 9.0],
+                }
+            )
+            selected = {
+                "available": True,
+                "run_identity": "new-run",
+                "run_time_utc": "2026-07-17T00:00:00Z",
+                "last_fetch_utc": "2026-07-17T08:00:00Z",
+                "next_expected_fetch_utc": "2026-07-17T14:00:00Z",
+                "arrival_estimate_method": "median_recent_complete_run_latency",
+                "metadata_line": "Last ECMWF fetch: 10:00 - Next expected fetch: ~16:00",
+            }
+            current_overlays: list[pd.DataFrame] = []
+            next_overlays: list[pd.DataFrame] = []
+
+            def save_current(table, path, local_tz, **kwargs):
+                current_overlays.append(kwargs["ecmwf_speed_series"].copy())
+                self._save_plot(table, path, local_tz, **kwargs)
+
+            def save_next(table, path, **kwargs):
+                next_overlays.append(kwargs["ecmwf_speed_series"].copy())
+                Path(path).write_bytes(b"next-mobile" if kwargs.get("mobile") else b"next")
+
+            result = run_measured_only_stage(
+                args=args,
+                db_path=db_path,
+                out_dir=out_dir,
+                build_plot_frame=_fixture_build_plot_frame,
+                save_current_day_plot=save_current,
+                save_next_day_plot=save_next,
+                load_ecmwf_overlay=lambda *args, **kwargs: (overlay.copy(), dict(selected)),
+                load_prediction_history=lambda **kwargs: [],
+                write_interactive_assets=self._write_interactive,
+                load_harmonie_metadata=lambda *args: (None, "fetched"),
+                auto_push=mock.Mock(),
+                now_utc=NOW_UTC,
+            )
+
+            self.assertTrue(result["ecmwf_changed"])
+            self.assertTrue(result["next_day_rendered"])
+            self.assertEqual(result["ecmwf_run_identity"], "new-run")
+            self.assertEqual(len(current_overlays), 2)
+            self.assertEqual(len(next_overlays), 2)
+            for rendered_overlay in current_overlays + next_overlays:
+                pd.testing.assert_frame_equal(rendered_overlay, overlay)
+            self.assertTrue((web_dir / "next_day_predictions.png").is_file())
+            self.assertTrue((web_dir / "next_day_predictions_mobile.png").is_file())
+            artifact_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact_metadata["ecmwf_run_identity"], "new-run")
+            self.assertEqual(artifact_metadata["ecmwf"]["last_fetch_utc"], selected["last_fetch_utc"])
+            web_metadata = json.loads(
+                (web_dir / "metadata_update.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(web_metadata["ecmwf_run_time_utc"], selected["run_time_utc"])
+            index = (web_dir / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("keep-next-token", index)
+
+
 if __name__ == "__main__":
     unittest.main()

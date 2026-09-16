@@ -141,6 +141,7 @@ class OperationalSnapshot:
     forecast: ForecastIdentity | None
     model_fingerprint: str | None
     cached_artifacts: CachedArtifactStatus
+    ecmwf_run_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,40 @@ def latest_observation_timestamp(db_path: Path, site: str) -> int | None:
             (site,),
         ).fetchone()
     return None if row is None or row[0] is None else int(row[0])
+
+
+def load_latest_complete_ecmwf_identity(
+    archive_db: Path,
+    *,
+    site: str,
+    cutoff_utc: datetime | None = None,
+) -> str | None:
+    """Return one cheap identity without loading forecast point history."""
+
+    if not archive_db.is_file():
+        return None
+    cutoff = (cutoff_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    try:
+        with _readonly_connection(archive_db) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            row = conn.execute(
+                """
+                SELECT run_time, completed_time
+                FROM forecast_collection_runs
+                WHERE provider='ECMWF' AND model='IFS' AND site=?
+                  AND status='complete' AND completed_time IS NOT NULL
+                  AND julianday(run_time) <= julianday(?)
+                  AND julianday(completed_time) <= julianday(?)
+                ORDER BY julianday(run_time) DESC
+                LIMIT 1
+                """,
+                (site, cutoff, cutoff),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return f"{row[0]}|{row[1]}"
 
 
 def load_latest_forecast_identity(
@@ -507,6 +542,13 @@ def decide_execution_mode(
         return ExecutionDecision("forecast_changed", "forecast content changed", True, False)
     if state.get("cached_prediction_fingerprint") != snapshot.cached_artifacts.fingerprint:
         return ExecutionDecision("recovery_cached_prediction_changed", "cached prediction content changed", True, False)
+    if state.get("ecmwf_run_identity") != snapshot.ecmwf_run_identity:
+        return ExecutionDecision(
+            "ecmwf_changed",
+            "latest complete ECMWF run changed",
+            False,
+            True,
+        )
 
     previous_obs = state.get("observation_max_ts")
     current_obs = snapshot.observation_max_ts
@@ -567,6 +609,7 @@ def write_success_state(
         "forecast_fingerprint": snapshot.forecast.fingerprint,
         "model_fingerprint": snapshot.model_fingerprint,
         "cached_prediction_fingerprint": snapshot.cached_artifacts.fingerprint,
+        "ecmwf_run_identity": snapshot.ecmwf_run_identity,
         "observation_max_ts": snapshot.observation_max_ts,
         "source_run_ts": snapshot.forecast.source_run_ts,
         "stored_run_ts": snapshot.forecast.run_ts,
@@ -594,6 +637,10 @@ def local_day_utc_bounds(local_timezone: str, now_utc: datetime | None = None) -
 def _launcher_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--db", default="data/wind_data_all_sites.db")
+    parser.add_argument(
+        "--ecmwf-archive-db",
+        default="data/ecmwf_archive/ecmwf_shadow.sqlite",
+    )
     parser.add_argument("--site", default="valkenburgsemeer")
     parser.add_argument("--model", default="HARMONIE")
     parser.add_argument("--target-hours", type=int, default=24)
@@ -633,6 +680,11 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         web_out_dir=Path(args.web_out_dir),
         now_utc=now_utc,
     )
+    ecmwf_run_identity = load_latest_complete_ecmwf_identity(
+        Path(args.ecmwf_archive_db),
+        site=args.site,
+        cutoff_utc=now_utc,
+    )
     return OperationalSnapshot(
         site=args.site,
         model=args.model,
@@ -640,6 +692,7 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         forecast=forecast,
         model_fingerprint=model_fingerprint,
         cached_artifacts=cached,
+        ecmwf_run_identity=ecmwf_run_identity,
     )
 
 
@@ -665,10 +718,12 @@ def _log_decision(decision: ExecutionDecision, snapshot: OperationalSnapshot | N
     forecast_hash = snapshot.forecast.fingerprint if snapshot and snapshot.forecast else None
     model_hash = snapshot.model_fingerprint if snapshot else None
     obs_ts = snapshot.observation_max_ts if snapshot else None
+    ecmwf_identity = snapshot.ecmwf_run_identity if snapshot else None
     print(
         f"execution_mode={decision.mode} reason={json.dumps(decision.reason)} "
         f"forecast_fingerprint={_abbrev(forecast_hash)} "
-        f"model_fingerprint={_abbrev(model_hash)} observation_max_ts={obs_ts}",
+        f"model_fingerprint={_abbrev(model_hash)} observation_max_ts={obs_ts} "
+        f"ecmwf_run_identity={json.dumps(ecmwf_identity)}",
         flush=True,
     )
 

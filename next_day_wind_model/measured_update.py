@@ -188,6 +188,7 @@ def _measured_dashboard_index_bytes(
     *,
     generated_at_utc: str,
     local_timezone: str,
+    refresh_next_day: bool = False,
 ) -> bytes:
     """Advance only current-day cache tokens in an existing dashboard page."""
     generated = datetime.fromisoformat(generated_at_utc.replace("Z", "+00:00"))
@@ -227,13 +228,27 @@ def _measured_dashboard_index_bytes(
         lambda match: match.group(1) + cache_token,
         text,
     )
+    next_asset_count = 0
+    if refresh_next_day:
+        next_asset_pattern = re.compile(
+            r'(next_day_predictions(?:_mobile)?\.png\?v=)[^"\'&<>\s]+'
+        )
+        text, next_asset_count = next_asset_pattern.subn(
+            lambda match: match.group(1) + cache_token, text
+        )
     text, version_count = re.subn(
         r'(currentVersion:\s*)"[^"]*"',
         lambda match: match.group(1) + json.dumps(version),
         text,
         count=1,
     )
-    if meta_count != 1 or current_asset_count < 2 or current_json_count < 1 or version_count != 1:
+    if (
+        meta_count != 1
+        or current_asset_count < 2
+        or current_json_count < 1
+        or version_count != 1
+        or (refresh_next_day and next_asset_count < 1)
+    ):
         raise ValueError("dashboard index lacks expected current-day version markers")
     return text.encode("utf-8")
 
@@ -258,6 +273,8 @@ def run_measured_only_stage(
     load_harmonie_metadata: Callable[..., tuple[Any, str]],
     auto_push: Callable[..., dict[str, Any]],
     load_harmonie_arrival_estimate: Callable[..., Any] | None = None,
+    save_next_day_plot: Callable[..., None] | None = None,
+    load_ecmwf_overlay: Callable[..., tuple[pd.DataFrame, dict[str, Any]]] | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     current_csv = out_dir / "current_day_predictions.csv"
@@ -286,6 +303,18 @@ def run_measured_only_stage(
         build_plot_frame=build_plot_frame,
     )
     current_csv_changed = write_bytes_if_changed(current_csv, _table_csv_bytes(composed))
+    next_csv = out_dir / "next_day_predictions.csv"
+    next_day_table = pd.DataFrame()
+    if next_csv.is_file():
+        next_day_table = pd.read_csv(next_csv)
+        if "target_time_utc" in next_day_table:
+            next_day_table["target_time_utc"] = pd.to_datetime(
+                next_day_table["target_time_utc"], utc=True, errors="coerce"
+            )
+        if "target_time_local" in next_day_table:
+            next_day_table["target_time_local"] = pd.to_datetime(
+                next_day_table["target_time_local"], utc=True, errors="coerce"
+            ).dt.tz_convert(ZoneInfo(args.local_timezone))
 
     prediction_generated_at_utc = (
         _metadata_value(metadata, "prediction_generated_at_utc")
@@ -329,7 +358,32 @@ def run_measured_only_stage(
         harmonie_arrival_history_utc = [
             value.isoformat() for value in estimate.arrivals_utc
         ]
-    plot_updated_at_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    plot_updated_at_dt = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    plot_updated_at_utc = plot_updated_at_dt.isoformat()
+    ecmwf_speed_series = pd.DataFrame()
+    ecmwf_metadata: dict[str, Any] = {
+        "available": False,
+        "reason": "ECMWF overlay loader unavailable",
+        "metadata_line": None,
+        "run_identity": None,
+    }
+    if load_ecmwf_overlay is not None and not next_day_table.empty:
+        try:
+            ecmwf_speed_series, ecmwf_metadata = load_ecmwf_overlay(
+                args,
+                current_day_table=composed,
+                next_day_table=next_day_table,
+                cutoff_utc=plot_updated_at_dt,
+            )
+        except Exception as exc:
+            print(
+                "Measured-only stage: ECMWF overlay unavailable; "
+                f"continuing without it: {type(exc).__name__}: {exc}"
+            )
+    ecmwf_metadata_text = ecmwf_metadata.get("metadata_line")
+    ecmwf_changed = (
+        metadata.get("ecmwf_run_identity") != ecmwf_metadata.get("run_identity")
+    )
     target_day = pd.to_datetime(composed["time_local"]).dt.tz_convert(
         ZoneInfo(args.local_timezone)
     ).iloc[0].date()
@@ -345,6 +399,9 @@ def run_measured_only_stage(
 
     current_png = out_dir / "current_day_predictions.png"
     current_mobile_png = out_dir / "current_day_predictions_mobile.png"
+    next_png = out_dir / "next_day_predictions.png"
+    next_mobile_png = out_dir / "next_day_predictions_mobile.png"
+    next_day_rendered = False
     artifact_changes: dict[str, bool] = {"current_day_predictions.csv": current_csv_changed}
     with tempfile.TemporaryDirectory(prefix="wind-measured-render-") as temporary_dir:
         temporary = Path(temporary_dir)
@@ -365,6 +422,10 @@ def run_measured_only_stage(
             harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
+            ecmwf_speed_series=ecmwf_speed_series,
+            ecmwf_metadata_text=(
+                str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+            ),
         )
         save_current_day_plot(
             composed,
@@ -382,9 +443,50 @@ def run_measured_only_stage(
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
             mobile=True,
+            ecmwf_speed_series=ecmwf_speed_series,
+            ecmwf_metadata_text=(
+                str(ecmwf_metadata_text) if ecmwf_metadata_text else None
+            ),
         )
         artifact_changes[current_png.name] = _copy_if_changed(temporary_png, current_png)
         artifact_changes[current_mobile_png.name] = _copy_if_changed(temporary_mobile_png, current_mobile_png)
+        if (
+            ecmwf_changed
+            and save_next_day_plot is not None
+            and not next_day_table.empty
+        ):
+            temporary_next = temporary / next_png.name
+            temporary_next_mobile = temporary / next_mobile_png.name
+            common_next_kwargs = {
+                "local_tz": args.local_timezone,
+                "plot_updated_at_utc": plot_updated_at_utc,
+                "prediction_updated_at_utc": prediction_updated_at_utc,
+                "model_trained_at_utc": model_trained_at_utc,
+                "harmonie_time_utc": harmonie_time_utc,
+                "harmonie_time_kind": harmonie_time_kind,
+                "plot_update_interval_minutes": plot_update_interval_minutes,
+                "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
+                "harmonie_expected_next_at_utc": harmonie_expected_next_at_utc,
+                "ecmwf_speed_series": ecmwf_speed_series,
+            }
+            save_next_day_plot(
+                next_day_table,
+                temporary_next,
+                **common_next_kwargs,
+            )
+            save_next_day_plot(
+                next_day_table,
+                temporary_next_mobile,
+                mobile=True,
+                **common_next_kwargs,
+            )
+            artifact_changes[next_png.name] = _copy_if_changed(
+                temporary_next, next_png
+            )
+            artifact_changes[next_mobile_png.name] = _copy_if_changed(
+                temporary_next_mobile, next_mobile_png
+            )
+            next_day_rendered = True
 
         interactive_dir = temporary / "interactive"
         interactive_dir.mkdir()
@@ -412,6 +514,9 @@ def run_measured_only_stage(
             "current_day_predictions.png": current_png,
             "current_day_predictions_mobile.png": current_mobile_png,
         }
+        if next_day_rendered:
+            publish_sources[next_png.name] = next_png
+            publish_sources[next_mobile_png.name] = next_mobile_png
         if "current_day_json" in interactive:
             publish_sources["current_day_interactive_data.json"] = (
                 interactive_dir / interactive["current_day_json"]
@@ -420,6 +525,14 @@ def run_measured_only_stage(
             name: _copy_if_changed(source, web_out_dir / name)
             for name, source in publish_sources.items()
         }
+
+    if ecmwf_changed:
+        metadata["ecmwf"] = ecmwf_metadata
+        metadata["ecmwf_run_identity"] = ecmwf_metadata.get("run_identity")
+        artifact_changes[metadata_path.name] = write_bytes_if_changed(
+            metadata_path,
+            (json.dumps(metadata, indent=2) + "\n").encode("utf-8"),
+        )
 
     meaningful_web_change = any(web_changes.values())
     latest_observation_utc = observations.index.max().tz_convert("UTC").isoformat()
@@ -453,6 +566,15 @@ def run_measured_only_stage(
                     "latest_observation_time_utc": latest_observation_utc,
                     "prediction_generated_at_utc": prediction_generated_at_utc,
                     "prediction_updated_at_utc": prediction_updated_at_utc,
+                    "ecmwf": ecmwf_metadata,
+                    "ecmwf_run_time_utc": ecmwf_metadata.get("run_time_utc"),
+                    "ecmwf_last_fetch_utc": ecmwf_metadata.get("last_fetch_utc"),
+                    "ecmwf_next_expected_fetch_utc": ecmwf_metadata.get(
+                        "next_expected_fetch_utc"
+                    ),
+                    "ecmwf_arrival_estimate_method": ecmwf_metadata.get(
+                        "arrival_estimate_method"
+                    ),
                     "harmonie_fetched_at_utc": None if harmonie_time_utc is None else str(harmonie_time_utc),
                     "harmonie_time_kind": harmonie_time_kind,
                     "harmonie_expected_next_at_utc": (
@@ -482,6 +604,7 @@ def run_measured_only_stage(
                 index_bytes,
                 generated_at_utc=generated_at,
                 local_timezone=args.local_timezone,
+                refresh_next_day=next_day_rendered,
             ),
         )
 
@@ -503,6 +626,9 @@ def run_measured_only_stage(
         "execution_mode": "measured_only",
         "observation_rows": int(len(observations)),
         "latest_observation_time_utc": latest_observation_utc,
+        "ecmwf_changed": ecmwf_changed,
+        "ecmwf_run_identity": ecmwf_metadata.get("run_identity"),
+        "next_day_rendered": next_day_rendered,
         "artifact_changes": artifact_changes,
         "web_changes": web_changes,
         "git_publish": git_publish,

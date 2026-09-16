@@ -1,0 +1,25 @@
+[Unit]
+Description=Wind Fetcher 2 production ECMWF IFS forecast-vintage collector
+Documentation=file://@REPO_ROOT@/docs/ecmwf_production_operations.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+ExecStart=@PYTHON@ @REPO_ROOT@/scripts/ecmwf_shadow_collector.py --config @CONFIG@ --data-dir @DATA_DIR@
+TimeoutStartSec=12min
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wind-fetcher2-ecmwf
+
+# Read the production checkout and dedicated environment, but write only the
+# independent ECMWF forecast-vintage archive and the private temporary tree.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@DATA_DIR@
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

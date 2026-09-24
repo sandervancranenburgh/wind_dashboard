@@ -20,12 +20,12 @@
     "completed_time_utc": "2026-09-24T12:33:20.188244Z",
     "database_open_mode": "read-only/query-only",
     "estimated_latency_hours": 7.300792795416667,
-    "information_cutoff_utc": "2026-09-24T19:12:05.081444Z",
+    "information_cutoff_utc": "2026-09-24T19:18:08.555893Z",
     "last_fetch_utc": "2026-09-24T12:33:20.188244Z",
-    "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~21:18",
+    "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~25 September 03:18",
     "model_version": "50r1",
-    "next_expected_fetch_utc": "2026-09-24T19:18:02.854064Z",
-    "next_expected_run_utc": "2026-09-24T12:00:00Z",
+    "next_expected_fetch_utc": "2026-09-25T01:18:02.854064Z",
+    "next_expected_run_utc": "2026-09-24T18:00:00Z",
     "reason": null,
     "resolution": "0.25 degrees",
     "rows_loaded": 16,
@@ -39,9 +39,9 @@
   },
   "ecmwf_arrival_estimate_method": "median_recent_complete_run_latency",
   "ecmwf_last_fetch_utc": "2026-09-24T12:33:20.188244Z",
-  "ecmwf_next_expected_fetch_utc": "2026-09-24T19:18:02.854064Z",
+  "ecmwf_next_expected_fetch_utc": "2026-09-25T01:18:02.854064Z",
   "ecmwf_run_time_utc": "2026-09-24T06:00:00Z",
-  "generated_at_utc": "2026-09-24T19:12:07.343328+00:00",
+  "generated_at_utc": "2026-09-24T19:18:10.819755+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
     "2026-09-23T11:42:05.585000+00:00",
@@ -78,11 +78,11 @@
     "current_day_interactive_data.json",
     "next_day_interactive_data.json"
   ],
-  "latest_observation_time_utc": "2026-09-24T19:11:13+00:00",
+  "latest_observation_time_utc": "2026-09-24T19:17:13+00:00",
   "measured_only_update": true,
   "model_last_trained_at_utc": "2026-09-12T05:25:17.609879+00:00",
   "plot_update_interval_minutes": 6,
-  "plot_updated_at_utc": "2026-09-24T19:12:05.081444+00:00",
+  "plot_updated_at_utc": "2026-09-24T19:18:08.555893+00:00",
   "prediction_generated_at_utc": "2026-09-24T18:42:12.778106+00:00",
   "prediction_updated_at_utc": "2026-09-24T18:42:29.485612+00:00",
   "static_images": [
@@ -96,5 +96,5 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-09-24T19:12:07.343328+00:00"
+  "static_plot_generated_at_utc": "2026-09-24T19:18:10.819755+00:00"
 }

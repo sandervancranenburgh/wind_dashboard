@@ -42,6 +42,11 @@ class WeatherClassifierTests(unittest.TestCase):
         self.assertEqual(derive_weather_code(cloud_cover_pct=79.999), 2)
         self.assertEqual(derive_weather_code(cloud_cover_pct=80), 3)
 
+    def test_total_high_cloud_still_classifies_as_overcast(self) -> None:
+        # P1 parameter 71 is total cloud cover; layer composition does not
+        # override the strict WMO/Open-Meteo total-cloud threshold.
+        self.assertEqual(derive_weather_code(cloud_cover_pct=95), 3)
+
     def test_precipitation_boundaries(self) -> None:
         cases = [
             (0.01, 51), (0.499, 51), (0.5, 53), (0.999, 53),
@@ -242,6 +247,11 @@ class WeatherStorageTests(unittest.TestCase):
             )
             self.assertEqual(timeline["weather_source"].tolist(), ["knmi_p1", "windsurfice", "knmi_p1"])
             self.assertEqual(timeline["forecast_temperature_c"].tolist(), [10, 21, 12])
+            self.assertEqual(
+                timeline["weather_run_utc"].iloc[[0, 2]].tolist(),
+                ["2026-09-25T00:00:00+00:00", "2026-09-25T00:00:00+00:00"],
+            )
+            self.assertTrue(pd.isna(timeline["weather_run_utc"].iloc[1]))
             before_fetch = build_weather_timeline(
                 db_path, site="valkenburgsemeer", target_times=targets,
                 fallback_temperature_c=[20, 21, 22], fallback_weather_code=[0, 0, 0],

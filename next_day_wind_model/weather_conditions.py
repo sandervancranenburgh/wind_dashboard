@@ -301,10 +301,12 @@ def build_weather_timeline(
     invalid_fallback = ~(np.isfinite(chosen_t) & np.isfinite(chosen_c))
     chosen_t[invalid_fallback] = np.nan
     chosen_c[invalid_fallback] = np.nan
+    chosen_run = np.full(len(targets), None, dtype=object)
 
     diagnostic_columns = [
-        "total_cloud_cover_pct", "total_precip_hourly_mm", "snowfall_hourly_cm",
-        "visibility_m",
+        "total_cloud_cover_pct", "low_cloud_cover_pct",
+        "medium_cloud_cover_pct", "high_cloud_cover_pct",
+        "total_precip_hourly_mm", "snowfall_hourly_cm", "visibility_m",
     ]
     diagnostics = {name: np.full(len(targets), np.nan) for name in diagnostic_columns}
     if len(targets) and Path(db_path).exists():
@@ -369,6 +371,11 @@ def build_weather_timeline(
                 chosen_t[use_p1] = p1_t[use_p1]
                 chosen_c[use_p1] = p1_c[use_p1]
                 chosen_source[use_p1] = "knmi_p1"
+                p1_runs = pd.to_datetime(selected["run_ts"], utc=True, errors="coerce")
+                chosen_run[use_p1] = [
+                    value.isoformat() if not pd.isna(value) else None
+                    for value in p1_runs[use_p1]
+                ]
                 for name in diagnostics:
                     if name in selected:
                         diagnostics[name] = pd.to_numeric(selected[name], errors="coerce").to_numpy(float)
@@ -379,6 +386,7 @@ def build_weather_timeline(
         {
             "forecast_temperature_c": chosen_t,
             "weather_code": pd.array(chosen_c, dtype="Int64"),
+            "weather_run_utc": chosen_run,
             "weather_source": chosen_source,
             "is_daylight": [is_daylight(value, latitude, longitude) for value in targets],
             **diagnostics,

@@ -1588,6 +1588,16 @@ def _weather_image(code: object, daylight: object) -> np.ndarray | None:
     return _WEATHER_IMAGE_CACHE[path]
 
 
+WEATHER_ICON_ZOOM_DESKTOP = 0.36
+WEATHER_ICON_ZOOM_MOBILE = 0.29
+WEATHER_TEMPERATURE_Y = 0.82
+WEATHER_ICON_Y = 0.20
+
+
+def _weather_icon_zoom(*, mobile: bool) -> float:
+    return WEATHER_ICON_ZOOM_MOBILE if mobile else WEATHER_ICON_ZOOM_DESKTOP
+
+
 def _draw_current_weather_strip(
     weather_ax: plt.Axes,
     table: pd.DataFrame,
@@ -1599,6 +1609,9 @@ def _draw_current_weather_strip(
     boundaries = pd.date_range(day_start + pd.Timedelta(hours=8), periods=15, freq="1h")
     boundary_x = mdates.date2num(boundaries.to_pydatetime()).astype(float)
     icon_count = 0
+    temperature_artists: list[object] = []
+    icon_artists: list[object] = []
+    icon_zoom = _weather_icon_zoom(mobile=mobile)
     for index in range(14):
         left, right = float(boundary_x[index]), float(boundary_x[index + 1])
         center = (left + right) / 2.0
@@ -1607,19 +1620,19 @@ def _draw_current_weather_strip(
             linewidth=0, zorder=0,
         )
         row = rows.iloc[index]
-        weather_ax.text(
-            center, 0.79, conventional_degree_label(row.get("forecast_temperature_c")),
+        temperature_artists.append(weather_ax.text(
+            center, WEATHER_TEMPERATURE_Y, conventional_degree_label(row.get("forecast_temperature_c")),
             ha="center", va="center", fontsize=9,
             fontweight="semibold", zorder=2,
-        )
+        ))
         image = _weather_image(row.get("weather_code"), row.get("is_daylight"))
         if image is not None:
-            weather_ax.add_artist(
-                AnnotationBbox(
-                    OffsetImage(image, zoom=0.38 if mobile else 0.50),
-                    (center, 0.30), frameon=False, pad=0, zorder=1.5,
-                )
+            icon = AnnotationBbox(
+                OffsetImage(image, zoom=icon_zoom),
+                (center, WEATHER_ICON_Y), frameon=False, pad=0, zorder=1.5,
             )
+            weather_ax.add_artist(icon)
+            icon_artists.append(icon)
             icon_count += 1
     for value in boundary_x:
         weather_ax.axvline(value, color="#d8d8d8", linewidth=0.7, zorder=1)
@@ -1633,51 +1646,78 @@ def _draw_current_weather_strip(
         "weather_cell_count": 14,
         "weather_icon_count": icon_count,
         "weather_cell_boundaries": [float(value) for value in boundary_x],
-        "weather_icon_zoom": 0.38 if mobile else 0.50,
+        "weather_background_count": 14,
+        "weather_separator_count": 15,
+        "weather_temperature_y": WEATHER_TEMPERATURE_Y,
+        "weather_icon_y": WEATHER_ICON_Y,
+        "weather_icon_zoom": icon_zoom,
+        "_weather_temperature_artists": temperature_artists,
+        "_weather_icon_artists": icon_artists,
     }
 
 
-def _draw_embedded_weather_strip(
-    ax: plt.Axes,
+def _draw_next_weather_strip(
+    weather_ax: plt.Axes,
     table: pd.DataFrame,
     local_tz: str,
-    y_upper: float,
     *,
     mobile: bool,
 ) -> dict[str, object]:
     _, rows = _weather_cell_rows(table, "target_time_local", local_tz)
     icon_count = 0
-    weather_artists: list[object] = []
+    temperature_artists: list[object] = []
+    icon_artists: list[object] = []
+    icon_zoom = _weather_icon_zoom(mobile=mobile)
     for index in range(14):
+        left, right = float(index), float(index + 1)
+        center = (left + right) / 2.0
+        weather_ax.axvspan(
+            left, right, color="white", alpha=0.19 if index % 2 == 0 else 0.12,
+            linewidth=0, zorder=0,
+        )
         row = rows.iloc[index]
-        weather_artists.append(ax.text(
-            index + 0.5, 1.65,
+        temperature_artists.append(weather_ax.text(
+            center, WEATHER_TEMPERATURE_Y,
             conventional_degree_label(row.get("forecast_temperature_c")),
             ha="center", va="center", fontsize=9,
-            fontweight="semibold", zorder=0.9,
+            fontweight="semibold", zorder=2,
         ))
         image = _weather_image(row.get("weather_code"), row.get("is_daylight"))
         if image is not None:
             icon = AnnotationBbox(
-                OffsetImage(image, zoom=0.22 if mobile else 0.20),
-                (index + 0.5, 0.68), frameon=False, pad=0, zorder=0.85,
+                OffsetImage(image, zoom=icon_zoom),
+                (center, WEATHER_ICON_Y), frameon=False, pad=0, zorder=1.5,
             )
-            ax.add_artist(icon)
-            weather_artists.append(icon)
+            weather_ax.add_artist(icon)
+            icon_artists.append(icon)
             icon_count += 1
+    for value in range(15):
+        weather_ax.axvline(value, color="#d8d8d8", linewidth=0.7, zorder=1)
+    weather_ax.set_xlim(0.0, 14.0)
+    weather_ax.set_ylim(0.0, 1.0)
+    weather_ax.set_yticks([])
+    weather_ax.set_xticks(
+        np.arange(15, dtype=float),
+        [f"{hour:02d}h" for hour in range(8, 23)],
+    )
+    weather_ax.tick_params(axis="x", labelbottom=True, bottom=True)
+    weather_ax.grid(False)
+    for spine_name in ("left", "right", "top"):
+        weather_ax.spines[spine_name].set_visible(False)
     return {
         "weather_cell_count": 14,
         "weather_icon_count": icon_count,
         "weather_cell_boundaries": [float(value) for value in range(15)],
-        "weather_background_count": 0,
-        "weather_separator_count": 0,
-        "weather_temperature_y": 1.65,
-        "weather_icon_y": 0.68,
-        "weather_icon_zoom": 0.22 if mobile else 0.20,
-        "curve_zorder_min": min(float(line.get_zorder()) for line in ax.lines),
-        "weather_icon_zorder": 0.85,
-        "_weather_artists": weather_artists,
+        "weather_background_count": 14,
+        "weather_separator_count": 15,
+        "weather_temperature_y": WEATHER_TEMPERATURE_Y,
+        "weather_icon_y": WEATHER_ICON_Y,
+        "weather_icon_zoom": icon_zoom,
+        "_weather_temperature_artists": temperature_artists,
+        "_weather_icon_artists": icon_artists,
     }
+
+
 def _draw_sufficient_wind_threshold(ax: plt.Axes) -> None:
     ax.axhline(
         SUFFICIENT_WIND_THRESHOLD_KTS,
@@ -2567,14 +2607,20 @@ def save_prediction_plot(
             f"harmonie_max_clipped={harmonie_max > y_upper}"
         )
 
-    fig_size = (8.4, 8.8) if mobile else (14, 7.2)
+    fig_size = (8.4, 9.8) if mobile else (14, 8.2)
     title_fs = 14 if mobile else None
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
     meta_fs = 9
     meta_y = 1.17
-    fig, ax = plt.subplots(figsize=fig_size)
+    fig, (ax, weather_ax, direction_ax) = plt.subplots(
+        3,
+        1,
+        figsize=fig_size,
+        sharex=True,
+        gridspec_kw={"height_ratios": [5.0, 0.82, 0.48], "hspace": 0.10},
+    )
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     _draw_sufficient_wind_threshold(ax)
     marker_size = 3.0
@@ -2632,7 +2678,7 @@ def save_prediction_plot(
         y=1.23 if mobile else 1.20,
         pad=0,
     )
-    ax.set_xlabel("Time", fontsize=label_fs, labelpad=24 if mobile else 26)
+    ax.set_xlabel("")
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
     handles, labels = ax.get_legend_handles_labels()
@@ -2656,13 +2702,22 @@ def save_prediction_plot(
     legend.get_frame().set_facecolor("white")
     legend.get_frame().set_alpha(0.96)
     legend.set_zorder(20)
-    ax.set_xticks(x, table["hour_label"], rotation=0)
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)
     ax.set_ylim(0.0, y_upper)
-    weather_diagnostics = _draw_embedded_weather_strip(
-        ax, table, local_tz, y_upper, mobile=mobile
+    ax.tick_params(axis="x", labelbottom=False, bottom=False)
+    weather_diagnostics = _draw_next_weather_strip(
+        weather_ax, table, local_tz, mobile=mobile
     )
+    weather_ax.tick_params(axis="x", labelsize=tick_fs)
+    weather_ax.set_xlabel("")
+    direction_ax.set_xlim(0.0, len(table) - 1.0)
+    direction_ax.set_ylim(0.0, 1.0)
+    direction_ax.set_yticks([])
+    direction_ax.tick_params(axis="x", labelbottom=False, bottom=False)
+    direction_ax.grid(False)
+    for spine in direction_ax.spines.values():
+        spine.set_visible(False)
     metadata_artist = ax.text(
         0.015,
         meta_y,
@@ -2708,23 +2763,22 @@ def save_prediction_plot(
         clip_on=False,
     )
 
-    # Draw wind direction arrows under x-axis.
+    # Draw wind direction arrows below the weather time axis.
     # Mapping: up-arrow means South wind (from South), per user preference.
-    # Using x-axis transform keeps arrows below axis regardless of y-scale.
-    y_base_axes = -0.115 if mobile else -0.14
-    arrow_len_axes = 0.058 if mobile else 0.065
+    y_base = 0.28
+    arrow_len = 0.23 if mobile else 0.25
     direction_arrow_count = 0
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, SUPERLOCAL_FORECAST_COLOR)]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
-            dy = arrow_len_axes * np.cos(theta)
-            ax.annotate(
+            dy = arrow_len * np.cos(theta)
+            direction_ax.annotate(
                 "",
-                xy=(i + dx, y_base_axes + dy),
-                xytext=(i, y_base_axes),
-                xycoords=ax.get_xaxis_transform(),
-                textcoords=ax.get_xaxis_transform(),
+                xy=(i + dx, y_base + dy),
+                xytext=(i, y_base),
+                xycoords=direction_ax.transData,
+                textcoords=direction_ax.transData,
                 arrowprops={
                     "arrowstyle": "-|>",
                     "color": color,
@@ -2736,21 +2790,30 @@ def save_prediction_plot(
             )
             direction_arrow_count += 1
 
-    layout_top = 0.93 if mobile else 0.965
-    layout_bottom = 0.055 if mobile else 0.04
-    fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
+    fig.subplots_adjust(
+        left=0.11 if mobile else 0.07,
+        right=0.985 if mobile else 0.99,
+        bottom=0.055 if mobile else 0.045,
+        top=0.82,
+        hspace=0.10,
+    )
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
-    weather_artists = weather_diagnostics.pop("_weather_artists", [])
-    weather_artist_bounds_data: list[list[float]] = []
-    for artist in weather_artists:
-        bbox = artist.get_window_extent(renderer)
-        corners = ax.transData.inverted().transform(
-            [[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]]
-        )
-        weather_artist_bounds_data.append(
-            [float(corners[0, 0]), float(corners[0, 1]), float(corners[1, 0]), float(corners[1, 1])]
-        )
+    weather_temperature_artists = weather_diagnostics.pop("_weather_temperature_artists", [])
+    weather_icon_artists = weather_diagnostics.pop("_weather_icon_artists", [])
+
+    def _display_bounds(artists: list[object]) -> list[list[float]]:
+        return [
+            [float(bbox.x0), float(bbox.y0), float(bbox.x1), float(bbox.y1)]
+            for bbox in (artist.get_window_extent(renderer) for artist in artists)
+        ]
+
+    weather_temperature_bounds = _display_bounds(weather_temperature_artists)
+    weather_icon_bounds = _display_bounds(weather_icon_artists)
+    weather_overlap_count = sum(
+        icon[3] > temperature[1]
+        for icon, temperature in zip(weather_icon_bounds, weather_temperature_bounds)
+    )
 
     def _figure_bounds(artist: object) -> list[float]:
         bbox = artist.get_window_extent(renderer)
@@ -2770,9 +2833,16 @@ def save_prediction_plot(
             {
                 **weather_diagnostics,
                 "axis_count": len(fig.axes),
+                "axis_roles": ["wind_speed", "weather", "direction"],
+                "axes_positions": [
+                    [float(value) for value in axis.get_position().bounds]
+                    for axis in (ax, weather_ax, direction_ax)
+                ],
                 "x_limits": [float(value) for value in ax.get_xlim()],
                 "y_limits": [float(value) for value in ax.get_ylim()],
                 "y_ticks": [float(value) for value in ax.get_yticks()],
+                "x_tick_labels": [item.get_text() for item in weather_ax.get_xticklabels()],
+                "x_axis_labels": [axis.get_xlabel() for axis in (ax, weather_ax, direction_ax)],
                 "figure_size_inches": [
                     float(value) for value in fig.get_size_inches()
                 ],
@@ -2804,16 +2874,14 @@ def save_prediction_plot(
                         ecmwf_frame.get("time_local", pd.Series(dtype="datetime64[ns]"))
                     )
                 ],
-                "direction_annotation_count": len(ax.texts),
+                "direction_annotation_count": len(direction_ax.texts),
                 "direction_arrow_count": direction_arrow_count,
                 "spot_name": spot_name or "",
                 "model_id_text": model_id_artist.get_text(),
                 "header_bounds_figure": header_bounds,
-                "weather_artist_bounds_data": weather_artist_bounds_data,
-                "weather_artist_max_y": max(
-                    (bounds[3] for bounds in weather_artist_bounds_data),
-                    default=float("nan"),
-                ),
+                "weather_temperature_bounds_display": weather_temperature_bounds,
+                "weather_icon_bounds_display": weather_icon_bounds,
+                "weather_icon_temperature_overlap_count": weather_overlap_count,
             }
         )
     fig.savefig(plot_path, dpi=150)
@@ -3824,7 +3892,7 @@ def save_current_day_plot(
     xlim_right_num = float(mdates.date2num(xlim_right.to_pydatetime()))
     for axis in (ax, weather_ax, variability_ax, direction_ax):
         axis.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=plot_tz))
-        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H", tz=plot_tz))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%Hh", tz=plot_tz))
         axis.xaxis.set_minor_locator(mticker.NullLocator())
         axis.xaxis.set_minor_formatter(mticker.NullFormatter())
         axis.tick_params(axis="both", labelsize=tick_fs)
@@ -4150,6 +4218,21 @@ def save_current_day_plot(
     )
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
+    weather_temperature_artists = weather_diagnostics.pop("_weather_temperature_artists", [])
+    weather_icon_artists = weather_diagnostics.pop("_weather_icon_artists", [])
+
+    def _display_bounds(artists: list[object]) -> list[list[float]]:
+        return [
+            [float(bbox.x0), float(bbox.y0), float(bbox.x1), float(bbox.y1)]
+            for bbox in (artist.get_window_extent(renderer) for artist in artists)
+        ]
+
+    weather_temperature_bounds = _display_bounds(weather_temperature_artists)
+    weather_icon_bounds = _display_bounds(weather_icon_artists)
+    weather_overlap_count = sum(
+        icon[3] > temperature[1]
+        for icon, temperature in zip(weather_icon_bounds, weather_temperature_bounds)
+    )
 
     def _figure_bounds(artist: object) -> list[float]:
         bbox = artist.get_window_extent(renderer)
@@ -4178,6 +4261,13 @@ def save_current_day_plot(
                     for axis in (ax, weather_ax, variability_ax, direction_ax)
                 ],
                 "subplot_hspace": subplot_hspace,
+                "x_tick_labels": [
+                    item.get_text() for item in variability_ax.get_xticklabels()
+                ],
+                "x_axis_labels": [
+                    axis.get_xlabel()
+                    for axis in (ax, weather_ax, variability_ax, direction_ax)
+                ],
                 "x_limits": [float(value) for value in ax.get_xlim()],
                 "speed_y_limits": [float(value) for value in ax.get_ylim()],
                 "variability_y_limits": [
@@ -4227,6 +4317,9 @@ def save_current_day_plot(
                 ],
                 "spot_name": spot_name or "",
                 "header_bounds_figure": header_bounds,
+                "weather_temperature_bounds_display": weather_temperature_bounds,
+                "weather_icon_bounds_display": weather_icon_bounds,
+                "weather_icon_temperature_overlap_count": weather_overlap_count,
             }
         )
     fig.savefig(plot_path, dpi=150)

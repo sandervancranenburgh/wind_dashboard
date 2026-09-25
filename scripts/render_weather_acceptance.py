@@ -121,7 +121,7 @@ def main() -> int:
     exact_targets = current_hours[exact_mask].tz_convert("UTC")
     current_weather = _weather_for_targets(args.db, args.site, exact_targets, now)
     for column in current_weather.columns:
-        current[column] = None if column in {"weather_source", "is_daylight"} else np.nan
+        current[column] = None if column in {"weather_source", "weather_run_utc", "is_daylight"} else np.nan
         current.loc[exact_mask, column] = current_weather[column].to_numpy()
 
     next_day = pd.read_csv(args.next_csv)
@@ -234,7 +234,9 @@ def main() -> int:
     local_next["description"] = [weather_description(value) for value in local_next["weather_code"]]
     compact = local_next[local_next["time"].between("08:00", "21:00")][
         [
-            "time", "forecast_temperature_c", "total_cloud_cover_pct",
+            "time", "weather_run_utc", "forecast_temperature_c",
+            "total_cloud_cover_pct", "low_cloud_cover_pct",
+            "medium_cloud_cover_pct", "high_cloud_cover_pct",
             "total_precip_hourly_mm", "snowfall_hourly_cm", "visibility_m",
             "weather_code", "description", "weather_source", "is_daylight",
         ]

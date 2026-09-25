@@ -275,17 +275,24 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(current_diagnostics["weather_cell_count"], 14)
         self.assertEqual(current_diagnostics["weather_icon_count"], 14)
         self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
-        self.assertEqual(next_diagnostics["axis_count"], 1)
+        self.assertEqual(next_diagnostics["axis_count"], 3)
+        self.assertEqual(
+            next_diagnostics["axis_roles"],
+            ["wind_speed", "weather", "direction"],
+        )
         self.assertEqual(next_diagnostics["weather_cell_count"], 14)
         self.assertEqual(next_diagnostics["weather_icon_count"], 14)
-        self.assertEqual(next_diagnostics["weather_background_count"], 0)
-        self.assertEqual(next_diagnostics["weather_separator_count"], 0)
-        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.20)
-        self.assertGreaterEqual(
-            min(bounds[1] for bounds in next_diagnostics["weather_artist_bounds_data"]),
-            0.0,
-        )
-        self.assertLess(next_diagnostics["weather_artist_max_y"], 2.0)
+        self.assertEqual(next_diagnostics["weather_background_count"], 14)
+        self.assertEqual(next_diagnostics["weather_separator_count"], 15)
+        self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.36)
+        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.36)
+        self.assertEqual(current_diagnostics["weather_icon_temperature_overlap_count"], 0)
+        self.assertEqual(next_diagnostics["weather_icon_temperature_overlap_count"], 0)
+        expected_hours = [f"{hour:02d}h" for hour in range(8, 23)]
+        self.assertEqual(current_diagnostics["x_tick_labels"], expected_hours)
+        self.assertEqual(next_diagnostics["x_tick_labels"], expected_hours)
+        self.assertEqual(current_diagnostics["x_axis_labels"], ["", "", "", ""])
+        self.assertEqual(next_diagnostics["x_axis_labels"], ["", "", ""])
         self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())
         self.assertGreaterEqual(
             next_diagnostics["header_bounds_figure"]["metadata"][1],
@@ -297,10 +304,6 @@ class RendererIntegrationTests(unittest.TestCase):
         assert_header_bounds_do_not_overlap(self, current_diagnostics)
         assert_header_bounds_do_not_overlap(self, next_diagnostics)
         self.assertEqual(next_diagnostics["direction_arrow_count"], 30)
-        self.assertLess(
-            next_diagnostics["weather_icon_zorder"],
-            next_diagnostics["curve_zorder_min"],
-        )
 
     def test_mobile_weather_cells_remain_readable_and_aligned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -324,15 +327,13 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(current_diagnostics["subplot_hspace"], 0.10)
         self.assertEqual(current_diagnostics["weather_cell_count"], 14)
         self.assertEqual(next_diagnostics["weather_cell_count"], 14)
-        self.assertEqual(next_diagnostics["weather_background_count"], 0)
-        self.assertEqual(next_diagnostics["weather_separator_count"], 0)
-        self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.38)
-        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.22)
-        self.assertGreaterEqual(
-            min(bounds[1] for bounds in next_diagnostics["weather_artist_bounds_data"]),
-            0.0,
-        )
-        self.assertLess(next_diagnostics["weather_artist_max_y"], 2.0)
+        self.assertEqual(next_diagnostics["axis_count"], 3)
+        self.assertEqual(next_diagnostics["weather_background_count"], 14)
+        self.assertEqual(next_diagnostics["weather_separator_count"], 15)
+        self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.29)
+        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.29)
+        self.assertEqual(current_diagnostics["weather_icon_temperature_overlap_count"], 0)
+        self.assertEqual(next_diagnostics["weather_icon_temperature_overlap_count"], 0)
         self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())
         self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
         self.assertEqual(next_diagnostics["direction_arrow_count"], 30)

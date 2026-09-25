@@ -8888,6 +8888,10 @@ def main() -> None:
             "forecast_wind_dir_deg",
             "lstm_pred_wind_dir_deg",
             "delta_dir_lstm_minus_forecast",
+            "forecast_temperature_c",
+            "weather_code",
+            "weather_source",
+            "is_daylight",
         ]
     ].copy()
     table_for_csv["target_time_utc"] = table_for_csv["target_time_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")

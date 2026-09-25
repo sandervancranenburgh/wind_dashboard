@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
+from next_day_wind_model.weather_conditions import derive_windsurfice_weather
+
 
 @dataclass(frozen=True)
 class DatasetConfig:
@@ -52,6 +54,7 @@ FORECAST_METEO_FEATURE_GROUPS: dict[str, list[str]] = {
     ],
 }
 FORECAST_METEO_COLUMNS = FORECAST_METEO_FEATURE_GROUPS["all_meteo"]
+FORECAST_WEATHER_COLUMNS = [*FORECAST_METEO_COLUMNS, "forecast_weather_code"]
 
 
 def _to_float(value) -> float | None:
@@ -137,8 +140,13 @@ def load_forecast_vintages(
         filters.append("target_ts <= ?")
         params.append(int(target_end_ts_ms))
 
+    forecast_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(forecasts)")
+    }
+    weather_code_sql = "weather_code" if "weather_code" in forecast_columns else "NULL AS weather_code"
     query = f"""
-    SELECT run_ts, fetched_ts, target_ts, horizon_hr, wind_speed, wind_gust, wind_dir, payload
+    SELECT run_ts, fetched_ts, target_ts, horizon_hr, wind_speed, wind_gust, wind_dir,
+           {weather_code_sql}, payload
     FROM forecasts
     WHERE {' AND '.join(filters)}
     ORDER BY run_ts ASC, target_ts ASC
@@ -154,7 +162,7 @@ def load_forecast_vintages(
         raise ValueError("No forecast rows found for selected site/model.")
 
     records: List[Dict] = []
-    for run_ts, fetched_ts, target_ts, horizon_hr, wind_speed, wind_gust, wind_dir, payload_raw in rows:
+    for run_ts, fetched_ts, target_ts, horizon_hr, wind_speed, wind_gust, wind_dir, weather_code, payload_raw in rows:
         payload = json.loads(payload_raw) if payload_raw else {}
         records.append(
             {
@@ -204,6 +212,11 @@ def load_forecast_vintages(
                 "forecast_high_cloud_cover": _forecast_value(payload, None, ["high_cloud_cover"]),
                 "forecast_cloud_base": _forecast_value(payload, None, ["cloud_base"]),
                 "forecast_global_radiation": _forecast_value(payload, None, ["global_radiation"]),
+                "forecast_weather_code": (
+                    _to_float(weather_code)
+                    if _to_float(weather_code) is not None
+                    else _to_float(derive_windsurfice_weather(payload))
+                ),
             }
         )
 
@@ -245,6 +258,7 @@ def _collapse_latest_forecast_view(forecast_vintages: pd.DataFrame) -> pd.DataFr
             "forecast_high_cloud_cover",
             "forecast_cloud_base",
             "forecast_global_radiation",
+            "forecast_weather_code",
         ]
     ]
 
@@ -696,7 +710,7 @@ def _load_inference_vintage_lookup_bundle(
             "forecast_max": pd.to_numeric(group["forecast_max"], errors="coerce").to_numpy(dtype=np.float32),
             "forecast_dir": pd.to_numeric(group["forecast_dir"], errors="coerce").to_numpy(dtype=np.float32),
         }
-        for col in FORECAST_METEO_COLUMNS:
+        for col in FORECAST_WEATHER_COLUMNS:
             target_lookup[int(target_ts)][col] = pd.to_numeric(group[col], errors="coerce").to_numpy(dtype=np.float32)
 
     run_entries: List[Dict[str, object]] = []
@@ -716,7 +730,7 @@ def _load_inference_vintage_lookup_bundle(
                 "horizon_hr": pd.to_numeric(group["horizon_hr"], errors="coerce").to_numpy(dtype=np.float32),
             }
         )
-        for col in FORECAST_METEO_COLUMNS:
+        for col in FORECAST_WEATHER_COLUMNS:
             run_entries[-1][col] = pd.to_numeric(group[col], errors="coerce").to_numpy(dtype=np.float32)
     run_entries.sort(key=lambda entry: (int(entry["run_ts"]), int(entry["available_ts"])))
     run_available_ts = np.asarray([int(entry["available_ts"]) for entry in run_entries], dtype=np.int64)
@@ -743,7 +757,7 @@ _TRAINING_FLOAT_COLUMNS = (
     "forecast_min",
     "forecast_max",
     "forecast_dir",
-    *FORECAST_METEO_COLUMNS,
+    *FORECAST_WEATHER_COLUMNS,
 )
 
 
@@ -932,6 +946,10 @@ def load_training_forecast_lookup(
                 for run_ts, available_ts in availability_rows:
                     availability_by_run[int(run_ts)] = int(available_ts)
 
+        forecast_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(forecasts)")
+        }
+        weather_code_sql = "weather_code" if "weather_code" in forecast_columns else "NULL AS weather_code"
         cursor = conn.execute(
             f"""
             SELECT
@@ -942,6 +960,7 @@ def load_training_forecast_lookup(
                 wind_speed,
                 wind_gust,
                 wind_dir,
+                {weather_code_sql},
                 payload
             FROM forecasts
             WHERE {' AND '.join(filters)}
@@ -962,6 +981,7 @@ def load_training_forecast_lookup(
                 wind_speed,
                 wind_gust,
                 wind_dir,
+                weather_code,
                 payload_raw,
             ) in rows:
                 row_run_ts = int(run_ts)
@@ -1030,6 +1050,11 @@ def load_training_forecast_lookup(
                     "forecast_high_cloud_cover": _lower_payload_value(lower_payload, None, ["high_cloud_cover"]),
                     "forecast_cloud_base": _lower_payload_value(lower_payload, None, ["cloud_base"]),
                     "forecast_global_radiation": _lower_payload_value(lower_payload, None, ["global_radiation"]),
+                    "forecast_weather_code": (
+                        _to_float(weather_code)
+                        if _to_float(weather_code) is not None
+                        else _to_float(derive_windsurfice_weather(payload))
+                    ),
                 }
 
                 run_ts_values.append(row_run_ts)
@@ -1154,7 +1179,7 @@ def _lookup_latest_target_as_of(
         "forecast_min": float(series["forecast_min"][pos]),
         "forecast_max": float(series["forecast_max"][pos]),
         "forecast_dir": float(series["forecast_dir"][pos]),
-        **{col: float(series[col][pos]) for col in FORECAST_METEO_COLUMNS},
+        **{col: float(series[col][pos]) for col in FORECAST_WEATHER_COLUMNS},
     }
 
 
@@ -1222,7 +1247,7 @@ def _select_latest_complete_run_frame(
                     "forecast_dir": np.asarray(entry["forecast_dir"], dtype=np.float32)[indices],
                     **{
                         col: np.asarray(entry[col], dtype=np.float32)[indices]
-                        for col in FORECAST_METEO_COLUMNS
+                        for col in FORECAST_WEATHER_COLUMNS
                     },
                 },
                 index=target_times,
@@ -1852,6 +1877,8 @@ def build_next_day_inference_input(
     forecast_min_next = target_frame["forecast_min"].to_numpy(dtype=np.float32)
     forecast_max_next = target_frame["forecast_max"].to_numpy(dtype=np.float32)
     forecast_dir_next = target_frame["forecast_dir"].to_numpy(dtype=np.float32)
+    forecast_temperature_next = target_frame["forecast_temperature"].to_numpy(dtype=np.float32)
+    forecast_weather_code_next = target_frame["forecast_weather_code"].to_numpy(dtype=np.float32)
 
     X_input = _apply_standardizer(x_window[np.newaxis, :, :], x_mean, x_std).astype(np.float32)
     return {
@@ -1860,6 +1887,8 @@ def build_next_day_inference_input(
         "forecast_min_next24": forecast_min_next,
         "forecast_max_next24": forecast_max_next,
         "forecast_dir_next24": forecast_dir_next,
+        "forecast_temperature_next24": forecast_temperature_next,
+        "forecast_weather_code_next24": forecast_weather_code_next,
         "target_run_ts": target_frame["run_ts"].to_numpy(dtype=np.int64),
         "target_fetched_ts": target_frame["fetched_ts"].to_numpy(dtype=np.int64),
         "target_horizon_hr": target_frame["horizon_hr"].to_numpy(dtype=np.float32),

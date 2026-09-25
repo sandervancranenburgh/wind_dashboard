@@ -39,10 +39,16 @@ PLOT_RENDERER_ONLY = os.environ.get("WIND_PLOT_RENDERER_ONLY") == "1"
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
-from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea, VPacker
+from matplotlib.offsetbox import AnnotationBbox, AnchoredOffsetbox, HPacker, OffsetImage, TextArea, VPacker
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+from next_day_wind_model.weather_conditions import (
+    build_weather_timeline,
+    conventional_degree_label,
+    is_daylight,
+    weather_icon_path,
+)
 from next_day_wind_model.ecmwf_dashboard import (
     ECMWF_FORECAST_COLOR,
     ECMWF_FORECAST_LINEWIDTH,
@@ -1487,6 +1493,15 @@ def build_prediction_table(
     lo = np.minimum(forecast_min, forecast_max)
     hi = np.maximum(forecast_min, forecast_max)
     forecast_dir = inference_input["forecast_dir_next24"].astype(np.float32)
+    forecast_temperature = np.asarray(
+        inference_input.get("forecast_temperature_next24", np.full(len(target_times), np.nan)),
+        dtype=np.float32,
+    )
+    forecast_weather_code = np.asarray(
+        inference_input.get("forecast_weather_code_next24", np.full(len(target_times), np.nan)),
+        dtype=np.float32,
+    )
+    valid_weather = np.isfinite(forecast_temperature) & np.isfinite(forecast_weather_code)
 
     table = pd.DataFrame(
         {
@@ -1498,6 +1513,12 @@ def build_prediction_table(
             "lstm_pred_wind_speed": speed_pred.astype(np.float32),
             "forecast_wind_dir_deg": forecast_dir,
             "lstm_pred_wind_dir_deg": dir_pred.astype(np.float32),
+            "forecast_temperature_c": np.where(valid_weather, forecast_temperature, np.nan),
+            "weather_code": pd.array(
+                np.where(valid_weather, forecast_weather_code, np.nan), dtype="Int64"
+            ),
+            "weather_source": np.where(valid_weather, "windsurfice", None),
+            "is_daylight": [is_daylight(value, 52.168, 4.437) for value in target_times],
         }
     ).assign(
         hour_utc=lambda d: d["target_time_utc"].dt.strftime("%H"),
@@ -1534,6 +1555,129 @@ def _apply_speed_background(ax: plt.Axes, y_top: float, x_left: float, x_right: 
     )
 
 
+_WEATHER_IMAGE_CACHE: dict[Path, np.ndarray] = {}
+
+
+def _weather_cell_rows(
+    table: pd.DataFrame, time_column: str, local_tz: str
+) -> tuple[pd.Timestamp, pd.DataFrame]:
+    values = pd.to_datetime(table[time_column], utc=True, errors="coerce").dt.tz_convert(
+        ZoneInfo(local_tz)
+    )
+    day_start = pd.Timestamp(values.dropna().iloc[0]).normalize()
+    starts = pd.date_range(day_start + pd.Timedelta(hours=8), periods=14, freq="1h")
+    frame = table.copy()
+    frame["_weather_time"] = values
+    frame = frame[
+        frame["_weather_time"].dt.minute.eq(0)
+        & frame["_weather_time"].dt.second.eq(0)
+    ].drop_duplicates("_weather_time", keep="last").set_index("_weather_time")
+    return day_start, frame.reindex(starts)
+
+
+def _weather_image(code: object, daylight: object) -> np.ndarray | None:
+    if pd.isna(code):
+        return None
+    if isinstance(daylight, str):
+        daylight = daylight.strip().lower() in {"1", "true", "yes"}
+    path = weather_icon_path(code, False if pd.isna(daylight) else bool(daylight))
+    if path is None or not path.exists():
+        return None
+    if path not in _WEATHER_IMAGE_CACHE:
+        _WEATHER_IMAGE_CACHE[path] = plt.imread(path)
+    return _WEATHER_IMAGE_CACHE[path]
+
+
+def _draw_current_weather_strip(
+    weather_ax: plt.Axes,
+    table: pd.DataFrame,
+    local_tz: str,
+    *,
+    mobile: bool,
+) -> dict[str, object]:
+    day_start, rows = _weather_cell_rows(table, "time_local", local_tz)
+    boundaries = pd.date_range(day_start + pd.Timedelta(hours=8), periods=15, freq="1h")
+    boundary_x = mdates.date2num(boundaries.to_pydatetime()).astype(float)
+    icon_count = 0
+    for index in range(14):
+        left, right = float(boundary_x[index]), float(boundary_x[index + 1])
+        center = (left + right) / 2.0
+        weather_ax.axvspan(
+            left, right, color="white", alpha=0.19 if index % 2 == 0 else 0.12,
+            linewidth=0, zorder=0,
+        )
+        row = rows.iloc[index]
+        weather_ax.text(
+            center, 0.79, conventional_degree_label(row.get("forecast_temperature_c")),
+            ha="center", va="center", fontsize=9,
+            fontweight="semibold", zorder=2,
+        )
+        image = _weather_image(row.get("weather_code"), row.get("is_daylight"))
+        if image is not None:
+            weather_ax.add_artist(
+                AnnotationBbox(
+                    OffsetImage(image, zoom=0.38 if mobile else 0.50),
+                    (center, 0.30), frameon=False, pad=0, zorder=1.5,
+                )
+            )
+            icon_count += 1
+    for value in boundary_x:
+        weather_ax.axvline(value, color="#d8d8d8", linewidth=0.7, zorder=1)
+    weather_ax.set_ylim(0.0, 1.0)
+    weather_ax.set_yticks([])
+    weather_ax.tick_params(axis="x", labelbottom=False, bottom=False)
+    weather_ax.grid(False)
+    for spine in weather_ax.spines.values():
+        spine.set_visible(False)
+    return {
+        "weather_cell_count": 14,
+        "weather_icon_count": icon_count,
+        "weather_cell_boundaries": [float(value) for value in boundary_x],
+        "weather_icon_zoom": 0.38 if mobile else 0.50,
+    }
+
+
+def _draw_embedded_weather_strip(
+    ax: plt.Axes,
+    table: pd.DataFrame,
+    local_tz: str,
+    y_upper: float,
+    *,
+    mobile: bool,
+) -> dict[str, object]:
+    _, rows = _weather_cell_rows(table, "target_time_local", local_tz)
+    icon_count = 0
+    weather_artists: list[object] = []
+    for index in range(14):
+        row = rows.iloc[index]
+        weather_artists.append(ax.text(
+            index + 0.5, 1.65,
+            conventional_degree_label(row.get("forecast_temperature_c")),
+            ha="center", va="center", fontsize=9,
+            fontweight="semibold", zorder=0.9,
+        ))
+        image = _weather_image(row.get("weather_code"), row.get("is_daylight"))
+        if image is not None:
+            icon = AnnotationBbox(
+                OffsetImage(image, zoom=0.22 if mobile else 0.20),
+                (index + 0.5, 0.68), frameon=False, pad=0, zorder=0.85,
+            )
+            ax.add_artist(icon)
+            weather_artists.append(icon)
+            icon_count += 1
+    return {
+        "weather_cell_count": 14,
+        "weather_icon_count": icon_count,
+        "weather_cell_boundaries": [float(value) for value in range(15)],
+        "weather_background_count": 0,
+        "weather_separator_count": 0,
+        "weather_temperature_y": 1.65,
+        "weather_icon_y": 0.68,
+        "weather_icon_zoom": 0.22 if mobile else 0.20,
+        "curve_zorder_min": min(float(line.get_zorder()) for line in ax.lines),
+        "weather_icon_zorder": 0.85,
+        "_weather_artists": weather_artists,
+    }
 def _draw_sufficient_wind_threshold(ax: plt.Axes) -> None:
     ax.axhline(
         SUFFICIENT_WIND_THRESHOLD_KTS,
@@ -1817,7 +1961,13 @@ def _build_current_day_plot_frame(
         "is_actual_observation": is_actual_observation,
     }
     for col, values in forecast_columns.items():
-        table_data[col] = pd.Series(np.asarray(values, dtype=np.float32), index=dense_times).reindex(plot_times).to_numpy(dtype=np.float32)
+        raw = np.asarray(values)
+        if raw.dtype.kind in "OUSb":
+            table_data[col] = pd.Series(raw, index=dense_times).reindex(plot_times).to_numpy()
+        else:
+            table_data[col] = pd.Series(
+                np.asarray(values, dtype=np.float32), index=dense_times
+            ).reindex(plot_times).to_numpy(dtype=np.float32)
     for out_col, raw_col in actual_columns.items():
         if raw_col in actual_frame.columns:
             table_data[out_col] = (
@@ -2371,6 +2521,7 @@ def save_prediction_plot(
     harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
     mobile: bool = False,
     ecmwf_speed_series: pd.DataFrame | None = None,
+    spot_name: str | None = None,
     render_diagnostics: dict[str, object] | None = None,
 ) -> None:
     table = table.copy()
@@ -2421,8 +2572,8 @@ def save_prediction_plot(
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
-    meta_fs = 10 if mobile else 9
-    meta_y = 1.14 if mobile else 1.13
+    meta_fs = 9
+    meta_y = 1.17
     fig, ax = plt.subplots(figsize=fig_size)
     _apply_speed_background(ax, y_upper, x_left=0.0, x_right=len(table) - 1.0)
     _draw_sufficient_wind_threshold(ax)
@@ -2456,10 +2607,12 @@ def save_prediction_plot(
         ecmwf_frame = ecmwf_frame.dropna(subset=["time_local", "wind_speed_knots"])
         first_target = pd.Timestamp(table["target_time_local"].iloc[0])
         last_target = pd.Timestamp(table["target_time_local"].iloc[-1])
-        ecmwf_frame = ecmwf_frame[
-            (ecmwf_frame["time_local"] >= first_target)
-            & (ecmwf_frame["time_local"] <= last_target)
-        ].sort_values("time_local")
+        ecmwf_frame = _native_points_through_first_after_limit(
+            ecmwf_frame,
+            time_column="time_local",
+            left=first_target,
+            right=last_target,
+        )
         if not ecmwf_frame.empty:
             ecmwf_x = (
                 (ecmwf_frame["time_local"] - first_target).dt.total_seconds() / 3600.0
@@ -2470,12 +2623,15 @@ def save_prediction_plot(
                 color=ECMWF_FORECAST_COLOR,
                 linewidth=ECMWF_FORECAST_LINEWIDTH,
                 linestyle="-",
-                marker="D",
-                markersize=3.8 if mobile else 3.4,
                 label="ECMWF forecast",
                 zorder=2.8,
             )[0]
-    ax.set_title(day_label, fontsize=title_fs)
+    title_artist = ax.set_title(
+        day_label,
+        fontsize=title_fs,
+        y=1.23 if mobile else 1.20,
+        pad=0,
+    )
     ax.set_xlabel("Time", fontsize=label_fs, labelpad=24 if mobile else 26)
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
@@ -2504,7 +2660,10 @@ def save_prediction_plot(
     ax.tick_params(axis="both", labelsize=tick_fs)
     ax.set_xlim(0.0, len(table) - 1.0)
     ax.set_ylim(0.0, y_upper)
-    ax.text(
+    weather_diagnostics = _draw_embedded_weather_strip(
+        ax, table, local_tz, y_upper, mobile=mobile
+    )
+    metadata_artist = ax.text(
         0.015,
         meta_y,
         _format_plot_meta_text(
@@ -2525,9 +2684,9 @@ def save_prediction_plot(
         color="black",
         clip_on=False,
     )
-    ax.text(
+    model_id_artist = ax.text(
         0.985,
-        meta_y,
+        1.22 if mobile else meta_y,
         _format_model_id_text(model_trained_at_utc, local_tz),
         transform=ax.transAxes,
         ha="right",
@@ -2537,12 +2696,24 @@ def save_prediction_plot(
         clip_on=False,
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
     )
+    spot_artist = ax.text(
+        0.985,
+        1.015,
+        spot_name or "",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=meta_fs,
+        color="black",
+        clip_on=False,
+    )
 
     # Draw wind direction arrows under x-axis.
     # Mapping: up-arrow means South wind (from South), per user preference.
     # Using x-axis transform keeps arrows below axis regardless of y-scale.
     y_base_axes = -0.115 if mobile else -0.14
     arrow_len_axes = 0.058 if mobile else 0.065
+    direction_arrow_count = 0
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, SUPERLOCAL_FORECAST_COLOR)]:
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
@@ -2563,13 +2734,42 @@ def save_prediction_plot(
                 },
                 clip_on=False,
             )
+            direction_arrow_count += 1
 
     layout_top = 0.93 if mobile else 0.965
     layout_bottom = 0.055 if mobile else 0.04
     fig.tight_layout(rect=[0, layout_bottom, 1, layout_top])
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    weather_artists = weather_diagnostics.pop("_weather_artists", [])
+    weather_artist_bounds_data: list[list[float]] = []
+    for artist in weather_artists:
+        bbox = artist.get_window_extent(renderer)
+        corners = ax.transData.inverted().transform(
+            [[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]]
+        )
+        weather_artist_bounds_data.append(
+            [float(corners[0, 0]), float(corners[0, 1]), float(corners[1, 0]), float(corners[1, 1])]
+        )
+
+    def _figure_bounds(artist: object) -> list[float]:
+        bbox = artist.get_window_extent(renderer)
+        corners = fig.transFigure.inverted().transform(
+            [[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]]
+        )
+        return [float(corners[0, 0]), float(corners[0, 1]), float(corners[1, 0]), float(corners[1, 1])]
+
+    header_bounds = {
+        "title": _figure_bounds(title_artist),
+        "metadata": _figure_bounds(metadata_artist),
+        "model_id": _figure_bounds(model_id_artist),
+        "spot_name": _figure_bounds(spot_artist),
+    }
     if render_diagnostics is not None:
         render_diagnostics.update(
             {
+                **weather_diagnostics,
+                "axis_count": len(fig.axes),
                 "x_limits": [float(value) for value in ax.get_xlim()],
                 "y_limits": [float(value) for value in ax.get_ylim()],
                 "y_ticks": [float(value) for value in ax.get_yticks()],
@@ -2592,6 +2792,12 @@ def save_prediction_plot(
                 "ecmwf_linewidth": (
                     None if ecmwf_line is None else float(ecmwf_line.get_linewidth())
                 ),
+                "ecmwf_marker": (
+                    None if ecmwf_line is None else str(ecmwf_line.get_marker())
+                ),
+                "ecmwf_x_data": (
+                    [] if ecmwf_line is None else [float(value) for value in ecmwf_line.get_xdata()]
+                ),
                 "ecmwf_times_local": [
                     value.isoformat()
                     for value in pd.DatetimeIndex(
@@ -2599,6 +2805,15 @@ def save_prediction_plot(
                     )
                 ],
                 "direction_annotation_count": len(ax.texts),
+                "direction_arrow_count": direction_arrow_count,
+                "spot_name": spot_name or "",
+                "model_id_text": model_id_artist.get_text(),
+                "header_bounds_figure": header_bounds,
+                "weather_artist_bounds_data": weather_artist_bounds_data,
+                "weather_artist_max_y": max(
+                    (bounds[3] for bounds in weather_artist_bounds_data),
+                    default=float("nan"),
+                ),
             }
         )
     fig.savefig(plot_path, dpi=150)
@@ -2776,6 +2991,14 @@ def build_current_day_table(
     )
 
     fc_today = forecast_frame_local.reindex(full_hours)
+    weather_hourly = build_weather_timeline(
+        db_path,
+        site=cfg.site,
+        target_times=full_hours.tz_convert("UTC"),
+        fallback_temperature_c=fc_today["forecast_temperature"].to_numpy(dtype=float),
+        fallback_weather_code=fc_today["forecast_weather_code"].to_numpy(dtype=float),
+        available_at=issue_anchor_utc,
+    )
     issued_hourly_predictions = pd.DataFrame(
         columns=[
             "target_time_utc",
@@ -2860,6 +3083,9 @@ def build_current_day_table(
         rem_hourly_dir.index,
         dense_times,
     )
+    weather_local = weather_hourly.copy()
+    weather_local.index = weather_local.index.tz_convert(tz)
+    sparse_weather = weather_local.reindex(dense_times)
 
     # Actual measurements keep their source timestamps; forecast/prediction
     # values remain on the configured dense forecast grid.
@@ -2876,6 +3102,14 @@ def build_current_day_table(
             "lstm_pred_wind_dir_deg_full": lstm_dir_full_dense,
             "lstm_pred_wind_speed": rem_dense_speed,
             "lstm_pred_wind_dir_deg": rem_dense_dir,
+            "forecast_temperature_c": sparse_weather["forecast_temperature_c"].to_numpy(dtype=float),
+            "weather_code": pd.to_numeric(sparse_weather["weather_code"], errors="coerce").to_numpy(dtype=float),
+            "weather_source": sparse_weather["weather_source"].to_numpy(dtype=object),
+            "is_daylight": sparse_weather["is_daylight"].to_numpy(dtype=object),
+            "total_cloud_cover_pct": sparse_weather["total_cloud_cover_pct"].to_numpy(dtype=float),
+            "total_precip_hourly_mm": sparse_weather["total_precip_hourly_mm"].to_numpy(dtype=float),
+            "snowfall_hourly_cm": sparse_weather["snowfall_hourly_cm"].to_numpy(dtype=float),
+            "visibility_m": sparse_weather["visibility_m"].to_numpy(dtype=float),
         },
         actual_day_raw,
         now_local=now_local,
@@ -2932,6 +3166,7 @@ def save_current_day_plot(
     mobile: bool = False,
     ecmwf_speed_series: pd.DataFrame | None = None,
     ecmwf_metadata_text: str | None = None,
+    spot_name: str | None = None,
     render_diagnostics: dict[str, object] | None = None,
 ) -> None:
     def _prepare_branch_frame(
@@ -3232,28 +3467,28 @@ def save_current_day_plot(
         )
 
     fig_size = (8.4, 10.4) if mobile else (14, 8.8)
-    title_fs = 14 if mobile else None
-    title_pad = 12 if mobile else 20
+    title_fs = 12 if mobile else None
     label_fs = 12 if mobile else None
     tick_fs = 11 if mobile else None
     legend_fs = 10 if mobile else None
     meta_fs = 10 if mobile else 9
-    mae_fs = 11 if mobile else 10
-    meta_text_y = 1.19 if mobile else 1.16
-    metric_box_y = 1.29 if mobile else 1.24
-    subplot_hspace = 0.20 if mobile else 0.17
-    fig, (ax, variability_ax, direction_ax) = plt.subplots(
-        3,
+    mae_fs = 9
+    meta_text_y = 1.23 if mobile else 1.16
+    metric_box_y = 1.45 if mobile else 1.40
+    subplot_hspace = 0.10 if mobile else 0.17
+    fig, (ax, weather_ax, variability_ax, direction_ax) = plt.subplots(
+        4,
         1,
         figsize=fig_size,
         sharex=True,
-        gridspec_kw={"height_ratios": [5.0, 1.12, 0.48], "hspace": subplot_hspace},
+        gridspec_kw={"height_ratios": [5.0, 0.82, 1.12, 0.48], "hspace": subplot_hspace},
     )
 
-    def _plot_valid_line(x_values: np.ndarray, y_values: np.ndarray, **kwargs) -> None:
+    def _plot_valid_line(x_values: np.ndarray, y_values: np.ndarray, **kwargs) -> Line2D | None:
         valid = ~np.isnan(y_values)
         if np.any(valid):
-            ax.plot(x_values[valid], y_values[valid], **kwargs)
+            return ax.plot(x_values[valid], y_values[valid], **kwargs)[0]
+        return None
 
     _apply_speed_background(ax, y_upper, x_left=float(x[0]), x_right=float(x[-1]))
     _draw_sufficient_wind_threshold(ax)
@@ -3453,6 +3688,7 @@ def save_current_day_plot(
     # production renderer; ECMWF is deliberately excluded from the y-scale,
     # direction arrows, variability panel, and MAE calculation.
     ecmwf_plotted = False
+    ecmwf_line: Line2D | None = None
     ecmwf_frame = pd.DataFrame()
     if ecmwf_speed_series is not None and not ecmwf_speed_series.empty:
         ecmwf_frame = ecmwf_speed_series.copy()
@@ -3472,18 +3708,16 @@ def save_current_day_plot(
             right=pd.Timestamp(time_index[-1]),
         )
         if not ecmwf_frame.empty:
-            _plot_valid_line(
+            ecmwf_line = _plot_valid_line(
                 _date_x_values(ecmwf_frame["time_local"]),
                 ecmwf_frame["wind_speed_knots"].to_numpy(dtype=float),
                 color=ECMWF_FORECAST_COLOR,
                 linewidth=ECMWF_FORECAST_LINEWIDTH,
                 linestyle="-",
-                marker="D",
-                markersize=3.8 if mobile else 3.4,
                 label="_nolegend_",
                 zorder=2.8,
             )
-            ecmwf_plotted = True
+            ecmwf_plotted = ecmwf_line is not None
 
     def _first_valid_point(x_values: np.ndarray, y_values: np.ndarray) -> tuple[float, float] | None:
         valid_idx = np.where(~np.isnan(y_values))[0]
@@ -3519,7 +3753,12 @@ def save_current_day_plot(
             label="_nolegend_",
         )
 
-    ax.set_title(day_label, fontsize=title_fs, pad=title_pad)
+    title_artist = ax.set_title(
+        day_label,
+        fontsize=title_fs,
+        y=1.35 if mobile else 1.30,
+        pad=0,
+    )
     ax.set_xlabel("")
     ax.set_ylabel("Wind speed (kts)", fontsize=label_fs)
     ax.grid(axis="y", alpha=0.3)
@@ -3560,11 +3799,6 @@ def save_current_day_plot(
             color=ECMWF_FORECAST_COLOR,
             linewidth=ECMWF_FORECAST_LINEWIDTH,
             linestyle="-",
-            marker="D",
-            markersize=4.2 if mobile else 3.8,
-            markerfacecolor=ECMWF_FORECAST_COLOR,
-            markeredgecolor="white",
-            markeredgewidth=0.7,
         ),
     }
     desired_order = [
@@ -3588,7 +3822,7 @@ def save_current_day_plot(
     xlim_right = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=22)
     xlim_left_num = float(mdates.date2num(xlim_left.to_pydatetime()))
     xlim_right_num = float(mdates.date2num(xlim_right.to_pydatetime()))
-    for axis in (ax, variability_ax, direction_ax):
+    for axis in (ax, weather_ax, variability_ax, direction_ax):
         axis.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=plot_tz))
         axis.xaxis.set_major_formatter(mdates.DateFormatter("%H", tz=plot_tz))
         axis.xaxis.set_minor_locator(mticker.NullLocator())
@@ -3599,6 +3833,9 @@ def save_current_day_plot(
     variability_ax.tick_params(axis="x", labelbottom=True)
     direction_ax.tick_params(axis="x", labelbottom=False, bottom=False)
     ax.set_ylim(y_lower, y_upper)
+    weather_diagnostics = _draw_current_weather_strip(
+        weather_ax, table, local_tz, mobile=mobile
+    )
 
     variability_y_lower = 0.5
     variability_y_upper = 2.0
@@ -3723,13 +3960,14 @@ def save_current_day_plot(
             ax.annotate(
                 f"active anchor {current_harmonie_anchor.strftime('%H:%M')}",
                 xy=(current_branch_boundary_x, y_upper),
-                xytext=(0, 4),
+                xytext=(0, -5),
                 textcoords="offset points",
                 ha="center",
-                va="bottom",
+                va="top",
                 fontsize=max(mae_fs - 2, 8),
                 color="black",
                 clip_on=False,
+                bbox={"facecolor": "white", "alpha": 0.6, "edgecolor": "none", "pad": 1.0},
             )
 
     def _metric_value_colors(metric: dict | None) -> tuple[str, str]:
@@ -3831,7 +4069,7 @@ def save_current_day_plot(
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         additional_line_after_harmonie=ecmwf_metadata_text if ecmwf_plotted else None,
     )
-    ax.text(
+    metadata_artist = ax.text(
         0.015,
         meta_text_y + (0.025 if ecmwf_plotted else 0.0),
         plot_meta_text,
@@ -3842,12 +4080,24 @@ def save_current_day_plot(
         color="black",
         clip_on=False,
     )
+    spot_artist = ax.text(
+        0.985,
+        1.015,
+        spot_name or "",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=mae_fs,
+        color="black",
+        clip_on=False,
+    )
 
     # Direction arrows for forecast, LSTM (remaining where available, else full-day context), and actual.
     y_base = 0.26
     arrow_len = 0.22 if mobile else 0.24
     arrow_dx_scale = 0.22 / 24.0
     forecast_arrow_rows, actual_arrow_rows = _current_day_direction_arrow_rows(table)
+    direction_arrow_count = 0
     for _, row in forecast_arrow_rows.iterrows():
         row_x = float(mdates.date2num(pd.Timestamp(row["time_local"]).to_pydatetime()))
         fdir = row["forecast_wind_dir_deg"]
@@ -3870,6 +4120,7 @@ def save_current_day_plot(
                 clip_on=False,
                 zorder=z,
             )
+            direction_arrow_count += 1
     for _, row in actual_arrow_rows.iterrows():
         direction_deg = row["actual_wind_dir_deg"]
         row_x = float(mdates.date2num(pd.Timestamp(row["time_local"]).to_pydatetime()))
@@ -3886,6 +4137,7 @@ def save_current_day_plot(
             clip_on=False,
             zorder=6,
         )
+        direction_arrow_count += 1
 
     layout_top = 0.78 if mobile else 0.82
     layout_bottom = 0.08 if mobile else 0.075
@@ -3896,16 +4148,36 @@ def save_current_day_plot(
         top=layout_top,
         hspace=subplot_hspace,
     )
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def _figure_bounds(artist: object) -> list[float]:
+        bbox = artist.get_window_extent(renderer)
+        corners = fig.transFigure.inverted().transform(
+            [[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]]
+        )
+        return [float(corners[0, 0]), float(corners[0, 1]), float(corners[1, 0]), float(corners[1, 1])]
+
+    header_bounds = {
+        "title": _figure_bounds(title_artist),
+        "metadata": _figure_bounds(metadata_artist),
+        "mae": _figure_bounds(mse_anchored),
+        "spot_name": _figure_bounds(spot_artist),
+    }
     if render_diagnostics is not None:
         legend = ax.get_legend()
         render_diagnostics.update(
             {
                 "figure_size_inches": [float(value) for value in fig.get_size_inches()],
                 "save_dpi": 150,
+                **weather_diagnostics,
+                "axis_count": len(fig.axes),
+                "axis_roles": ["wind_speed", "weather", "variability", "direction"],
                 "axes_positions": [
                     [float(value) for value in axis.get_position().bounds]
-                    for axis in (ax, variability_ax, direction_ax)
+                    for axis in (ax, weather_ax, variability_ax, direction_ax)
                 ],
+                "subplot_hspace": subplot_hspace,
                 "x_limits": [float(value) for value in ax.get_xlim()],
                 "speed_y_limits": [float(value) for value in ax.get_ylim()],
                 "variability_y_limits": [
@@ -3923,16 +4195,25 @@ def save_current_day_plot(
                 "metadata_lines": plot_meta_text.splitlines(),
                 "axis_line_colors": [
                     [str(line.get_color()) for line in axis.lines]
-                    for axis in (ax, variability_ax, direction_ax)
+                    for axis in (ax, weather_ax, variability_ax, direction_ax)
                 ],
                 "axis_annotation_counts": [
-                    len(axis.texts) for axis in (ax, variability_ax, direction_ax)
+                    len(axis.texts) for axis in (ax, weather_ax, variability_ax, direction_ax)
                 ],
+                "direction_arrow_count": direction_arrow_count,
                 "ecmwf_plotted": ecmwf_plotted,
                 "ecmwf_color": ECMWF_FORECAST_COLOR if ecmwf_plotted else None,
                 "ecmwf_linestyle": "-" if ecmwf_plotted else None,
                 "ecmwf_linewidth": (
                     ECMWF_FORECAST_LINEWIDTH if ecmwf_plotted else None
+                ),
+                "ecmwf_marker": (
+                    None if ecmwf_line is None else str(ecmwf_line.get_marker())
+                ),
+                "ecmwf_legend_marker": (
+                    str(order_map["ECMWF forecast"].get_marker())
+                    if ecmwf_plotted
+                    else None
                 ),
                 "ecmwf_times_local": [
                     value.isoformat()
@@ -3944,6 +4225,8 @@ def save_current_day_plot(
                     0.015,
                     meta_text_y + (0.025 if ecmwf_plotted else 0.0),
                 ],
+                "spot_name": spot_name or "",
+                "header_bounds_figure": header_bounds,
             }
         )
     fig.savefig(plot_path, dpi=150)
@@ -7129,6 +7412,7 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
     )
     save_prediction_plot(
         table,
@@ -7143,6 +7427,7 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         mobile=True,
     )
 
@@ -7209,6 +7494,7 @@ def run_dashboard_stage_from_cached_artifacts(
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         ecmwf_metadata_text=(
             str(ecmwf_metadata_text) if ecmwf_metadata_text else None
         ),
@@ -7230,6 +7516,7 @@ def run_dashboard_stage_from_cached_artifacts(
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         ecmwf_metadata_text=(
             str(ecmwf_metadata_text) if ecmwf_metadata_text else None
         ),
@@ -8547,6 +8834,16 @@ def main() -> None:
     _log_rss("next_day_prediction_complete")
 
     table = build_prediction_table(inference_input_speed, speed_pred, direction_pred, local_tz=args.local_timezone)
+    next_weather = build_weather_timeline(
+        db_path,
+        site=cfg.site,
+        target_times=table["target_time_utc"],
+        fallback_temperature_c=table["forecast_temperature_c"],
+        fallback_weather_code=table["weather_code"],
+        available_at=datetime.now(timezone.utc),
+    ).reset_index(drop=True)
+    for weather_column in next_weather.columns:
+        table[weather_column] = next_weather[weather_column].to_numpy()
     next_day_prediction_log_frame = _build_next_day_prediction_log_frame(inference_input_speed, speed_pred)
     is_test_mode = args.test_now_local_hour is not None
     prediction_generated_at_dt = datetime.now(timezone.utc)
@@ -8794,6 +9091,7 @@ def main() -> None:
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
     )
     save_prediction_plot(
         table,
@@ -8808,6 +9106,7 @@ def main() -> None:
         harmonie_update_interval_minutes=args.harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         mobile=True,
     )
 
@@ -8829,6 +9128,7 @@ def main() -> None:
         prior_prediction_tables=current_day_prior_prediction_tables,
         live_monitoring_metric=current_day_live_monitoring_metric,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         ecmwf_metadata_text=(
             str(ecmwf_metadata_text) if ecmwf_metadata_text else None
         ),
@@ -8850,6 +9150,7 @@ def main() -> None:
         live_monitoring_metric=current_day_live_monitoring_metric,
         mobile=True,
         ecmwf_speed_series=ecmwf_speed_series,
+        spot_name=_site_display_name(args.site),
         ecmwf_metadata_text=(
             str(ecmwf_metadata_text) if ecmwf_metadata_text else None
         ),

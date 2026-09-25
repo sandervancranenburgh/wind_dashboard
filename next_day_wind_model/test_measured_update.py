@@ -79,6 +79,10 @@ def _cached_table() -> pd.DataFrame:
     data["actual_wind_dir_deg"] = np.nan
     data["hour_local"] = times.strftime("%H")
     data["minute_local"] = times.minute
+    data["forecast_temperature_c"] = np.arange(24, dtype=float) + 5.0
+    data["weather_code"] = np.where(np.arange(24) < 12, 2, 3)
+    data["weather_source"] = "windsurfice"
+    data["is_daylight"] = (np.arange(24) >= 7) & (np.arange(24) <= 20)
     return pd.DataFrame(data)
 
 
@@ -167,6 +171,14 @@ class CompositionTests(unittest.TestCase):
         np.testing.assert_allclose(reused[future_mask], original[future_mask], equal_nan=True)
         self.assertIn(pd.Timestamp("2026-07-17T10:05:00+02:00"), set(result["time_local"]))
         self.assertEqual(result["actual_wind_speed"].dropna().iloc[-1], 6.0)
+        np.testing.assert_allclose(
+            captured["forecast_temperature_c"],
+            cached["forecast_temperature_c"].to_numpy(dtype=float),
+        )
+        np.testing.assert_allclose(
+            captured["weather_code"], cached["weather_code"].to_numpy(dtype=float)
+        )
+        self.assertEqual(captured["weather_source"].tolist(), ["windsurfice"] * 24)
 
 
 class MeasuredStageTests(unittest.TestCase):

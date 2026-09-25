@@ -61,6 +61,10 @@ def current_table() -> pd.DataFrame:
             "is_future": times >= pd.Timestamp(f"{DAY} 12:00", tz=LOCAL_TZ),
             "hour_local": times.strftime("%H"),
             "minute_local": times.minute,
+            "forecast_temperature_c": np.linspace(12.0, 18.0, count),
+            "weather_code": [0, 1, 2, 3, 45, 51, 53, 55, 61, 63, 65, 71, 73, 75, 0],
+            "weather_source": "windsurfice",
+            "is_daylight": [True] * 12 + [False] * 3,
         }
     )
 
@@ -78,6 +82,10 @@ def next_table() -> pd.DataFrame:
             "lstm_pred_wind_speed": np.linspace(8.5, 11.5, count),
             "forecast_wind_dir_deg": np.linspace(180.0, 240.0, count),
             "lstm_pred_wind_dir_deg": np.linspace(185.0, 245.0, count),
+            "forecast_temperature_c": np.linspace(11.0, 17.0, count),
+            "weather_code": [3, 2, 1, 0, 51, 53, 55, 61, 63, 65, 71, 73, 75, 45, 0],
+            "weather_source": "windsurfice",
+            "is_daylight": [True] * 12 + [False] * 3,
         }
     )
 
@@ -89,6 +97,7 @@ def current_kwargs() -> dict:
         "prediction_updated_at_utc": "2026-09-16T07:31:00Z",
         "model_trained_at_utc": "2026-09-15T05:25:00Z",
         "harmonie_time_utc": "2026-09-16T07:25:00Z",
+        "spot_name": "Valkenburgse meer",
         "plot_updated_at_utc": "2026-09-16T08:00:00Z",
         "prior_prediction_tables": [],
         "live_monitoring_metric": {
@@ -107,7 +116,30 @@ def next_kwargs() -> dict:
         "prediction_updated_at_utc": "2026-09-16T07:31:00Z",
         "model_trained_at_utc": "2026-09-15T05:25:00Z",
         "harmonie_time_utc": "2026-09-16T07:25:00Z",
+        "spot_name": "Valkenburgse meer",
     }
+
+
+def bounds_overlap(first: list[float], second: list[float]) -> bool:
+    return not (
+        first[2] <= second[0]
+        or second[2] <= first[0]
+        or first[3] <= second[1]
+        or second[3] <= first[1]
+    )
+
+
+def assert_header_bounds_do_not_overlap(
+    case: unittest.TestCase, diagnostics: dict[str, object]
+) -> None:
+    bounds = diagnostics["header_bounds_figure"]
+    names = list(bounds)
+    for index, first_name in enumerate(names):
+        for second_name in names[index + 1 :]:
+            case.assertFalse(
+                bounds_overlap(bounds[first_name], bounds[second_name]),
+                f"{first_name} overlaps {second_name}: {bounds}",
+            )
 
 
 def overlay_for(day: str, *, extreme: bool = False) -> pd.DataFrame:
@@ -152,6 +184,8 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(development["ecmwf_color"], ECMWF_FORECAST_COLOR)
         self.assertEqual(development["ecmwf_linestyle"], "-")
         self.assertEqual(development["ecmwf_linewidth"], ECMWF_FORECAST_LINEWIDTH)
+        self.assertEqual(development["ecmwf_marker"], "None")
+        self.assertEqual(development["ecmwf_legend_marker"], "None")
         plotted = pd.to_datetime(development["ecmwf_times_local"], utc=True)
         self.assertGreater(plotted.max(), pd.Timestamp("2026-09-16T20:00:00Z"))
         self.assertEqual(reference["x_limits"], development["x_limits"])
@@ -194,6 +228,10 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(development["ecmwf_color"], ECMWF_FORECAST_COLOR)
         self.assertEqual(development["ecmwf_linestyle"], "-")
         self.assertEqual(development["ecmwf_linewidth"], ECMWF_FORECAST_LINEWIDTH)
+        self.assertEqual(development["ecmwf_marker"], "None")
+        self.assertGreater(max(development["ecmwf_x_data"]), development["x_limits"][1])
+        plotted = pd.to_datetime(development["ecmwf_times_local"], utc=True)
+        self.assertGreater(plotted.max(), pd.Timestamp("2026-09-17T20:00:00Z"))
         self.assertEqual(reference["x_limits"], development["x_limits"])
         self.assertEqual(reference["y_limits"], development["y_limits"])
         self.assertEqual(reference["y_ticks"], development["y_ticks"])
@@ -229,6 +267,77 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertFalse(next_diagnostics["ecmwf_plotted"])
         self.assertNotIn("ECMWF forecast", current_diagnostics["legend_labels"])
         self.assertNotIn("ECMWF forecast", next_diagnostics["legend_labels"])
+        self.assertEqual(current_diagnostics["axis_count"], 4)
+        self.assertEqual(
+            current_diagnostics["axis_roles"],
+            ["wind_speed", "weather", "variability", "direction"],
+        )
+        self.assertEqual(current_diagnostics["weather_cell_count"], 14)
+        self.assertEqual(current_diagnostics["weather_icon_count"], 14)
+        self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
+        self.assertEqual(next_diagnostics["axis_count"], 1)
+        self.assertEqual(next_diagnostics["weather_cell_count"], 14)
+        self.assertEqual(next_diagnostics["weather_icon_count"], 14)
+        self.assertEqual(next_diagnostics["weather_background_count"], 0)
+        self.assertEqual(next_diagnostics["weather_separator_count"], 0)
+        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.20)
+        self.assertGreaterEqual(
+            min(bounds[1] for bounds in next_diagnostics["weather_artist_bounds_data"]),
+            0.0,
+        )
+        self.assertLess(next_diagnostics["weather_artist_max_y"], 2.0)
+        self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())
+        self.assertGreaterEqual(
+            next_diagnostics["header_bounds_figure"]["metadata"][1],
+            next_diagnostics["axes_position"][1]
+            + next_diagnostics["axes_position"][3],
+        )
+        self.assertEqual(current_diagnostics["spot_name"], "Valkenburgse meer")
+        self.assertEqual(next_diagnostics["spot_name"], "Valkenburgse meer")
+        assert_header_bounds_do_not_overlap(self, current_diagnostics)
+        assert_header_bounds_do_not_overlap(self, next_diagnostics)
+        self.assertEqual(next_diagnostics["direction_arrow_count"], 30)
+        self.assertLess(
+            next_diagnostics["weather_icon_zorder"],
+            next_diagnostics["curve_zorder_min"],
+        )
+
+    def test_mobile_weather_cells_remain_readable_and_aligned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current_diagnostics: dict[str, object] = {}
+            next_diagnostics: dict[str, object] = {}
+            save_current_day_plot(
+                current_table(), root / "current-mobile.png", mobile=True,
+                render_diagnostics=current_diagnostics, **current_kwargs(),
+            )
+            save_prediction_plot(
+                next_table(), root / "next-mobile.png", mobile=True,
+                render_diagnostics=next_diagnostics, **next_kwargs(),
+            )
+            self.assertGreater((root / "current-mobile.png").stat().st_size, 20_000)
+            self.assertGreater((root / "next-mobile.png").stat().st_size, 20_000)
+        self.assertEqual(len(current_diagnostics["weather_cell_boundaries"]), 15)
+        self.assertEqual(len(next_diagnostics["weather_cell_boundaries"]), 15)
+        self.assertEqual(current_diagnostics["weather_icon_count"], 14)
+        self.assertEqual(next_diagnostics["weather_icon_count"], 14)
+        self.assertEqual(current_diagnostics["subplot_hspace"], 0.10)
+        self.assertEqual(current_diagnostics["weather_cell_count"], 14)
+        self.assertEqual(next_diagnostics["weather_cell_count"], 14)
+        self.assertEqual(next_diagnostics["weather_background_count"], 0)
+        self.assertEqual(next_diagnostics["weather_separator_count"], 0)
+        self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.38)
+        self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.22)
+        self.assertGreaterEqual(
+            min(bounds[1] for bounds in next_diagnostics["weather_artist_bounds_data"]),
+            0.0,
+        )
+        self.assertLess(next_diagnostics["weather_artist_max_y"], 2.0)
+        self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())
+        self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
+        self.assertEqual(next_diagnostics["direction_arrow_count"], 30)
+        assert_header_bounds_do_not_overlap(self, current_diagnostics)
+        assert_header_bounds_do_not_overlap(self, next_diagnostics)
 
 
 class ArchiveSelectionTests(unittest.TestCase):

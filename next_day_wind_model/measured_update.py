@@ -26,6 +26,23 @@ FORECAST_COLUMNS = (
     "lstm_pred_wind_speed",
     "lstm_pred_wind_dir_deg",
 )
+OPTIONAL_WEATHER_COLUMNS = (
+    "forecast_temperature_c",
+    "weather_code",
+    "weather_source",
+    "is_daylight",
+    "total_cloud_cover_pct",
+    "total_precip_hourly_mm",
+    "snowfall_hourly_cm",
+    "visibility_m",
+)
+
+
+def _site_display_name(site: str) -> str:
+    return {
+        "valkenburgsemeer": "Valkenburgse meer",
+        "oostvoorne": "Oostvoornse meer",
+    }.get(str(site or "").strip(), str(site or "").strip())
 
 
 def _truthy_series(values: pd.Series) -> pd.Series:
@@ -156,6 +173,15 @@ def compose_current_day_table(
             values = values.copy()
             values[dense_times < now_hour] = np.nan
         forecast_values[column] = values
+    for column in OPTIONAL_WEATHER_COLUMNS:
+        if column not in grid.columns:
+            continue
+        if column in {"weather_source", "is_daylight"}:
+            forecast_values[column] = grid[column].to_numpy(dtype=object)
+        else:
+            forecast_values[column] = pd.to_numeric(
+                grid[column], errors="coerce"
+            ).to_numpy(dtype=np.float32)
 
     return build_plot_frame(
         dense_times,
@@ -423,6 +449,7 @@ def run_measured_only_stage(
             prior_prediction_tables=prior_tables,
             live_monitoring_metric=live_metric,
             ecmwf_speed_series=ecmwf_speed_series,
+            spot_name=_site_display_name(args.site),
             ecmwf_metadata_text=(
                 str(ecmwf_metadata_text) if ecmwf_metadata_text else None
             ),
@@ -444,6 +471,7 @@ def run_measured_only_stage(
             live_monitoring_metric=live_metric,
             mobile=True,
             ecmwf_speed_series=ecmwf_speed_series,
+            spot_name=_site_display_name(args.site),
             ecmwf_metadata_text=(
                 str(ecmwf_metadata_text) if ecmwf_metadata_text else None
             ),
@@ -468,6 +496,7 @@ def run_measured_only_stage(
                 "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
                 "harmonie_expected_next_at_utc": harmonie_expected_next_at_utc,
                 "ecmwf_speed_series": ecmwf_speed_series,
+                "spot_name": _site_display_name(args.site),
             }
             save_next_day_plot(
                 next_day_table,

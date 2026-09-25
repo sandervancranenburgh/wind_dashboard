@@ -286,6 +286,8 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(next_diagnostics["weather_separator_count"], 15)
         self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.36)
         self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.36)
+        self.assertEqual(current_diagnostics["weather_icon_y"], 0.20)
+        self.assertEqual(next_diagnostics["weather_icon_y"], 0.25)
         self.assertEqual(current_diagnostics["weather_icon_temperature_overlap_count"], 0)
         self.assertEqual(next_diagnostics["weather_icon_temperature_overlap_count"], 0)
         expected_hours = [f"{hour:02d}h" for hour in range(8, 23)]
@@ -332,6 +334,8 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(next_diagnostics["weather_separator_count"], 15)
         self.assertEqual(current_diagnostics["weather_icon_zoom"], 0.29)
         self.assertEqual(next_diagnostics["weather_icon_zoom"], 0.29)
+        self.assertEqual(current_diagnostics["weather_icon_y"], 0.20)
+        self.assertEqual(next_diagnostics["weather_icon_y"], 0.32)
         self.assertEqual(current_diagnostics["weather_icon_temperature_overlap_count"], 0)
         self.assertEqual(next_diagnostics["weather_icon_temperature_overlap_count"], 0)
         self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())

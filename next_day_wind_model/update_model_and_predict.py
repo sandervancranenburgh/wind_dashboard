@@ -1592,10 +1592,16 @@ WEATHER_ICON_ZOOM_DESKTOP = 0.36
 WEATHER_ICON_ZOOM_MOBILE = 0.29
 WEATHER_TEMPERATURE_Y = 0.82
 WEATHER_ICON_Y = 0.20
+NEXT_WEATHER_ICON_Y_DESKTOP = 0.25
+NEXT_WEATHER_ICON_Y_MOBILE = 0.32
 
 
 def _weather_icon_zoom(*, mobile: bool) -> float:
     return WEATHER_ICON_ZOOM_MOBILE if mobile else WEATHER_ICON_ZOOM_DESKTOP
+
+
+def _next_weather_icon_y(*, mobile: bool) -> float:
+    return NEXT_WEATHER_ICON_Y_MOBILE if mobile else NEXT_WEATHER_ICON_Y_DESKTOP
 
 
 def _draw_current_weather_strip(
@@ -1668,6 +1674,7 @@ def _draw_next_weather_strip(
     temperature_artists: list[object] = []
     icon_artists: list[object] = []
     icon_zoom = _weather_icon_zoom(mobile=mobile)
+    icon_y = _next_weather_icon_y(mobile=mobile)
     for index in range(14):
         left, right = float(index), float(index + 1)
         center = (left + right) / 2.0
@@ -1686,7 +1693,7 @@ def _draw_next_weather_strip(
         if image is not None:
             icon = AnnotationBbox(
                 OffsetImage(image, zoom=icon_zoom),
-                (center, WEATHER_ICON_Y), frameon=False, pad=0, zorder=1.5,
+                (center, icon_y), frameon=False, pad=0, zorder=1.5,
             )
             weather_ax.add_artist(icon)
             icon_artists.append(icon)
@@ -1711,7 +1718,7 @@ def _draw_next_weather_strip(
         "weather_background_count": 14,
         "weather_separator_count": 15,
         "weather_temperature_y": WEATHER_TEMPERATURE_Y,
-        "weather_icon_y": WEATHER_ICON_Y,
+        "weather_icon_y": icon_y,
         "weather_icon_zoom": icon_zoom,
         "_weather_temperature_artists": temperature_artists,
         "_weather_icon_artists": icon_artists,

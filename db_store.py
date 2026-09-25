@@ -7,6 +7,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Iterable, Dict, Any, Optional, Tuple, List
 
+from next_day_wind_model.weather_conditions import derive_windsurfice_weather
+
 
 DB_FILENAME = "wind_data_all_sites.db"
 LEGACY_DB_FILENAME = "wind_data.db"
@@ -40,6 +42,9 @@ SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
 }
 USER_PROFILE_OPTIONAL_COLUMNS = {
     "public_username": "TEXT",
+}
+FORECAST_OPTIONAL_COLUMNS = {
+    "weather_code": "INTEGER",
 }
 
 
@@ -91,6 +96,7 @@ def _create_forecasts_table(conn: sqlite3.Connection) -> None:
             wind_speed REAL,
             wind_gust REAL,
             wind_dir REAL,
+            weather_code INTEGER,
             payload TEXT,
             PRIMARY KEY (site, model, run_ts, target_ts)
         )
@@ -212,7 +218,18 @@ def _forecast_schema_matches(conn: sqlite3.Connection) -> bool:
         )
         for row in rows
     }
-    return actual == expected
+    # Optional columns are additive migrations. Extra columns must never force
+    # a rebuild of an otherwise-current forecast table.
+    return all(actual.get(column) == definition for column, definition in expected.items())
+
+
+def _ensure_forecast_optional_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = _table_columns(conn, FORECASTS_TABLE)
+    for column_name, column_type in FORECAST_OPTIONAL_COLUMNS.items():
+        if column_name not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE {FORECASTS_TABLE} ADD COLUMN {column_name} {column_type}"
+            )
 
 
 def _next_backup_table_name(conn: sqlite3.Connection, base_name: str) -> str:
@@ -227,9 +244,11 @@ def _next_backup_table_name(conn: sqlite3.Connection, base_name: str) -> str:
 def _migrate_forecasts_table(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, FORECASTS_TABLE):
         _create_forecasts_table(conn)
+        _ensure_forecast_optional_columns(conn)
         return
     if _forecast_schema_matches(conn):
         _create_forecasts_table(conn)
+        _ensure_forecast_optional_columns(conn)
         return
 
     legacy_table = _next_backup_table_name(conn, 'forecasts_legacy')
@@ -252,6 +271,7 @@ def _migrate_forecasts_table(conn: sqlite3.Connection) -> None:
     wind_gust_expr = 'wind_gust' if 'wind_gust' in legacy_columns else 'NULL'
     wind_dir_expr = 'wind_dir' if 'wind_dir' in legacy_columns else 'NULL'
     payload_expr = 'payload' if 'payload' in legacy_columns else 'NULL'
+    weather_code_expr = 'weather_code' if 'weather_code' in legacy_columns else 'NULL'
 
     # Legacy DBs did not persist fetch time separately, so migration reuses the
     # stored run time. New writes keep run_ts (forecast vintage) separate from
@@ -260,7 +280,7 @@ def _migrate_forecasts_table(conn: sqlite3.Connection) -> None:
         f"""
         INSERT OR REPLACE INTO {FORECASTS_TABLE} (
             site, model, run_ts, run_iso, fetched_ts, fetched_iso,
-            target_ts, target_iso, horizon_hr, wind_speed, wind_gust, wind_dir, payload
+            target_ts, target_iso, horizon_hr, wind_speed, wind_gust, wind_dir, weather_code, payload
         )
         SELECT
             site,
@@ -275,12 +295,14 @@ def _migrate_forecasts_table(conn: sqlite3.Connection) -> None:
             {wind_speed_expr},
             {wind_gust_expr},
             {wind_dir_expr},
+            {weather_code_expr},
             {payload_expr}
         FROM {legacy_table}
         WHERE run_ts IS NOT NULL
           AND target_ts IS NOT NULL
         """
     )
+    _ensure_forecast_optional_columns(conn)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -586,13 +608,14 @@ def upsert_forecasts(
         horizon_ms = target_ts - run_ts_ms
         horizon_hr = int(round(horizon_ms / 1000 / 3600))
         spd, gst, dire = extract_wind_triplet(r)
+        weather_code = derive_windsurfice_weather(r)
         cur.execute(
             f"""
             INSERT INTO {FORECASTS_TABLE}(
                 site, model, run_ts, run_iso, fetched_ts, fetched_iso, target_ts, target_iso, horizon_hr,
-                wind_speed, wind_gust, wind_dir, payload
+                wind_speed, wind_gust, wind_dir, weather_code, payload
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,json(?))
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,json(?))
             ON CONFLICT(site, model, run_ts, target_ts) DO UPDATE SET
                 run_iso=excluded.run_iso,
                 fetched_ts=MIN({FORECASTS_TABLE}.fetched_ts, excluded.fetched_ts),
@@ -605,6 +628,7 @@ def upsert_forecasts(
                 wind_speed=COALESCE(excluded.wind_speed, {FORECASTS_TABLE}.wind_speed),
                 wind_gust=COALESCE(excluded.wind_gust, {FORECASTS_TABLE}.wind_gust),
                 wind_dir=COALESCE(excluded.wind_dir, {FORECASTS_TABLE}.wind_dir),
+                weather_code=COALESCE(excluded.weather_code, {FORECASTS_TABLE}.weather_code),
                 payload=excluded.payload
             """,
             (
@@ -620,6 +644,7 @@ def upsert_forecasts(
                 spd,
                 gst,
                 dire,
+                weather_code,
                 json.dumps(r, ensure_ascii=False),
             ),
         )

@@ -15,7 +15,13 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Iterable
 
 import pandas as pd
+import numpy as np
 import requests
+
+from next_day_wind_model.weather_conditions import (
+    derive_weather_code,
+    hourly_accumulation_increments,
+)
 
 if TYPE_CHECKING:
     import xarray as xr
@@ -31,6 +37,20 @@ U_WIND_PARAMETER = 33
 V_WIND_PARAMETER = 34
 GUST_U_WIND_PARAMETER = 162
 GUST_V_WIND_PARAMETER = 163
+WEATHER_PARAMETERS: dict[str, tuple[int, int, int | None]] = {
+    "temperature_2m_c": (11, 2, None),
+    "visibility_m": (20, 0, None),
+    "relative_humidity_2m_pct": (52, 2, None),
+    "total_precip_accum_mm": (61, 0, 4),
+    "total_cloud_cover_pct": (71, 0, None),
+    "low_cloud_cover_pct": (73, 0, None),
+    "medium_cloud_cover_pct": (74, 0, None),
+    "high_cloud_cover_pct": (75, 0, None),
+    "rain_accum_mm": (181, 0, 4),
+    "snow_accum_mm_we": (184, 0, 4),
+    "cloud_base_m": (186, 0, None),
+    "graupel_accum_mm_we": (201, 0, 4),
+}
 KNOTS_PER_MPS = 1.9438444924406
 HARMONIE_P1_TAR_PATTERN = re.compile(r"^HARM43_V1_P1_(\d{10})\.tar$")
 
@@ -354,7 +374,13 @@ def ensure_downloaded_tar(
     return download_file(download_url, out_path)
 
 
-def open_grib_parameter(grib_path: Path, parameter: int, level: int) -> "xr.Dataset":
+def open_grib_parameter(
+    grib_path: Path,
+    parameter: int,
+    level: int,
+    *,
+    time_range_indicator: int | None = None,
+) -> "xr.Dataset":
     try:
         import xarray as xr
     except ModuleNotFoundError as exc:
@@ -363,14 +389,17 @@ def open_grib_parameter(grib_path: Path, parameter: int, level: int) -> "xr.Data
         ) from exc
 
     try:
+        filter_by_keys = {
+            "indicatorOfParameter": parameter,
+            "level": level,
+        }
+        if time_range_indicator is not None:
+            filter_by_keys["timeRangeIndicator"] = int(time_range_indicator)
         return xr.open_dataset(
             grib_path,
             engine="cfgrib",
             backend_kwargs={
-                "filter_by_keys": {
-                    "indicatorOfParameter": parameter,
-                    "level": level,
-                },
+                "filter_by_keys": filter_by_keys,
                 "indexpath": "",
             },
         )
@@ -387,6 +416,74 @@ def nearest_value(ds: "xr.Dataset", site: SitePoint) -> tuple[float, float, floa
         raise KnmiExtractionError(f"Expected one GRIB data variable, found: {data_vars}")
     var = data_vars[0]
     return float(point[var].values), float(point.latitude), float(point.longitude)
+
+
+def _normalise_weather_value(name: str, value: float) -> float:
+    if name == "temperature_2m_c" and value > 150.0:
+        return value - 273.15
+    if name.endswith("_cover_pct") or name == "relative_humidity_2m_pct":
+        return value * 100.0 if 0.0 <= value <= 1.0 else value
+    return value
+
+
+def extract_weather_parameters(grib_path: Path, site: SitePoint) -> dict[str, float | None]:
+    """Extract available P1 weather fields without making wind archival fragile."""
+    values: dict[str, float | None] = {}
+    for name, (parameter, level, time_range_indicator) in WEATHER_PARAMETERS.items():
+        dataset = None
+        try:
+            dataset = open_grib_parameter(
+                grib_path,
+                parameter=parameter,
+                level=level,
+                time_range_indicator=time_range_indicator,
+            )
+            value, _, _ = nearest_value(dataset, site)
+            values[name] = _normalise_weather_value(name, value)
+        except Exception:
+            values[name] = None
+        finally:
+            if dataset is not None:
+                dataset.close()
+    return values
+
+
+def add_hourly_weather_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Derive no-look-ahead hourly increments and weather codes per model run."""
+    if frame.empty:
+        return frame.copy()
+    output = frame.copy().sort_values(["run_ts", "horizon_hr"]).reset_index(drop=True)
+    for hourly_name, accumulation_name in (
+        ("total_precip_hourly_mm", "total_precip_accum_mm"),
+        ("rain_hourly_mm", "rain_accum_mm"),
+        ("snow_hourly_mm_we", "snow_accum_mm_we"),
+        ("graupel_hourly_mm_we", "graupel_accum_mm_we"),
+    ):
+        output[hourly_name] = np.nan
+        if accumulation_name not in output:
+            continue
+        for _, indices in output.groupby("run_ts", sort=False).groups.items():
+            ordered = list(indices)
+            output.loc[ordered, hourly_name] = hourly_accumulation_increments(
+                pd.to_numeric(output.loc[ordered, accumulation_name], errors="coerce")
+            )
+    output["snowfall_hourly_cm"] = pd.to_numeric(
+        output["snow_hourly_mm_we"], errors="coerce"
+    ) * 0.7
+
+    def _code(row: pd.Series) -> int | None:
+        precipitation = row.get("total_precip_hourly_mm")
+        if pd.isna(precipitation):
+            precipitation = row.get("rain_hourly_mm")
+        return derive_weather_code(
+            cloud_cover_pct=row.get("total_cloud_cover_pct"),
+            precipitation_mm=precipitation,
+            snow_water_equivalent_mm=row.get("snow_hourly_mm_we"),
+            visibility_m=row.get("visibility_m"),
+        )
+
+    output["weather_code"] = output.apply(_code, axis=1).astype("Int64")
+    return output
 
 
 def _level_feature_names(level: int) -> tuple[str, str, str, str, str, str]:
@@ -469,6 +566,7 @@ def extract_one_grib(
 
     row["grid_lat"] = grid_lat
     row["grid_lon"] = grid_lon
+    row.update(extract_weather_parameters(grib_path, site))
     add_derived_features(row)
     return row
 
@@ -542,7 +640,7 @@ def extract_tar_features(
 
     if not rows:
         raise KnmiExtractionError(f"No KNMI feature rows extracted from {tar_path}.")
-    frame = pd.DataFrame(rows).sort_values(["run_ts", "horizon_hr"]).reset_index(drop=True)
+    frame = add_hourly_weather_features(pd.DataFrame(rows))
     return ExtractionResult(frame=frame, errors=tuple(errors))
 
 
@@ -570,6 +668,24 @@ def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
             wind_dir_10m REAL,
             wind_dir_sin_10m REAL,
             wind_dir_cos_10m REAL,
+            temperature_2m_c REAL,
+            visibility_m REAL,
+            relative_humidity_2m_pct REAL,
+            total_precip_accum_mm REAL,
+            total_precip_hourly_mm REAL,
+            total_cloud_cover_pct REAL,
+            low_cloud_cover_pct REAL,
+            medium_cloud_cover_pct REAL,
+            high_cloud_cover_pct REAL,
+            rain_accum_mm REAL,
+            rain_hourly_mm REAL,
+            snow_accum_mm_we REAL,
+            snow_hourly_mm_we REAL,
+            snowfall_hourly_cm REAL,
+            cloud_base_m REAL,
+            graupel_accum_mm_we REAL,
+            graupel_hourly_mm_we REAL,
+            weather_code INTEGER,
             u_50m_mps REAL,
             v_50m_mps REAL,
             wind_speed_50m_mps REAL,
@@ -614,6 +730,24 @@ def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
     for column, column_type in (
         ("wind_gust_10m_mps", "REAL"),
         ("wind_gust_10m_knots", "REAL"),
+        ("temperature_2m_c", "REAL"),
+        ("visibility_m", "REAL"),
+        ("relative_humidity_2m_pct", "REAL"),
+        ("total_precip_accum_mm", "REAL"),
+        ("total_precip_hourly_mm", "REAL"),
+        ("total_cloud_cover_pct", "REAL"),
+        ("low_cloud_cover_pct", "REAL"),
+        ("medium_cloud_cover_pct", "REAL"),
+        ("high_cloud_cover_pct", "REAL"),
+        ("rain_accum_mm", "REAL"),
+        ("rain_hourly_mm", "REAL"),
+        ("snow_accum_mm_we", "REAL"),
+        ("snow_hourly_mm_we", "REAL"),
+        ("snowfall_hourly_cm", "REAL"),
+        ("cloud_base_m", "REAL"),
+        ("graupel_accum_mm_we", "REAL"),
+        ("graupel_hourly_mm_we", "REAL"),
+        ("weather_code", "INTEGER"),
     ):
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {column} {column_type}")

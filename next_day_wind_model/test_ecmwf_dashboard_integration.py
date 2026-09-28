@@ -275,6 +275,10 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(current_diagnostics["weather_cell_count"], 14)
         self.assertEqual(current_diagnostics["weather_icon_count"], 14)
         self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
+        self.assertGreater(
+            current_diagnostics["time_label_axis_zorder"],
+            current_diagnostics["direction_axis_zorder"],
+        )
         self.assertEqual(next_diagnostics["axis_count"], 3)
         self.assertEqual(
             next_diagnostics["axis_roles"],
@@ -340,6 +344,10 @@ class RendererIntegrationTests(unittest.TestCase):
         self.assertEqual(next_diagnostics["weather_icon_temperature_overlap_count"], 0)
         self.assertNotIn("unknown", next_diagnostics["model_id_text"].lower())
         self.assertEqual(current_diagnostics["direction_arrow_count"], 34)
+        self.assertGreater(
+            current_diagnostics["time_label_axis_zorder"],
+            current_diagnostics["direction_axis_zorder"],
+        )
         self.assertEqual(next_diagnostics["direction_arrow_count"], 30)
         assert_header_bounds_do_not_overlap(self, current_diagnostics)
         assert_header_bounds_do_not_overlap(self, next_diagnostics)

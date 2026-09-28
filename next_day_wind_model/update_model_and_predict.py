@@ -3998,6 +3998,10 @@ def save_current_day_plot(
     direction_ax.set_ylabel("")
     direction_ax.set_xlabel("")
     direction_ax.grid(False)
+    # Tick labels extend below the variability axes into the direction row.
+    # Draw that axes after the direction axes so arrows cannot paint over them.
+    direction_ax.set_zorder(0)
+    variability_ax.set_zorder(1)
     for spine_name in ("left", "right", "top", "bottom"):
         direction_ax.spines[spine_name].set_visible(False)
 
@@ -4298,6 +4302,8 @@ def save_current_day_plot(
                     len(axis.texts) for axis in (ax, weather_ax, variability_ax, direction_ax)
                 ],
                 "direction_arrow_count": direction_arrow_count,
+                "time_label_axis_zorder": float(variability_ax.get_zorder()),
+                "direction_axis_zorder": float(direction_ax.get_zorder()),
                 "ecmwf_plotted": ecmwf_plotted,
                 "ecmwf_color": ECMWF_FORECAST_COLOR if ecmwf_plotted else None,
                 "ecmwf_linestyle": "-" if ecmwf_plotted else None,

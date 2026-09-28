@@ -477,6 +477,9 @@ def add_hourly_weather_features(frame: pd.DataFrame) -> pd.DataFrame:
             precipitation = row.get("rain_hourly_mm")
         return derive_weather_code(
             cloud_cover_pct=row.get("total_cloud_cover_pct"),
+            low_cloud_cover_pct=row.get("low_cloud_cover_pct"),
+            medium_cloud_cover_pct=row.get("medium_cloud_cover_pct"),
+            high_cloud_cover_pct=row.get("high_cloud_cover_pct"),
             precipitation_mm=precipitation,
             snow_water_equivalent_mm=row.get("snow_hourly_mm_we"),
             visibility_m=row.get("visibility_m"),

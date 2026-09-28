@@ -26,6 +26,8 @@ from next_day_wind_model.weather_conditions import (
     build_weather_timeline,
     conventional_degree_label,
     derive_weather_code,
+    derive_windsurfice_weather,
+    effective_cloud_cover_pct,
     hourly_accumulation_increments,
     is_daylight,
     weather_icon_path,
@@ -42,10 +44,50 @@ class WeatherClassifierTests(unittest.TestCase):
         self.assertEqual(derive_weather_code(cloud_cover_pct=79.999), 2)
         self.assertEqual(derive_weather_code(cloud_cover_pct=80), 3)
 
-    def test_total_high_cloud_still_classifies_as_overcast(self) -> None:
-        # P1 parameter 71 is total cloud cover; layer composition does not
-        # override the strict WMO/Open-Meteo total-cloud threshold.
+    def test_total_only_cloud_cover_keeps_legacy_fallback(self) -> None:
         self.assertEqual(derive_weather_code(cloud_cover_pct=95), 3)
+
+    def test_layer_aware_cloud_cover_discounts_thin_upper_layers(self) -> None:
+        self.assertAlmostEqual(effective_cloud_cover_pct(100, 0, 0, 100), 35.0)
+        self.assertEqual(
+            derive_weather_code(
+                cloud_cover_pct=100,
+                low_cloud_cover_pct=0,
+                medium_cloud_cover_pct=0,
+                high_cloud_cover_pct=100,
+            ),
+            1,
+        )
+        self.assertEqual(
+            derive_weather_code(
+                cloud_cover_pct=100,
+                low_cloud_cover_pct=0,
+                medium_cloud_cover_pct=100,
+                high_cloud_cover_pct=0,
+            ),
+            2,
+        )
+        self.assertEqual(
+            derive_weather_code(
+                cloud_cover_pct=100,
+                low_cloud_cover_pct=80,
+                medium_cloud_cover_pct=0,
+                high_cloud_cover_pct=0,
+            ),
+            3,
+        )
+        self.assertEqual(
+            derive_windsurfice_weather(
+                {
+                    "Clouds": 100,
+                    "low_cloud_cover": 0,
+                    "medium_cloud_cover": 0,
+                    "high_cloud_cover": 100,
+                    "Rain": 0,
+                }
+            ),
+            1,
+        )
 
     def test_precipitation_boundaries(self) -> None:
         cases = [
@@ -183,18 +225,21 @@ class WeatherStorageTests(unittest.TestCase):
         })
         frame = pd.DataFrame(
             {
-                "run_ts": ["2026-01-01T00:00:00Z"] * 3,
-                "horizon_hr": [0, 1, 2],
-                "total_precip_accum_mm": [0.0, 0.6, 1.8],
-                "rain_accum_mm": [0.0, 0.6, 1.8],
-                "snow_accum_mm_we": [0.0, 0.0, 0.0],
-                "graupel_accum_mm_we": [0.0, 0.0, 0.0],
-                "total_cloud_cover_pct": [10, 90, 90],
-                "visibility_m": [10_000, 10_000, 10_000],
+                "run_ts": ["2026-01-01T00:00:00Z"] * 4,
+                "horizon_hr": [0, 1, 2, 3],
+                "total_precip_accum_mm": [0.0, 0.6, 1.8, 1.8],
+                "rain_accum_mm": [0.0, 0.6, 1.8, 1.8],
+                "snow_accum_mm_we": [0.0, 0.0, 0.0, 0.0],
+                "graupel_accum_mm_we": [0.0, 0.0, 0.0, 0.0],
+                "total_cloud_cover_pct": [10, 90, 90, 100],
+                "low_cloud_cover_pct": [0, 0, 0, 0],
+                "medium_cloud_cover_pct": [0, 0, 0, 0],
+                "high_cloud_cover_pct": [10, 90, 90, 100],
+                "visibility_m": [10_000, 10_000, 10_000, 10_000],
             }
         )
         derived = add_hourly_weather_features(frame)
-        self.assertEqual(derived["weather_code"].tolist(), [0, 53, 55])
+        self.assertEqual(derived["weather_code"].tolist(), [0, 53, 55, 1])
         conn.close()
 
     def test_p1_parameter_extraction_requests_accumulated_fields(self) -> None:

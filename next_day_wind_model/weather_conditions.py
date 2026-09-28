@@ -90,6 +90,41 @@ def _finite(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def effective_cloud_cover_pct(
+    total_cloud_cover_pct: Any,
+    low_cloud_cover_pct: Any = None,
+    medium_cloud_cover_pct: Any = None,
+    high_cloud_cover_pct: Any = None,
+) -> float | None:
+    """Estimate visually opaque cloud cover when all layer covers are available.
+
+    Total cloud cover alone treats thin high cloud like an opaque low deck. The
+    layer-aware estimate keeps low cloud at full weight while discounting mid
+    and high cloud, then combines the layers as overlapping fractional cover.
+    """
+    total = _finite(total_cloud_cover_pct)
+    layers = tuple(
+        _finite(value)
+        for value in (
+            low_cloud_cover_pct,
+            medium_cloud_cover_pct,
+            high_cloud_cover_pct,
+        )
+    )
+    if any(value is None for value in layers):
+        return total
+    low, medium, high = (
+        max(0.0, min(100.0, float(value))) / 100.0
+        for value in layers
+    )
+    effective = 100.0 * (
+        1.0 - (1.0 - low) * (1.0 - 0.70 * medium) * (1.0 - 0.35 * high)
+    )
+    if total is not None:
+        effective = min(max(0.0, min(100.0, total)), effective)
+    return effective
+
+
 def _severity(value: float, thresholds: Iterable[float], codes: Iterable[int]) -> int:
     threshold_values = tuple(thresholds)
     code_values = tuple(codes)
@@ -102,6 +137,9 @@ def _severity(value: float, thresholds: Iterable[float], codes: Iterable[int]) -
 def derive_weather_code(
     *,
     cloud_cover_pct: Any = None,
+    low_cloud_cover_pct: Any = None,
+    medium_cloud_cover_pct: Any = None,
+    high_cloud_cover_pct: Any = None,
     precipitation_mm: Any = None,
     rain_mm: Any = None,
     snow_water_equivalent_mm: Any = None,
@@ -158,7 +196,12 @@ def derive_weather_code(
     visibility = _finite(visibility_m)
     if visibility is not None and visibility <= 1000.0:
         return 45
-    cloud = _finite(cloud_cover_pct)
+    cloud = effective_cloud_cover_pct(
+        cloud_cover_pct,
+        low_cloud_cover_pct,
+        medium_cloud_cover_pct,
+        high_cloud_cover_pct,
+    )
     if cloud is None:
         return None
     if cloud < 20.0:
@@ -267,6 +310,9 @@ def derive_windsurfice_weather(payload: dict[str, Any]) -> int | None:
     lower = {str(key).lower(): value for key, value in payload.items()}
     return derive_weather_code(
         cloud_cover_pct=lower.get("clouds", lower.get("cloud_cover")),
+        low_cloud_cover_pct=lower.get("low_cloud_cover"),
+        medium_cloud_cover_pct=lower.get("medium_cloud_cover"),
+        high_cloud_cover_pct=lower.get("high_cloud_cover"),
         precipitation_mm=lower.get("rain", lower.get("precipitation")),
     )
 

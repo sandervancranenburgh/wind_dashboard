@@ -64,6 +64,24 @@ Outputs:
 - `next_day_wind_model/artifacts/tuning_intraday_results.csv`
 - `next_day_wind_model/artifacts/tuning_summary.json` (includes recommended training command)
 
+## Offline Gustiness Experiment
+
+Evaluate the already archived HARMONIE P1 gust and wind-profile features against
+the rider-reported session labels without modifying the production database:
+
+```bash
+python3 next_day_wind_model/gustiness_experiment.py \
+  --db data/wind_data_all_sites.db \
+  --out-dir next_day_wind_model/artifacts/gustiness_experiment
+```
+
+The database is opened with SQLite `mode=ro&immutable=1` and `query_only`. The
+experiment uses the latest P1 vintage that was available before each session,
+holds out complete session dates during evaluation, and treats `gusty` plus
+`very_gusty` as the positive class. Outputs are session features, out-of-fold
+predictions, model metrics, a date-cluster bootstrap, a JSON summary, and a
+diagnostic plot. The experiment does not publish or promote a production model.
+
 ## Output artifacts
 
 - `next_day_wind_model/artifacts/next_day_lstm_speed_residual.pt` (residual speed)

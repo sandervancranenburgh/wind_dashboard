@@ -50,9 +50,9 @@
         "referer_slug": "oostvoorne"
       },
       "knmi_p1": {
-        "enabled": false,
-        "latitude": 51.9278,
-        "longitude": 4.05502
+        "enabled": true,
+        "latitude": 51.928597,
+        "longitude": 4.074097
       },
       "ecmwf": {
         "enabled": true,

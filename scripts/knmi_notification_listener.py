@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.knmi_extract_latest_to_db import DEFAULT_SITE_POINTS, process_knmi_file_to_db
+from scripts.knmi_extract_latest_to_db import DEFAULT_SITE_POINTS, process_knmi_file_to_db_for_sites
 
 
 HOST = "mqtt.dataplatform.knmi.nl"
@@ -32,12 +32,20 @@ FILENAME_KEYS = {"filename", "fileName", "name", "key", "path"}
 SESSION_EXPIRY_SECONDS = 24 * 60 * 60
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Subscribe to KNMI Notification Service HARMONIE P1 events and update shadow SQLite tables.",
     )
     parser.add_argument("--db", type=Path, default=Path("data/wind_data_all_sites.db"))
-    parser.add_argument("--site", required=True, choices=sorted(DEFAULT_SITE_POINTS))
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--site", action="append", dest="sites", choices=sorted(DEFAULT_SITE_POINTS),
+        help="Configured site ID; repeat to process multiple sites.",
+    )
+    selection.add_argument(
+        "--all-sites", action="store_true",
+        help="Process every KNMI P1-enabled site in the canonical registry.",
+    )
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--keep-raw", action="store_true")
     parser.add_argument("--raw-retention-runs", type=int, default=None)
@@ -45,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="Exit after processing one valid file event.")
     parser.add_argument("--max-events", type=int, default=None, help="Exit after processing N valid file events.")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def configure_logging(level: str) -> None:
@@ -196,10 +204,11 @@ def connect_client(client: Any) -> None:
 def process_filename(filename: str, args: argparse.Namespace) -> bool:
     logging.info("Processing KNMI notification filename=%s", filename)
     try:
-        result = process_knmi_file_to_db(
+        sites = tuple(DEFAULT_SITE_POINTS) if args.all_sites else tuple(dict.fromkeys(args.sites))
+        batch = process_knmi_file_to_db_for_sites(
             filename=filename,
             db_path=args.db,
-            site=args.site,
+            sites=sites,
             keep_raw=args.keep_raw,
             raw_retention_runs=args.raw_retention_runs,
             cleanup_dry_run=args.cleanup_dry_run,
@@ -208,19 +217,17 @@ def process_filename(filename: str, args: argparse.Namespace) -> bool:
         logging.exception("KNMI notification processing failed for %s", filename)
         return False
 
-    diagnostic = result.archive_diagnostic or {}
-    logging.info(
-        "KNMI notification processed filename=%s run_ts=%s rows_written=%s shadow_rows_written=%s "
-        "distinct_knmi_runs=%s row_count=%s max_run_ts=%s latest_run_horizon_count=%s",
-        result.filename,
-        result.run_ts,
-        result.rows_written,
-        result.shadow_rows_written,
-        diagnostic.get("distinct_run_ts"),
-        diagnostic.get("row_count"),
-        diagnostic.get("max_run_ts"),
-        result.latest_run_horizon_count,
-    )
+    for result in batch.results:
+        diagnostic = result.archive_diagnostic or {}
+        logging.info(
+            "KNMI notification processed filename=%s site=%s run_ts=%s rows_written=%s "
+            "shadow_rows_written=%s distinct_knmi_runs=%s row_count=%s max_run_ts=%s "
+            "latest_run_horizon_count=%s",
+            result.filename, result.site.site, result.run_ts, result.rows_written,
+            result.shadow_rows_written, diagnostic.get("distinct_run_ts"),
+            diagnostic.get("row_count"), diagnostic.get("max_run_ts"),
+            result.latest_run_horizon_count,
+        )
     return True
 
 

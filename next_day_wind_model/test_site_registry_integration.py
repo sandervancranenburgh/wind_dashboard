@@ -38,8 +38,12 @@ class SiteRegistryIntegrationTests(unittest.TestCase):
         self.assertEqual(db_store.SPOT_TO_SITE["Valkenburgse meer"], "valkenburgsemeer")
         self.assertEqual(db_store.SPOT_TO_SITE["Valkenburgse Meer"], "valkenburgsemeer")
 
-    def test_knmi_operational_enablement_remains_valkenburg_only(self) -> None:
-        self.assertEqual(tuple(DEFAULT_SITE_POINTS), ("valkenburgsemeer",))
+    def test_knmi_operational_enablement_includes_both_sites(self) -> None:
+        self.assertEqual(tuple(DEFAULT_SITE_POINTS), ("valkenburgsemeer", "oostvoorne"))
+        self.assertEqual(
+            (DEFAULT_SITE_POINTS["oostvoorne"].lat, DEFAULT_SITE_POINTS["oostvoorne"].lon),
+            (51.928597, 4.074097),
+        )
 
     def test_production_ecmwf_config_resolves_both_registry_sites(self) -> None:
         config = load_shadow_config(Path("config/ecmwf_production.json"))

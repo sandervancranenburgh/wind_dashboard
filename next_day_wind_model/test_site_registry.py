@@ -38,7 +38,7 @@ class SiteRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(site.site_id for site in enabled_sites("knmi_p1")),
-            ("valkenburgsemeer",),
+            ("valkenburgsemeer", "oostvoorne"),
         )
         self.assertEqual(
             tuple(site.site_id for site in enabled_sites("superlocal_model")),
@@ -52,6 +52,15 @@ class SiteRegistryTests(unittest.TestCase):
             (52.1603, 4.44197),
         )
         self.assertEqual((site.knmi_p1.latitude, site.knmi_p1.longitude), (52.168, 4.437))
+        oostvoorne = load_site_registry().site("oostvoorne")
+        self.assertEqual(
+            (oostvoorne.knmi_p1.latitude, oostvoorne.knmi_p1.longitude),
+            (51.928597, 4.074097),
+        )
+        self.assertEqual(
+            (oostvoorne.windsurfice.forecast_latitude, oostvoorne.windsurfice.forecast_longitude),
+            (51.9278, 4.05502),
+        )
 
     def test_duplicate_site_id_is_rejected(self) -> None:
         registry = load_site_registry()

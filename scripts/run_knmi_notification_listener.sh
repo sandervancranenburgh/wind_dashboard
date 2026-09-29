@@ -43,7 +43,7 @@ cd "${REPO_ROOT}"
     source "${VENV}/bin/activate"
   fi
 
-  python3 scripts/knmi_notification_listener.py --site valkenburgsemeer --log-level INFO
+  python3 scripts/knmi_notification_listener.py --all-sites --log-level INFO
 
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI notification listener end"
 } >> "${LOG_FILE}" 2>&1

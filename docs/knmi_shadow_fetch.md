@@ -13,6 +13,38 @@ without changing the production Windsurfice fetch, dashboard, or model path.
 It does not write to production `forecasts` unless `--write-production` is
 explicitly passed. That flag is intended only for manual controlled tests.
 
+## Multi-site operation
+
+Use `--all-sites` for normal operation or repeat `--site` for an explicit
+subset. A P1 tar is downloaded and each member is staged once, then every
+selected site is extracted from it. All selected sites are written to both
+KNMI tables in one SQLite transaction. If extraction or writing fails for any
+site, the transaction is rolled back and the tar remains available for retry.
+The tar cleanup policy runs once, only after the cross-site commit succeeds.
+
+The configured KNMI P1 points are:
+
+- `valkenburgsemeer`: `52.168, 4.437`;
+- `oostvoorne`: `51.928597, 4.074097`.
+
+Oostvoorne's former `51.9278, 4.05502` value originated as the coordinate sent
+to the Windsurfice forecast endpoint; the repository contains no evidence that
+it is the `windsurfice-v25-node6` sensor coordinate. Windsurfice and ECMWF keep
+their existing source-specific coordinates in this phase.
+
+Development validation with `HARM43_V1_P1_2026092911.tar` showed that the old
+and new Oostvoorne coordinates both resolve to the same P1 grid point
+(`grid_lat` approximately `51.934`, `grid_lon` approximately `4.060`) for all
+61 horizons. Their extracted 10 m wind, gust, and 100 m wind values were
+identical for that archive.
+
+Examples:
+
+```bash
+python3 scripts/knmi_extract_latest_to_db.py --all-sites
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --site oostvoorne
+```
+
 ## HARMONIE P1 local GRIB parameter mapping
 
 The KNMI HARMONIE Cy43 P1 GRIB code table defines the local wind parameters
@@ -57,19 +89,19 @@ comparison views that report their selection policy.
 Latest available KNMI tar:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer
+python3 scripts/knmi_extract_latest_to_db.py --all-sites
 ```
 
 Specific filename, suitable for a future Notification Service listener:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --filename HARM43_V1_P1_2026051504.tar
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --filename HARM43_V1_P1_2026051504.tar
 ```
 
 Existing local tar, useful for offline verification:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer \
+python3 scripts/knmi_extract_latest_to_db.py --all-sites \
   --tar-path data/raw/knmi/harmonie_arome_cy43_p1/HARM43_V1_P1_2026051504.tar
 ```
 
@@ -88,19 +120,19 @@ By default, after successful extraction and successful writes to
 processed tar file:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer
+python3 scripts/knmi_extract_latest_to_db.py --all-sites
 ```
 
 For debugging, keep the processed tar:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --keep-raw
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --keep-raw
 ```
 
 To retain only the latest N matching raw HARMONIE P1 tar files in `--raw-dir`:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --raw-retention-runs 2
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --raw-retention-runs 2
 ```
 
 When `--raw-retention-runs N` is supplied, retention controls which
@@ -139,19 +171,19 @@ Example hourly cron fallback:
 Recent KNMI runs:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --inspect-runs --inspect-limit 10
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --inspect-runs --inspect-limit 10
 ```
 
 Archive diagnostic:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --archive-diagnostic
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --archive-diagnostic
 ```
 
 Latest shadow rows:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --inspect-shadow --inspect-limit 5
+python3 scripts/knmi_extract_latest_to_db.py --all-sites --inspect-shadow --inspect-limit 5
 ```
 
 Compare latest KNMI shadow and Windsurfice snapshots:

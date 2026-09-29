@@ -28,7 +28,7 @@ from next_day_wind_model.knmi_harmonie import (
     create_harmonie_knmi_features_table,
     create_knmi_forecasts_shadow_table,
     ensure_downloaded_tar,
-    extract_tar_features,
+    extract_tar_features_for_sites,
     knmi_archive_diagnostic,
     latest_harmonie_knmi_rows,
     latest_shadow_rows,
@@ -73,7 +73,17 @@ class KnmiProcessResult:
     latest_run_horizon_count: int | None
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class KnmiBatchProcessResult:
+    filename: str
+    run_ts: str | None
+    tar_path: Path
+    selected_size: int | None
+    results: tuple[KnmiProcessResult, ...]
+    cleanup_result: Any
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download/extract the latest KNMI HARMONIE P1 tar and write feature rows to SQLite.",
     )
@@ -82,7 +92,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/knmi/harmonie_arome_cy43_p1"))
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--version", default=VERSION)
-    parser.add_argument("--site", required=True, choices=sorted(DEFAULT_SITE_POINTS))
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--site", action="append", dest="sites", choices=sorted(DEFAULT_SITE_POINTS),
+        help="Configured site ID; repeat to process multiple sites.",
+    )
+    selection.add_argument(
+        "--all-sites", action="store_true",
+        help="Process every KNMI P1-enabled site in the canonical registry.",
+    )
     parser.add_argument("--site-lat", type=float, default=None)
     parser.add_argument("--site-lon", type=float, default=None)
     parser.add_argument("--max-files", type=int, default=10)
@@ -160,11 +178,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print raw tar cleanup actions after successful extraction without deleting files.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def site_points_from_args(args: argparse.Namespace) -> tuple[SitePoint, ...]:
+    site_names = list(DEFAULT_SITE_POINTS) if args.all_sites else list(dict.fromkeys(args.sites))
+    if (args.site_lat is not None or args.site_lon is not None) and len(site_names) != 1:
+        raise ValueError("--site-lat/--site-lon require exactly one --site.")
+    return tuple(
+        site_point_from_name(site, args.site_lat, args.site_lon)
+        for site in site_names
+    )
 
 
 def site_point_from_args(args: argparse.Namespace) -> SitePoint:
-    return site_point_from_name(args.site, args.site_lat, args.site_lon)
+    """Compatibility helper for callers that require exactly one selected site."""
+    points = site_points_from_args(args)
+    if len(points) != 1:
+        raise ValueError("Exactly one KNMI site is required for this operation.")
+    return points[0]
 
 
 def db_path_from_args(args: argparse.Namespace) -> Path:
@@ -380,10 +412,10 @@ def print_cleanup_summary(args: argparse.Namespace, tar_path: Path, result: Any)
             print(f"- {warning}")
 
 
-def process_knmi_file_to_db(
+def process_knmi_file_to_db_for_sites(
     filename: str | None,
     db_path: Path,
-    site: str,
+    sites: tuple[str, ...] | list[str],
     keep_raw: bool = False,
     raw_retention_runs: int | None = None,
     cleanup_dry_run: bool = False,
@@ -402,106 +434,123 @@ def process_knmi_file_to_db(
     skip_archive_diagnostic: bool = False,
     include_observation_joinability: bool = False,
     db_retries: int = 5,
-) -> KnmiProcessResult:
-    """Download/extract one KNMI HARMONIE P1 tar and write shadow rows to SQLite."""
+) -> KnmiBatchProcessResult:
+    """Download one archive, extract all sites, and commit them atomically."""
     if raw_retention_runs is not None and raw_retention_runs < 0:
         raise ValueError("raw_retention_runs must be zero or greater.")
+    site_names = tuple(dict.fromkeys(sites))
+    if not site_names:
+        raise ValueError("At least one KNMI site is required.")
+    if (site_lat is not None or site_lon is not None) and len(site_names) != 1:
+        raise ValueError("Custom coordinates require exactly one KNMI site.")
+    site_points = tuple(site_point_from_name(site, site_lat, site_lon) for site in site_names)
 
-    site_point = site_point_from_name(site, site_lat, site_lon)
-    args = argparse.Namespace(
-        tar_path=tar_path,
-        filename=filename,
-        raw_dir=raw_dir,
-        dataset=dataset,
-        version=version,
-        max_files=max_files,
+    selection_args = argparse.Namespace(
+        tar_path=tar_path, filename=filename, raw_dir=raw_dir, dataset=dataset,
+        version=version, max_files=max_files,
     )
     fetched_ts = utc_now_iso()
-    tar_path, selected_filename, run_ts, selected_size = select_tar(args)
-    result = extract_tar_features(
-        tar_path,
-        site_point,
-        source=SOURCE,
-        dataset=dataset,
-        fetched_ts=fetched_ts,
-        continue_on_error=continue_on_error,
+    selected_tar, selected_filename, run_ts, selected_size = select_tar(selection_args)
+    extracted = extract_tar_features_for_sites(
+        selected_tar, site_points, source=SOURCE, dataset=dataset,
+        fetched_ts=fetched_ts, continue_on_error=continue_on_error,
     )
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    write_counts: dict[str, tuple[int, int, int]] = {}
     last_locked_error: sqlite3.OperationalError | None = None
     for attempt in range(1, db_retries + 1):
         conn = connect_sqlite_with_timeout(db_path)
         try:
-            create_harmonie_knmi_features_table(conn)
-            create_knmi_forecasts_shadow_table(conn)
-            rows_written = upsert_harmonie_knmi_features(conn, result.frame)
-            shadow_rows_written = 0 if skip_shadow else upsert_knmi_forecasts_shadow(conn, result.frame, model=model)
-            production_rows_written = (
-                write_knmi_rows_to_production_forecasts(conn, result.frame, model=model)
-                if write_production
-                else 0
-            )
-            sample = latest_harmonie_knmi_rows(conn, site=site_point.site, limit=5)
-            shadow_sample = latest_shadow_rows(conn, site=site_point.site, limit=5)
-            diagnostic = (
-                None
-                if skip_archive_diagnostic
-                else knmi_archive_diagnostic(
-                    conn,
-                    site=site_point.site,
-                    include_observation_joinability=include_observation_joinability,
+            conn.execute("BEGIN IMMEDIATE")
+            create_harmonie_knmi_features_table(conn, commit=False)
+            create_knmi_forecasts_shadow_table(conn, commit=False)
+            for site_point in site_points:
+                frame = extracted[site_point.site].frame
+                rows_written = upsert_harmonie_knmi_features(conn, frame, commit=False)
+                shadow_rows_written = (
+                    0 if skip_shadow else upsert_knmi_forecasts_shadow(conn, frame, model=model, commit=False)
                 )
-            )
-            recent_runs = recent_knmi_runs(conn, site=site_point.site, limit=1)
-            latest_run_horizon_count = None
-            if not recent_runs.empty:
-                latest_run_horizon_count = int(recent_runs.iloc[0]["horizon_count"])
+                production_rows_written = (
+                    write_knmi_rows_to_production_forecasts(conn, frame, model=model, commit=False)
+                    if write_production else 0
+                )
+                write_counts[site_point.site] = (
+                    rows_written, shadow_rows_written, production_rows_written
+                )
+            conn.commit()
             break
         except sqlite3.OperationalError as exc:
-            conn.close()
+            conn.rollback()
             if "database is locked" not in str(exc).lower() or attempt >= db_retries:
                 raise
             last_locked_error = exc
             time.sleep(sqlite_retry_delay(attempt))
-            continue
+        except Exception:
+            conn.rollback()
+            raise
         finally:
-            try:
-                conn.close()
-            except UnboundLocalError:
-                pass
+            conn.close()
     else:
         raise last_locked_error or sqlite3.OperationalError("SQLite write failed.")
 
     cleanup_result = cleanup_raw_harmonie_tars(
-        raw_dir,
-        processed_tar=tar_path,
-        keep_processed=keep_raw,
-        retention_runs=raw_retention_runs,
-        dry_run=cleanup_dry_run,
+        raw_dir, processed_tar=selected_tar, keep_processed=keep_raw,
+        retention_runs=raw_retention_runs, dry_run=cleanup_dry_run,
     )
 
-    return KnmiProcessResult(
-        filename=selected_filename,
-        run_ts=run_ts,
-        tar_path=tar_path,
-        selected_size=selected_size,
-        horizons_extracted=len(result.frame),
-        rows_written=rows_written,
-        shadow_rows_written=shadow_rows_written,
-        production_rows_written=production_rows_written,
-        db_path=db_path,
-        site=site_point,
-        errors=tuple(result.errors),
-        latest_rows=sample,
-        latest_shadow_rows=shadow_sample,
+    site_results: list[KnmiProcessResult] = []
+    conn = connect_sqlite_with_timeout(db_path)
+    try:
+        for site_point in site_points:
+            sample = latest_harmonie_knmi_rows(conn, site=site_point.site, limit=5)
+            shadow_sample = latest_shadow_rows(conn, site=site_point.site, limit=5)
+            diagnostic = (
+                None if skip_archive_diagnostic else knmi_archive_diagnostic(
+                    conn, site=site_point.site,
+                    include_observation_joinability=include_observation_joinability,
+                )
+            )
+            recent_runs = recent_knmi_runs(conn, site=site_point.site, limit=1)
+            latest_count = None if recent_runs.empty else int(recent_runs.iloc[0]["horizon_count"])
+            rows_written, shadow_rows_written, production_rows_written = write_counts[site_point.site]
+            result = extracted[site_point.site]
+            site_results.append(KnmiProcessResult(
+                filename=selected_filename, run_ts=run_ts, tar_path=selected_tar,
+                selected_size=selected_size, horizons_extracted=len(result.frame),
+                rows_written=rows_written, shadow_rows_written=shadow_rows_written,
+                production_rows_written=production_rows_written, db_path=db_path,
+                site=site_point, errors=tuple(result.errors), latest_rows=sample,
+                latest_shadow_rows=shadow_sample, cleanup_result=cleanup_result,
+                archive_diagnostic=diagnostic, latest_run_horizon_count=latest_count,
+            ))
+    finally:
+        conn.close()
+
+    return KnmiBatchProcessResult(
+        filename=selected_filename, run_ts=run_ts, tar_path=selected_tar,
+        selected_size=selected_size, results=tuple(site_results),
         cleanup_result=cleanup_result,
-        archive_diagnostic=diagnostic,
-        latest_run_horizon_count=latest_run_horizon_count,
     )
 
 
-def print_process_result(args: argparse.Namespace, result: KnmiProcessResult) -> None:
-    print_cleanup_summary(args, result.tar_path, result.cleanup_result)
+def process_knmi_file_to_db(
+    filename: str | None, db_path: Path, site: str, keep_raw: bool = False,
+    raw_retention_runs: int | None = None, cleanup_dry_run: bool = False, **kwargs: Any,
+) -> KnmiProcessResult:
+    """Backward-compatible single-site entry point."""
+    batch = process_knmi_file_to_db_for_sites(
+        filename=filename, db_path=db_path, sites=(site,), keep_raw=keep_raw,
+        raw_retention_runs=raw_retention_runs, cleanup_dry_run=cleanup_dry_run, **kwargs,
+    )
+    return batch.results[0]
+
+
+def print_process_result(
+    args: argparse.Namespace, result: KnmiProcessResult, *, show_cleanup: bool = True
+) -> None:
+    if show_cleanup:
+        print_cleanup_summary(args, result.tar_path, result.cleanup_result)
 
     print("\nKNMI HARMONIE feature extraction")
     print("================================")
@@ -574,25 +623,27 @@ def main() -> None:
     args = parse_args()
     if args.raw_retention_runs is not None and args.raw_retention_runs < 0:
         raise SystemExit("--raw-retention-runs must be zero or greater.")
-    site = site_point_from_args(args)
+    try:
+        sites = site_points_from_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     db_path = db_path_from_args(args)
 
-    if args.inspect:
-        print_latest_rows(db_path, site=site.site, limit=args.inspect_limit)
-        return
-    if args.inspect_shadow:
-        print_latest_shadow_rows(db_path, site=site.site, limit=args.inspect_limit)
-        return
-    if args.inspect_runs:
-        print_recent_runs(db_path, site=site.site, limit=args.inspect_limit)
-        return
-    if args.diagnose_archive or args.archive_diagnostic:
-        print_archive_diagnostic(
-            db_path,
-            site=site.site,
-            timezone_name=args.timezone,
-            include_observation_joinability=args.include_observation_joinability,
-        )
+    if args.inspect or args.inspect_shadow or args.inspect_runs or args.diagnose_archive or args.archive_diagnostic:
+        for site in sites:
+            if len(sites) > 1:
+                print(f"\nSite: {site.site}")
+            if args.inspect:
+                print_latest_rows(db_path, site=site.site, limit=args.inspect_limit)
+            elif args.inspect_shadow:
+                print_latest_shadow_rows(db_path, site=site.site, limit=args.inspect_limit)
+            elif args.inspect_runs:
+                print_recent_runs(db_path, site=site.site, limit=args.inspect_limit)
+            else:
+                print_archive_diagnostic(
+                    db_path, site=site.site, timezone_name=args.timezone,
+                    include_observation_joinability=args.include_observation_joinability,
+                )
         return
 
     if args.latest_count is not None and (args.filename is not None or args.tar_path is not None):
@@ -614,10 +665,10 @@ def main() -> None:
         for index, filename in enumerate(filenames, start=1):
             if len(filenames) > 1:
                 print(f"\nProcessing KNMI file {index}/{len(filenames)}: {filename}")
-            result = process_knmi_file_to_db(
+            batch = process_knmi_file_to_db_for_sites(
                 filename=filename,
                 db_path=db_path,
-                site=site.site,
+                sites=tuple(site.site for site in sites),
                 keep_raw=args.keep_raw,
                 raw_retention_runs=args.raw_retention_runs,
                 cleanup_dry_run=args.cleanup_dry_run,
@@ -635,7 +686,8 @@ def main() -> None:
                 skip_archive_diagnostic=args.skip_archive_diagnostic,
                 include_observation_joinability=args.include_observation_joinability,
             )
-            print_process_result(args, result)
+            for result_index, result in enumerate(batch.results):
+                print_process_result(args, result, show_cleanup=result_index == 0)
     except (KnmiApiError, KnmiExtractionError, FileNotFoundError, ValueError, sqlite3.OperationalError) as exc:
         raise SystemExit(f"KNMI extraction failed: {exc}") from exc
 

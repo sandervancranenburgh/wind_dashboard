@@ -599,12 +599,40 @@ def extract_tar_features(
     levels: Iterable[int] = LEVELS,
     continue_on_error: bool = False,
 ) -> ExtractionResult:
+    return extract_tar_features_for_sites(
+        tar_path,
+        (site,),
+        source=source,
+        dataset=dataset,
+        fetched_ts=fetched_ts,
+        levels=levels,
+        continue_on_error=continue_on_error,
+    )[site.site]
+
+
+def extract_tar_features_for_sites(
+    tar_path: Path,
+    sites: Iterable[SitePoint],
+    *,
+    source: str = SOURCE,
+    dataset: str = DATASET,
+    fetched_ts: str | None = None,
+    levels: Iterable[int] = LEVELS,
+    continue_on_error: bool = False,
+) -> dict[str, ExtractionResult]:
+    """Extract all requested sites while reading each tar member only once."""
     if not tar_path.exists():
         raise FileNotFoundError(f"KNMI tar file not found: {tar_path}")
 
+    site_points = tuple(sites)
+    if not site_points:
+        raise ValueError("At least one KNMI site is required.")
+    if len({site.site for site in site_points}) != len(site_points):
+        raise ValueError("KNMI site selections must be unique.")
+
     fetched = fetched_ts or utc_now_iso()
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
+    rows: dict[str, list[dict[str, Any]]] = {site.site: [] for site in site_points}
+    errors: dict[str, list[str]] = {site.site: [] for site in site_points}
     with tarfile.open(tar_path, "r") as tar:
         members = sorted((member for member in tar.getmembers() if member.isfile()), key=lambda member: member.name)
         if not members:
@@ -613,41 +641,59 @@ def extract_tar_features(
         with TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             for member in members:
+                grib_path = tmp_dir / Path(member.name).name
                 try:
                     extracted = tar.extractfile(member)
                     if extracted is None:
                         raise KnmiExtractionError(f"Could not read tar member {member.name}.")
-                    grib_path = tmp_dir / Path(member.name).name
                     with grib_path.open("wb") as handle:
                         handle.write(extracted.read())
-                    rows.append(
-                        extract_one_grib(
-                            grib_path,
-                            site,
-                            source=source,
-                            dataset=dataset,
-                            fetched_ts=fetched,
-                            levels=levels,
-                        )
-                    )
+                    for site_point in site_points:
+                        try:
+                            rows[site_point.site].append(
+                                extract_one_grib(
+                                    grib_path,
+                                    site_point,
+                                    source=source,
+                                    dataset=dataset,
+                                    fetched_ts=fetched,
+                                    levels=levels,
+                                )
+                            )
+                        except Exception as exc:
+                            message = f"{member.name} [{site_point.site}]: {exc}"
+                            if not continue_on_error:
+                                raise KnmiExtractionError(message) from exc
+                            errors[site_point.site].append(message)
                 except Exception as exc:
-                    message = f"{member.name}: {exc}"
                     if not continue_on_error:
-                        raise KnmiExtractionError(message) from exc
-                    errors.append(message)
+                        if isinstance(exc, KnmiExtractionError):
+                            raise
+                        raise KnmiExtractionError(f"{member.name}: {exc}") from exc
+                    if not any(member.name in message for values in errors.values() for message in values):
+                        for site_point in site_points:
+                            errors[site_point.site].append(f"{member.name}: {exc}")
                 finally:
                     try:
                         grib_path.unlink()
-                    except (NameError, OSError):
+                    except OSError:
                         pass
 
-    if not rows:
-        raise KnmiExtractionError(f"No KNMI feature rows extracted from {tar_path}.")
-    frame = add_hourly_weather_features(pd.DataFrame(rows))
-    return ExtractionResult(frame=frame, errors=tuple(errors))
+    results: dict[str, ExtractionResult] = {}
+    for site_point in site_points:
+        site_rows = rows[site_point.site]
+        if not site_rows:
+            raise KnmiExtractionError(
+                f"No KNMI feature rows extracted from {tar_path} for site={site_point.site}."
+            )
+        results[site_point.site] = ExtractionResult(
+            frame=add_hourly_weather_features(pd.DataFrame(site_rows)),
+            errors=tuple(errors[site_point.site]),
+        )
+    return results
 
 
-def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
+def create_harmonie_knmi_features_table(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -760,15 +806,18 @@ def create_harmonie_knmi_features_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_site_target ON {TABLE_NAME}(site, target_ts)"
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
     return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
 
 
-def upsert_harmonie_knmi_features(conn: sqlite3.Connection, frame: pd.DataFrame) -> int:
-    create_harmonie_knmi_features_table(conn)
+def upsert_harmonie_knmi_features(
+    conn: sqlite3.Connection, frame: pd.DataFrame, *, commit: bool = True
+) -> int:
+    create_harmonie_knmi_features_table(conn, commit=False)
     if frame.empty:
         return 0
 
@@ -802,7 +851,8 @@ def upsert_harmonie_knmi_features(conn: sqlite3.Connection, frame: pd.DataFrame)
         """,
         rows,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(rows)
 
 
@@ -833,7 +883,7 @@ def latest_harmonie_knmi_rows(conn: sqlite3.Connection, site: str, limit: int = 
     )
 
 
-def create_knmi_forecasts_shadow_table(conn: sqlite3.Connection) -> None:
+def create_knmi_forecasts_shadow_table(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     """Create a non-production forecast mirror for KNMI replacement checks."""
     conn.execute(
         f"""
@@ -864,7 +914,8 @@ def create_knmi_forecasts_shadow_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{SHADOW_TABLE_NAME}_site_target ON {SHADOW_TABLE_NAME}(site, target_ts)"
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONIE") -> pd.DataFrame:
@@ -925,8 +976,14 @@ def feature_frame_to_shadow_forecasts(frame: pd.DataFrame, model: str = "HARMONI
     return out
 
 
-def upsert_knmi_forecasts_shadow(conn: sqlite3.Connection, frame: pd.DataFrame, model: str = "HARMONIE") -> int:
-    create_knmi_forecasts_shadow_table(conn)
+def upsert_knmi_forecasts_shadow(
+    conn: sqlite3.Connection,
+    frame: pd.DataFrame,
+    model: str = "HARMONIE",
+    *,
+    commit: bool = True,
+) -> int:
+    create_knmi_forecasts_shadow_table(conn, commit=False)
     shadow = feature_frame_to_shadow_forecasts(frame, model=model)
     if shadow.empty:
         return 0
@@ -975,11 +1032,18 @@ def upsert_knmi_forecasts_shadow(conn: sqlite3.Connection, frame: pd.DataFrame, 
         """,
         rows,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(rows)
 
 
-def write_knmi_rows_to_production_forecasts(conn: sqlite3.Connection, frame: pd.DataFrame, model: str = "HARMONIE") -> int:
+def write_knmi_rows_to_production_forecasts(
+    conn: sqlite3.Connection,
+    frame: pd.DataFrame,
+    model: str = "HARMONIE",
+    *,
+    commit: bool = True,
+) -> int:
     """
     Dangerous compatibility path for explicit manual tests only.
 
@@ -1028,7 +1092,8 @@ def write_knmi_rows_to_production_forecasts(conn: sqlite3.Connection, frame: pd.
         """,
         rows,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(rows)
 
 

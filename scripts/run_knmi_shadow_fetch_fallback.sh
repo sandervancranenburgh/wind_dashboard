@@ -37,7 +37,7 @@ cd "${REPO_ROOT}"
     source "${VENV}/bin/activate"
   fi
 
-  python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count "${LATEST_COUNT}"
+  python3 scripts/knmi_extract_latest_to_db.py --all-sites --latest-count "${LATEST_COUNT}"
 
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI shadow fallback fetch end"
 } >> "${LOG_FILE}" 2>&1

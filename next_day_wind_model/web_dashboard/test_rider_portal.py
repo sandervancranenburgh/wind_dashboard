@@ -984,7 +984,7 @@ class RiderPortalTest(unittest.TestCase):
         html = (output_dir / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="dashboard-refresh"', html)
         self.assertIn("↻ Refresh", html)
-        self.assertEqual(updater._site_display_name("valkenburgsemeer"), "Valkenburgse meer")
+        self.assertEqual(updater._site_display_name("valkenburgsemeer"), "Valkenburgse Meer")
         self.assertIn("<title>Super local wind prediction - Valkenburgse meer</title>", html)
         self.assertIn("<h1>Super local wind prediction</h1>", html)
         self.assertNotIn("<h1>Super local wind prediction Valkenburgse meer", html)

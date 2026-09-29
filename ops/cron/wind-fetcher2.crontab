@@ -1,0 +1,14 @@
+# Production template. Review paths and diff against `crontab -l` before install.
+# All operational site selection is explicit; no command relies on a default site.
+
+# Fetch both registered Windsurfice sites, then update the existing Valkenburg dashboard.
+*/6 7-22 * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/repos/wind_fetcher2/scripts/run_wind_dashboard_pipeline.sh >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/wind_pipeline_cron.log 2>&1
+
+# Retrain the current production model for its explicit canonical site.
+15 7 * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/repos/wind_fetcher2/scripts/run_wind_updater_locked.sh /home/sandervancranenburgh/Documents/python_envs/env/bin/python next_day_wind_model/update_model_and_predict.py --db data/wind_data_all_sites.db --site valkenburgsemeer --window-hours 72 --epochs 30 --batch-size 16 --speed-constraint-eps 0.2 --intraday-epochs 40 --intraday-hidden1 192 --intraday-hidden2 32 --intraday-dropout 0.2 --intraday-learning-rate 0.001 --intraday-recency-power 1.0 --web-out-dir docs --current-day-interval-minutes 6 --git-auto-push-pages --git-remote origin --git-branch main --companion-app-base-url https://portal-cityailab.tbm.tudelft.nl >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/wind_pipeline_cron.log 2>&1
+
+# KNMI HARMONIE P1 remains explicitly Valkenburg-only until the multi-site extractor is deployed.
+*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && bash scripts/run_knmi_shadow_fetch_fallback.sh >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/wind_pipeline_cron.log 2>&1
+
+# Daily SQLite online backup.
+0 2 * * * /home/sandervancranenburgh/Documents/repos/wind_fetcher2/backup_database.sh

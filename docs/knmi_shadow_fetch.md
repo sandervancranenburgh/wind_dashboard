@@ -57,19 +57,19 @@ comparison views that report their selection policy.
 Latest available KNMI tar:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer
 ```
 
 Specific filename, suitable for a future Notification Service listener:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --filename HARM43_V1_P1_2026051504.tar
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --filename HARM43_V1_P1_2026051504.tar
 ```
 
 Existing local tar, useful for offline verification:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py \
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer \
   --tar-path data/raw/knmi/harmonie_arome_cy43_p1/HARM43_V1_P1_2026051504.tar
 ```
 
@@ -88,19 +88,19 @@ By default, after successful extraction and successful writes to
 processed tar file:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer
 ```
 
 For debugging, keep the processed tar:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --keep-raw
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --keep-raw
 ```
 
 To retain only the latest N matching raw HARMONIE P1 tar files in `--raw-dir`:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --raw-retention-runs 2
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --raw-retention-runs 2
 ```
 
 When `--raw-retention-runs N` is supplied, retention controls which
@@ -139,19 +139,19 @@ Example hourly cron fallback:
 Recent KNMI runs:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --inspect-runs --inspect-limit 10
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --inspect-runs --inspect-limit 10
 ```
 
 Archive diagnostic:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --archive-diagnostic
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --archive-diagnostic
 ```
 
 Latest shadow rows:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --inspect-shadow --inspect-limit 5
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --inspect-shadow --inspect-limit 5
 ```
 
 Compare latest KNMI shadow and Windsurfice snapshots:

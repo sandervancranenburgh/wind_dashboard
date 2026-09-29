@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.knmi_extract_latest_to_db import process_knmi_file_to_db
+from scripts.knmi_extract_latest_to_db import DEFAULT_SITE_POINTS, process_knmi_file_to_db
 
 
 HOST = "mqtt.dataplatform.knmi.nl"
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         description="Subscribe to KNMI Notification Service HARMONIE P1 events and update shadow SQLite tables.",
     )
     parser.add_argument("--db", type=Path, default=Path("data/wind_data_all_sites.db"))
-    parser.add_argument("--site", default="valkenburgsemeer")
+    parser.add_argument("--site", required=True, choices=sorted(DEFAULT_SITE_POINTS))
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--keep-raw", action="store_true")
     parser.add_argument("--raw-retention-runs", type=int, default=None)

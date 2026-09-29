@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 
 from db_store import connect_db, init_db, upsert_observations, upsert_forecasts
+from next_day_wind_model.site_registry import enabled_sites
 
 # --- Windsurfice endpoints ---
 OBS_URL = "https://1.windsurfice.com/PHP_scripts/Wind_laatste_dag.php"
@@ -42,22 +43,15 @@ class SiteConfig:
 
 
 SITES = {
-    "valkenburgsemeer": SiteConfig(
-        site="valkenburgsemeer",
-        display_name="Valkenburgse Meer",
-        windsurfice_obs_site="windsurfice-v25-node7",
-        forecast_lat="52.1603",
-        forecast_lon="4.44197",
-        referer="https://windsurfice.com/en/locations/valkenburgsemeer",
-    ),
-    "oostvoorne": SiteConfig(
-        site="oostvoorne",
-        display_name="Oostvoornse Meer",
-        windsurfice_obs_site="windsurfice-v25-node6",
-        forecast_lat="51.9278",
-        forecast_lon="4.05502",
-        referer="https://windsurfice.com/en/locations/oostvoorne",
-    ),
+    site.site_id: SiteConfig(
+        site=site.site_id,
+        display_name=site.display_name,
+        windsurfice_obs_site=site.windsurfice.observation_station,
+        forecast_lat=str(site.windsurfice.forecast_latitude),
+        forecast_lon=str(site.windsurfice.forecast_longitude),
+        referer=f"https://windsurfice.com/en/locations/{site.windsurfice.referer_slug}",
+    )
+    for site in enabled_sites("windsurfice")
 }
 MODEL = "HARMONIE"
 
@@ -335,16 +329,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="./data",
         help="Root directory for per-site CSV snapshot folders and wind_data_all_sites.db.",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
         "--site",
-        default=None,
+        action="append",
+        dest="sites",
         choices=sorted(SITES),
-        help="Configured site to fetch. If omitted, all configured sites are fetched.",
+        help="Configured site ID to fetch; repeat for multiple sites.",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--all-sites",
         action="store_true",
-        help="Fetch every configured site. This is the default when --site is omitted.",
+        help="Fetch every Windsurfice-enabled site in the canonical registry.",
     )
     return parser.parse_args(argv)
 
@@ -353,7 +349,11 @@ def main(argv: list[str] | None = None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    site_configs = list(SITES.values()) if args.all_sites or args.site is None else [SITES[args.site]]
+    site_configs = (
+        list(SITES.values())
+        if args.all_sites
+        else [SITES[site_id] for site_id in dict.fromkeys(args.sites)]
+    )
     for site_config in site_configs:
         fetch_site(site_config, args.out_dir)
 

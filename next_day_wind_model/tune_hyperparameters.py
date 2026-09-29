@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         description="Tune hyperparameters for next-day (constrained residual) and intraday residual models.",
     )
     parser.add_argument("--db", default="data/wind_data_all_sites.db", help="Path to SQLite DB.")
-    parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
+    parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours.")
     parser.add_argument("--n-splits", type=int, default=3, help="TimeSeriesSplit folds.")
@@ -308,6 +308,7 @@ def main() -> None:
     recommend_cmd = (
         "python3 next_day_wind_model/update_model_and_predict.py "
         f"--db {args.db} "
+        f"--site {args.site} "
         f"--window-hours {int(best_next['window_hours'])} "
         f"--epochs {int(best_next['epochs'])} "
         f"--batch-size {int(best_next['batch_size'])} "

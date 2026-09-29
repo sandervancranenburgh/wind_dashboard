@@ -16,10 +16,11 @@ fi
 
 # Prediction/dashboard work is deliberately conditional on a completely
 # successful observation + production HARMONIE fetch and database write.
-"${PYTHON_BIN}" source_fetch.py data
+"${PYTHON_BIN}" source_fetch.py data --all-sites
 
 exec "${PYTHON_BIN}" next_day_wind_model/update_model_and_predict.py \
     --db data/wind_data_all_sites.db \
+    --site valkenburgsemeer \
     --window-hours 72 \
     --skip-training \
     --skip-data-refresh-check \

@@ -54,13 +54,13 @@ from next_day_wind_model.ecmwf_dashboard import (
     ECMWF_FORECAST_LINEWIDTH,
     load_ecmwf_plot_data,
 )
+from next_day_wind_model.site_registry import display_name
 if not MEASURED_ONLY_CHILD and not PLOT_RENDERER_ONLY:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
 
     from db_store import (
-        SPOT_TO_SITE,
         init_db,
         load_next_day_realized_detail_rows,
         load_prediction_evaluation_summary,
@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
         default=8.0,
         help="Fallback IFS availability latency until enough completed runs exist.",
     )
-    parser.add_argument("--site", default="valkenburgsemeer", help="Site name in DB.")
+    parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours for Y.")
@@ -359,7 +359,7 @@ def _latest_forecast_run_ts_ms(db_path: Path, site: str, model: str) -> int | No
 
 def _run_fetch_script(repo_root: Path, out_data_dir: Path) -> None:
     fetch_script = repo_root / "source_fetch.py"
-    cmd = [sys.executable, str(fetch_script), str(out_data_dir)]
+    cmd = [sys.executable, str(fetch_script), str(out_data_dir), "--all-sites"]
     print(f"Refreshing source data via: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(repo_root), check=True)
 
@@ -6733,10 +6733,10 @@ def _write_interactive_plot_assets(
 
 def _site_display_name(site: str) -> str:
     site_id = str(site or "").strip()
-    for display_name, mapped_site in SPOT_TO_SITE.items():
-        if mapped_site == site_id:
-            return display_name
-    return site_id
+    try:
+        return display_name(site_id)
+    except KeyError:
+        return site_id
 
 
 def publish_web_dashboard(

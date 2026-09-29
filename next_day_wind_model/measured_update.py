@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from next_day_wind_model.operational_update import local_day_utc_bounds, write_bytes_if_changed
+from next_day_wind_model.site_registry import display_name
 
 
 FORECAST_COLUMNS = (
@@ -39,10 +40,11 @@ OPTIONAL_WEATHER_COLUMNS = (
 
 
 def _site_display_name(site: str) -> str:
-    return {
-        "valkenburgsemeer": "Valkenburgse meer",
-        "oostvoorne": "Oostvoornse meer",
-    }.get(str(site or "").strip(), str(site or "").strip())
+    site_id = str(site or "").strip()
+    try:
+        return display_name(site_id)
+    except KeyError:
+        return site_id
 
 
 def _truthy_series(values: pd.Series) -> pd.Series:

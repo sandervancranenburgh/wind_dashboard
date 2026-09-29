@@ -42,13 +42,14 @@ from next_day_wind_model.knmi_harmonie import (
     utc_now_iso,
     write_knmi_rows_to_production_forecasts,
 )
+from next_day_wind_model.site_registry import enabled_sites
 
 
-# TODO: Move KNMI extraction coordinates into shared site configuration once
-# the project has source-specific site metadata. These are the verified point
-# coordinates used for the KNMI/Windsurfice comparison.
 DEFAULT_SITE_POINTS = {
-    "valkenburgsemeer": SitePoint(site="valkenburgsemeer", lat=52.168, lon=4.437),
+    site.site_id: SitePoint(
+        site=site.site_id, lat=site.knmi_p1.latitude, lon=site.knmi_p1.longitude
+    )
+    for site in enabled_sites("knmi_p1")
 }
 
 
@@ -81,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/knmi/harmonie_arome_cy43_p1"))
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--version", default=VERSION)
-    parser.add_argument("--site", default="valkenburgsemeer", choices=sorted(DEFAULT_SITE_POINTS))
+    parser.add_argument("--site", required=True, choices=sorted(DEFAULT_SITE_POINTS))
     parser.add_argument("--site-lat", type=float, default=None)
     parser.add_argument("--site-lon", type=float, default=None)
     parser.add_argument("--max-files", type=int, default=10)

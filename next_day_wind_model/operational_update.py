@@ -641,7 +641,7 @@ def _launcher_parser() -> argparse.ArgumentParser:
         "--ecmwf-archive-db",
         default="data/ecmwf_archive/ecmwf_shadow.sqlite",
     )
-    parser.add_argument("--site", default="valkenburgsemeer")
+    parser.add_argument("--site", required=True)
     parser.add_argument("--model", default="HARMONIE")
     parser.add_argument("--target-hours", type=int, default=24)
     parser.add_argument("--out-dir", default="next_day_wind_model/artifacts")

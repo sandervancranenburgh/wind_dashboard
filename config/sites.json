@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "sites": [
+    {
+      "site_id": "valkenburgsemeer",
+      "display_name": "Valkenburgse Meer",
+      "rider_spot_value": "Valkenburgse meer",
+      "aliases": [
+        "Valkenburgse Meer",
+        "Valkenburgse meer"
+      ],
+      "timezone": "Europe/Amsterdam",
+      "windsurfice": {
+        "enabled": true,
+        "observation_station": "windsurfice-v25-node7",
+        "forecast_latitude": 52.1603,
+        "forecast_longitude": 4.44197,
+        "referer_slug": "valkenburgsemeer"
+      },
+      "knmi_p1": {
+        "enabled": true,
+        "latitude": 52.168,
+        "longitude": 4.437
+      },
+      "ecmwf": {
+        "enabled": true,
+        "latitude": 52.168,
+        "longitude": 4.437,
+        "observation_site": "valkenburgsemeer"
+      },
+      "superlocal_model": {
+        "enabled": true,
+        "publish": true
+      }
+    },
+    {
+      "site_id": "oostvoorne",
+      "display_name": "Oostvoornse Meer",
+      "rider_spot_value": "Oostvoornse meer",
+      "aliases": [
+        "Oostvoornse Meer",
+        "Oostvoornse meer"
+      ],
+      "timezone": "Europe/Amsterdam",
+      "windsurfice": {
+        "enabled": true,
+        "observation_station": "windsurfice-v25-node6",
+        "forecast_latitude": 51.9278,
+        "forecast_longitude": 4.05502,
+        "referer_slug": "oostvoorne"
+      },
+      "knmi_p1": {
+        "enabled": false,
+        "latitude": 51.9278,
+        "longitude": 4.05502
+      },
+      "ecmwf": {
+        "enabled": true,
+        "latitude": 51.9278,
+        "longitude": 4.05502,
+        "observation_site": "oostvoorne"
+      },
+      "superlocal_model": {
+        "enabled": false,
+        "publish": false
+      }
+    }
+  ]
+}

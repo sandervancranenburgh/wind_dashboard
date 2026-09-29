@@ -31,14 +31,14 @@ The listener connects to `mqtt.dataplatform.knmi.nl:443` using MQTT over websock
 ## Manual Listener
 
 ```bash
-python3 scripts/knmi_notification_listener.py
+python3 scripts/knmi_notification_listener.py --site valkenburgsemeer
 ```
 
 Useful limited runs:
 
 ```bash
-python3 scripts/knmi_notification_listener.py --once --log-level INFO
-python3 scripts/knmi_notification_listener.py --max-events 3 --log-level INFO
+python3 scripts/knmi_notification_listener.py --site valkenburgsemeer --once --log-level INFO
+python3 scripts/knmi_notification_listener.py --site valkenburgsemeer --max-events 3 --log-level INFO
 ```
 
 Wrapper with log append:
@@ -55,7 +55,7 @@ The wrapper checks that `KNMI_API_KEY`, `KNMI_NOTIFICATION_API_KEY`, and `KNMI_N
 The direct tmux command has been validated end-to-end:
 
 ```bash
-python scripts/knmi_notification_listener.py --log-level INFO
+python scripts/knmi_notification_listener.py --site valkenburgsemeer --log-level INFO
 ```
 
 That run confirmed MQTT connection, persistent session replay, QoS 1 subscription, event receipt, filename parsing, file-specific processing, SQLite writes, and a complete 61-horizon archive. For ongoing operation, prefer the wrapper so stdout/stderr are appended to `logs/knmi_notification_listener.log`.
@@ -114,7 +114,7 @@ The setup is healthy when the latest KNMI API run equals the latest archived DB 
 Use the fallback job if the listener was down or may have missed events. It processes recent files idempotently through the existing extractor:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --latest-count 3
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count 3
 scripts/run_knmi_shadow_fetch_fallback.sh
 tail -f logs/knmi_shadow_fetch_fallback.log
 ```
@@ -124,7 +124,7 @@ The wrapper reads `KNMI_FALLBACK_LATEST_COUNT` and defaults to `3`.
 Catch up a wider window manually:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --latest-count 6
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count 6
 ```
 
 Example crontab line for a 30 minute fallback cadence:
@@ -138,13 +138,13 @@ Do not edit crontab blindly. While the notification/fallback code exists only on
 Before merge:
 
 ```cron
-*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev/logs/knmi_shadow_fetch_fallback.log 2>&1
+*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2_dev/logs/knmi_shadow_fetch_fallback.log 2>&1
 ```
 
 After merge to main:
 
 ```cron
-*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/logs/knmi_shadow_fetch_fallback.log 2>&1
+*/30 * * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/python_envs/env/bin/python scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count 3 >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/logs/knmi_shadow_fetch_fallback.log 2>&1
 ```
 
 ## Optional Systemd User Service
@@ -198,13 +198,13 @@ The key comparison is the latest API `run_ts` versus the archive `max_run_ts`. B
 For a quick DB-only archive summary:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --archive-diagnostic
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --archive-diagnostic
 ```
 
 Observation joinability counts are slower and opt-in:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --archive-diagnostic --include-observation-joinability
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --archive-diagnostic --include-observation-joinability
 ```
 
 Interpretation:
@@ -218,7 +218,7 @@ Interpretation:
 Fallback catch-up options:
 
 ```bash
-python3 scripts/knmi_extract_latest_to_db.py --latest-count 6
+python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer --latest-count 6
 python3 scripts/diagnose_knmi_notification_lag.py --process-missing-latest 6
 ```
 

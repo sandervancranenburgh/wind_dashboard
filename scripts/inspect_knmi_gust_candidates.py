@@ -30,11 +30,15 @@ from next_day_wind_model.knmi_harmonie import (
     nearest_value,
     open_grib_parameter,
 )
+from next_day_wind_model.site_registry import enabled_sites
 
 
 DEFAULT_DB = Path("data/wind_data_all_sites.db")
 DEFAULT_SITE_POINTS = {
-    "valkenburgsemeer": SitePoint(site="valkenburgsemeer", lat=52.168, lon=4.437),
+    site.site_id: SitePoint(
+        site=site.site_id, lat=site.knmi_p1.latitude, lon=site.knmi_p1.longitude
+    )
+    for site in enabled_sites("knmi_p1")
 }
 GRIB_NAME_RE = re.compile(r"^HA43_[^_]+_(\d{12})_(\d{3})00_GB$")
 

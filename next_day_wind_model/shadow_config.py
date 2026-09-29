@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from next_day_wind_model.forecast_provider import ForecastSite
+from next_day_wind_model.site_registry import load_site_registry
 
 
 DEFAULT_CONFIG_PATH = Path("config/ecmwf_shadow_experiment.json")
@@ -143,6 +144,30 @@ def load_shadow_config(path: Path | str = DEFAULT_CONFIG_PATH) -> ShadowExperime
         value = json.load(handle)
     if not isinstance(value, dict):
         raise ValueError("shadow configuration root must be an object")
+    site_ids = value.get("site_ids")
+    if site_ids is not None:
+        if value.get("sites"):
+            raise ValueError("configure either site_ids or sites, not both")
+        if not isinstance(site_ids, list) or not site_ids:
+            raise ValueError("site_ids must be a non-empty array")
+        registry = load_site_registry()
+        resolved_sites: list[dict[str, Any]] = []
+        for requested_id in site_ids:
+            site = registry.site(str(requested_id))
+            if not site.ecmwf.enabled:
+                raise ValueError(f"ECMWF is disabled for site: {site.site_id}")
+            resolved_sites.append(
+                {
+                    "site_id": site.site_id,
+                    "display_name": site.display_name,
+                    "latitude": site.ecmwf.latitude,
+                    "longitude": site.ecmwf.longitude,
+                    "observation_site": site.ecmwf.observation_site,
+                    "timezone": site.timezone,
+                }
+            )
+        value = dict(value)
+        value["sites"] = resolved_sites
     return config_from_mapping(value)
 
 

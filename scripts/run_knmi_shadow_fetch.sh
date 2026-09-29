@@ -25,7 +25,7 @@ cd "${REPO_ROOT}"
 
   # Operational default: archive the forecast into SQLite, then delete the
   # large raw tar after a successful write. Use --keep-raw manually for debugging.
-  python3 scripts/knmi_extract_latest_to_db.py
+  python3 scripts/knmi_extract_latest_to_db.py --site valkenburgsemeer
 
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] KNMI shadow fetch end"
 } >> "${LOG_FILE}" 2>&1

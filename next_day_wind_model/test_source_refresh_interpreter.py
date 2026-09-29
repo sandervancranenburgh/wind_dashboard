@@ -18,7 +18,7 @@ class SourceRefreshInterpreterTests(unittest.TestCase):
                 update_model_and_predict._run_fetch_script(repo_root, out_data_dir)
 
         run.assert_called_once_with(
-            [sys.executable, str(repo_root / "source_fetch.py"), str(out_data_dir)],
+            [sys.executable, str(repo_root / "source_fetch.py"), str(out_data_dir), "--all-sites"],
             cwd=str(repo_root),
             check=True,
         )

@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import db_store
+from next_day_wind_model.site_registry import rider_spot_values
 from wingfoil_analysis import analyze_session_file, build_wind_context
 
 
@@ -53,8 +54,7 @@ LOCAL_TZ = ZoneInfo(os.environ.get("WIND_DASHBOARD_TZ", "Europe/Amsterdam"))
 COMPANION_APP_BASE_URL = os.environ.get("COMPANION_APP_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 FORECAST_DASHBOARD_BASE_URL = os.environ.get("FORECAST_DASHBOARD_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
 SPOT_OPTIONS = [
-    "Valkenburgse meer",
-    "Oostvoornse meer",
+    *rider_spot_values(),
     "Brouwersdam",
     "Noord Aa",
     "Other",

@@ -27,6 +27,7 @@ from next_day_wind_model.knmi_harmonie import (
     open_grib_parameter,
     parse_run_and_horizon,
 )
+from next_day_wind_model.site_registry import enabled_sites
 
 
 EXPECTED_HORIZONS = set(range(61))
@@ -51,7 +52,10 @@ SPEED_BANDS_KT = [
     (20, float("inf"), ">20 kt"),
 ]
 DEFAULT_SITE_POINTS = {
-    "valkenburgsemeer": SitePoint(site="valkenburgsemeer", lat=52.168, lon=4.437),
+    site.site_id: SitePoint(
+        site=site.site_id, lat=site.knmi_p1.latitude, lon=site.knmi_p1.longitude
+    )
+    for site in enabled_sites("knmi_p1")
 }
 GUST_U_WIND_PARAMETER = 162
 GUST_V_WIND_PARAMETER = 163
@@ -1091,7 +1095,8 @@ def validate_max_wind_from_raw(
             pd.DataFrame(),
             "Cannot validate gust/max field because no raw KNMI GRIB file is available. "
             "Re-run the KNMI extractor with --keep-raw for one cycle, then run this diagnostic again.\n"
-            "Suggested command: python3 scripts/knmi_extract_latest_to_db.py --keep-raw",
+            "Suggested command: python3 scripts/knmi_extract_latest_to_db.py "
+            f"--site {site} --keep-raw",
         )
 
     site_point = site_point_from_db(conn, site)
@@ -1481,7 +1486,8 @@ def main() -> None:
             max_wind_result = print_max_wind_validation(
                 pd.DataFrame(),
                 "Not attempted in this run. Pass --validate-max-wind with --raw-grib or --raw-tar, "
-                "or keep one raw KNMI cycle with: python3 scripts/knmi_extract_latest_to_db.py --keep-raw",
+                "or keep one raw KNMI cycle with: python3 scripts/knmi_extract_latest_to_db.py "
+                f"--site {args.site} --keep-raw",
             )
 
         print_final_interpretation(coverage, closest_vintage, max_wind_result)

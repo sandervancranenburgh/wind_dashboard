@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Dict, Any, Optional, Tuple, List
 
 from next_day_wind_model.weather_conditions import derive_windsurfice_weather
+from next_day_wind_model.site_registry import spot_to_site_map
 
 
 DB_FILENAME = "wind_data_all_sites.db"
@@ -24,10 +25,7 @@ PREDICTION_LOG_EVAL_COLUMNS = {
     "model_sq_error": "REAL",
     "harmonie_sq_error": "REAL",
 }
-SPOT_TO_SITE = {
-    "Valkenburgse meer": "valkenburgsemeer",
-    "Oostvoornse meer": "oostvoorne",
-}
+SPOT_TO_SITE = spot_to_site_map()
 SURF_EXPERIENCE_OPTIONAL_COLUMNS = {
     "visibility": "TEXT NOT NULL DEFAULT 'private'",
     "perceived_wind_variability": "TEXT",

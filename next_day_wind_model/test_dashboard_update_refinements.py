@@ -33,7 +33,7 @@ class SourceFetchSequencingTests(unittest.TestCase):
                 side_effect=[None, RuntimeError("second site failed")],
             ) as fetch_site:
                 with self.assertRaisesRegex(RuntimeError, "second site failed"):
-                    source_fetch.main([directory])
+                    source_fetch.main([directory, "--all-sites"])
 
         self.assertEqual(
             [call.args[0].site for call in fetch_site.call_args_list],

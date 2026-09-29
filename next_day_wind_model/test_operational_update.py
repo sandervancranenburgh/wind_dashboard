@@ -243,7 +243,7 @@ class ExecutionModeTests(unittest.TestCase):
 
     def test_failed_child_never_advances_state(self) -> None:
         snapshot = _snapshot(forecast_hash=FORECAST_B)
-        argv = ["--skip-training", "--skip-data-refresh-check"]
+        argv = ["--site", "valkenburgsemeer", "--skip-training", "--skip-data-refresh-check"]
         with (
             mock.patch("next_day_wind_model.operational_update._collect_snapshot", return_value=snapshot),
             mock.patch("next_day_wind_model.operational_update.load_success_state", return_value=_state()),
@@ -257,7 +257,7 @@ class ExecutionModeTests(unittest.TestCase):
 
     def test_measured_mode_launches_only_measured_child_and_advances_state(self) -> None:
         snapshot = _snapshot(observation_max_ts=201)
-        argv = ["--skip-training", "--skip-data-refresh-check"]
+        argv = ["--site", "valkenburgsemeer", "--skip-training", "--skip-data-refresh-check"]
         with (
             mock.patch("next_day_wind_model.operational_update._collect_snapshot", return_value=snapshot),
             mock.patch("next_day_wind_model.operational_update.load_success_state", return_value=_state()),
@@ -279,7 +279,7 @@ class ExecutionModeTests(unittest.TestCase):
 
     def test_no_change_does_not_launch_child(self) -> None:
         snapshot = _snapshot()
-        argv = ["--skip-training", "--skip-data-refresh-check"]
+        argv = ["--site", "valkenburgsemeer", "--skip-training", "--skip-data-refresh-check"]
         with (
             mock.patch("next_day_wind_model.operational_update._collect_snapshot", return_value=snapshot),
             mock.patch("next_day_wind_model.operational_update.load_success_state", return_value=_state()),
@@ -460,7 +460,7 @@ class StatePersistenceTests(unittest.TestCase):
 
 
 class OperationalLauncherTests(unittest.TestCase):
-    BASE_ARGS = ("--skip-training", "--skip-data-refresh-check")
+    BASE_ARGS = ("--site", "valkenburgsemeer", "--skip-training", "--skip-data-refresh-check")
     SCRIPT = Path("fake.py")
 
     def _argv(self, root: Path, extra: tuple[str, ...] = ()) -> list[str]:
@@ -490,6 +490,8 @@ class OperationalLauncherTests(unittest.TestCase):
     ) -> dict:
         snapshot = _snapshot() if snapshot is None and collect_error is None else snapshot
         argv = self._argv(root, extra_argv) if operational_args else [
+            "--site",
+            "valkenburgsemeer",
             "--out-dir",
             str(root / "out"),
             "--web-out-dir",

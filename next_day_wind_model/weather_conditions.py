@@ -16,11 +16,12 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from next_day_wind_model.site_registry import load_site_registry
 
 ICON_DIR = Path(__file__).with_name("weather_icons")
 SITE_COORDINATES = {
-    "valkenburgsemeer": (52.168, 4.437),
-    "oostvoorne": (51.930, 4.050),
+    site.site_id: (site.knmi_p1.latitude, site.knmi_p1.longitude)
+    for site in load_site_registry().sites
 }
 
 WEATHER_DESCRIPTIONS = {

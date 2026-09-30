@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "default_public_site_id": "valkenburgsemeer",
   "sites": [
     {
       "site_id": "valkenburgsemeer",
@@ -62,7 +63,8 @@
       },
       "superlocal_model": {
         "enabled": false,
-        "publish": false
+        "publish": false,
+        "production_eligible_after": "2027-04-01"
       }
     }
   ]

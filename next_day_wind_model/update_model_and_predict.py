@@ -54,7 +54,14 @@ from next_day_wind_model.ecmwf_dashboard import (
     ECMWF_FORECAST_LINEWIDTH,
     load_ecmwf_plot_data,
 )
-from next_day_wind_model.site_registry import display_name
+from next_day_wind_model.site_registry import display_name, load_site_registry
+from next_day_wind_model.site_paths import (
+    CHECKPOINT_SCHEMA_VERSION,
+    build_artifact_manifest,
+    publication_target,
+    validate_checkpoint_identity,
+    write_artifact_manifest,
+)
 if not MEASURED_ONLY_CHILD and not PLOT_RENDERER_ONLY:
     import torch
     from torch import nn
@@ -4382,8 +4389,24 @@ def _save_model(
     )
 
 
-def _load_model(path: Path, device: torch.device) -> tuple[nn.Module, dict]:
+def _load_model(
+    path: Path,
+    device: torch.device,
+    *,
+    expected_site_id: str | None = None,
+    expected_forecast_model: str | None = None,
+    allow_legacy_identity: bool = False,
+) -> tuple[nn.Module, dict]:
     ckpt = torch.load(path, map_location=device)
+    if expected_site_id is not None or expected_forecast_model is not None:
+        if expected_site_id is None or expected_forecast_model is None:
+            raise ValueError("expected_site_id and expected_forecast_model must be provided together")
+        validate_checkpoint_identity(
+            ckpt,
+            expected_site_id=expected_site_id,
+            expected_forecast_model=expected_forecast_model,
+            allow_legacy_identity=allow_legacy_identity,
+        )
     model_class = str(ckpt.get("model_class", "NextDayLSTM"))
     if model_class == "TargetAwareNextDayLSTM":
         model = TargetAwareNextDayLSTM(
@@ -4401,6 +4424,16 @@ def _load_model(path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, ckpt
+
+
+def _site_publication_allowed(site_id: str) -> bool:
+    """Fail closed: only registry-enabled, explicitly published sites may write web files."""
+    site = load_site_registry().site(site_id)
+    return bool(
+        site.superlocal_model.enabled
+        and site.superlocal_model.publish
+        and publication_target(site.site_id) is not None
+    )
 
 
 def _resolve_model_trained_utc(ckpt: dict, model_path: Path) -> str | None:
@@ -7542,7 +7575,7 @@ def run_dashboard_stage_from_cached_artifacts(
     current_day_plot_mobile_path = out_dir / f"current_day_predictions{test_suffix}_mobile.png"
     current_day_target_local = current_day_table["time_local"].iloc[0].date()
     current_day_prior_prediction_tables = []
-    if not is_test_mode:
+    if not is_test_mode and _site_publication_allowed(args.site):
         current_day_prior_prediction_tables = load_current_day_prediction_history(
             out_dir=out_dir,
             target_day_local=current_day_target_local,
@@ -7689,7 +7722,7 @@ def run_dashboard_stage_from_cached_artifacts(
 
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
-    if not is_test_mode:
+    if not is_test_mode and _site_publication_allowed(args.site):
         web_publish = publish_web_dashboard(
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
@@ -7907,6 +7940,10 @@ def main() -> None:
     model_artifact_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else out_dir
     model_artifact_dir.mkdir(parents=True, exist_ok=True)
     db_path = Path(args.db).resolve()
+    registry_site = load_site_registry().site(args.site)
+    publication_allowed = _site_publication_allowed(registry_site.site_id)
+    if args.git_auto_push_pages and not publication_allowed:
+        raise SystemExit(f"Site {args.site!r} is not publication-enabled; refusing Git publication.")
     _log_rss("process_start")
 
     print(f"Output artifact directory: {out_dir.resolve()}")
@@ -8035,9 +8072,27 @@ def main() -> None:
             ],
             model_artifact_dir=model_artifact_dir,
         )
-        speed_model, speed_ckpt = _load_model(speed_model_path, device)
-        direction_model, direction_ckpt = _load_model(direction_model_path, device)
-        intraday_bundle, intraday_ckpt = load_intraday_model(intraday_model_path, device)
+        speed_model, speed_ckpt = _load_model(
+            speed_model_path,
+            device,
+            expected_site_id=args.site,
+            expected_forecast_model=args.model,
+            allow_legacy_identity=True,
+        )
+        direction_model, direction_ckpt = _load_model(
+            direction_model_path,
+            device,
+            expected_site_id=args.site,
+            expected_forecast_model=args.model,
+            allow_legacy_identity=True,
+        )
+        intraday_bundle, intraday_ckpt = load_intraday_model(
+            intraday_model_path,
+            device,
+            expected_site_id=args.site,
+            expected_forecast_model=args.model,
+            allow_legacy_identity=True,
+        )
         speed_arrays = {k: np.load(v) for k, v in speed_scalers_path.items()}
         direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
         speed_target_mode = str(speed_ckpt.get("target_mode", "residual")).strip().lower()
@@ -8340,8 +8395,20 @@ def main() -> None:
         champion_speed_eval_pred = np.full_like(challenger_speed_eval_pred, np.nan, dtype=np.float32)
         speed_promotion_summary: dict | None = None
         if champion_available:
-            champion_speed_model, champion_speed_ckpt = _load_model(speed_model_path, device)
-            champion_direction_model, champion_direction_ckpt = _load_model(direction_model_path, device)
+            champion_speed_model, champion_speed_ckpt = _load_model(
+                speed_model_path,
+                device,
+                expected_site_id=args.site,
+                expected_forecast_model=args.model,
+                allow_legacy_identity=True,
+            )
+            champion_direction_model, champion_direction_ckpt = _load_model(
+                direction_model_path,
+                device,
+                expected_site_id=args.site,
+                expected_forecast_model=args.model,
+                allow_legacy_identity=True,
+            )
             champion_speed_arrays = {k: np.load(v) for k, v in speed_scalers_path.items()}
             champion_direction_arrays = {k: np.load(v) for k, v in direction_scalers_path.items()}
             champion_speed_mode = str(champion_speed_ckpt.get("target_mode", "residual")).strip().lower()
@@ -8578,6 +8645,9 @@ def main() -> None:
                 model_class="TargetAwareNextDayLSTM",
                 history_hours=cfg.window_hours,
                 extra={
+                    "artifact_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "site_id": args.site,
+                    "forecast_model": args.model,
                     "constraint_eps": speed_constraint_eps,
                     "trained_at_utc": now_train_utc,
                     "speed_regime_calibration": speed_calibration,
@@ -8610,6 +8680,9 @@ def main() -> None:
                 target_mode=direction_target_mode,
                 output_activation="linear",
                 extra={
+                    "artifact_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "site_id": args.site,
+                    "forecast_model": args.model,
                     "trained_at_utc": now_train_utc,
                     "feature_schema": str(direction_arrays_full.get("feature_schema", "direction_v2")),
                 },
@@ -8717,6 +8790,9 @@ def main() -> None:
             model_selection_report["speed_eval_direction_stable_csv"] = str(gate_eval_direction_stable_csv)
 
         intraday_challenger_extra = {
+            "artifact_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "site_id": args.site,
+            "forecast_model": args.model,
             "trained_at_utc": now_train_utc,
             "hidden1": int(args.intraday_hidden1),
             "hidden2": int(args.intraday_hidden2),
@@ -8746,7 +8822,13 @@ def main() -> None:
         )
         intraday_champion_eval_frame: pd.DataFrame | None = None
         if intraday_champion_available:
-            intraday_champion_bundle, intraday_champion_ckpt = load_intraday_model(intraday_model_path, device)
+            intraday_champion_bundle, intraday_champion_ckpt = load_intraday_model(
+                intraday_model_path,
+                device,
+                expected_site_id=args.site,
+                expected_forecast_model=args.model,
+                allow_legacy_identity=True,
+            )
             intraday_champion_model_id = _format_model_id(
                 _resolve_model_trained_utc(intraday_champion_ckpt, intraday_model_path),
                 args.local_timezone,
@@ -9011,7 +9093,7 @@ def main() -> None:
             local_tz=args.local_timezone,
             prediction_generated_at_utc=prediction_generated_at_utc,
         )
-    if not is_test_mode:
+    if not is_test_mode and publication_allowed:
         next_day_prediction_log_rows = _log_prediction_frame(
             db_path=db_path,
             prediction_frame=next_day_prediction_log_frame,
@@ -9323,7 +9405,7 @@ def main() -> None:
 
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
-    if not is_test_mode:
+    if not is_test_mode and publication_allowed:
         daily_mae_png_src = None if daily_mae_png is None else Path(daily_mae_png)
         daily_mae_png_mobile_src: Path | None = None
         daily_mae_csv_src = None if daily_mae_csv is None else Path(daily_mae_csv)
@@ -9631,6 +9713,30 @@ def main() -> None:
     metadata_path = out_dir / ("metadata_update.json" if not is_test_mode else f"metadata_update{test_suffix}.json")
     with metadata_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+
+    manifest_files = [
+        speed_model_path,
+        direction_model_path,
+        intraday_model_path,
+        *speed_scalers_path.values(),
+        *direction_scalers_path.values(),
+    ]
+    if metadata_path.parent.resolve() == model_artifact_dir.resolve():
+        manifest_files.append(metadata_path)
+    manifest_files = [path for path in manifest_files if path.is_file()]
+    training_timestamps = [] if args.skip_training else list(speed_arrays_full.get("timestamps", []))
+    manifest = build_artifact_manifest(
+        artifact_dir=model_artifact_dir,
+        site_id=args.site,
+        forecast_model=args.model,
+        status="champion",
+        production_eligible=bool(registry_site.superlocal_model.enabled),
+        files=manifest_files,
+        training_data_start_utc=None if not training_timestamps else str(training_timestamps[0]),
+        training_data_end_utc=None if not training_timestamps else str(training_timestamps[-1]),
+        extra={"checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION},
+    )
+    write_artifact_manifest(model_artifact_dir, manifest)
 
     print("Model update complete.")
     print(f"Speed model saved to: {speed_model_path}")

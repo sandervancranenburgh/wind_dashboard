@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from datetime import date
 
 from next_day_wind_model.site_registry import (
     display_name,
@@ -18,6 +19,7 @@ class SiteRegistryTests(unittest.TestCase):
     def test_production_site_contract(self) -> None:
         registry = load_site_registry()
         self.assertEqual(registry.site_ids, ("valkenburgsemeer", "oostvoorne"))
+        self.assertEqual(registry.default_public_site_id, "valkenburgsemeer")
         self.assertEqual(display_name("valkenburgsemeer"), "Valkenburgse Meer")
         self.assertEqual(display_name("oostvoorne"), "Oostvoornse Meer")
         self.assertEqual(registry.canonical_site_id("Oostvoornse meer"), "oostvoorne")
@@ -43,6 +45,10 @@ class SiteRegistryTests(unittest.TestCase):
         self.assertEqual(
             tuple(site.site_id for site in enabled_sites("superlocal_model")),
             ("valkenburgsemeer",),
+        )
+        self.assertEqual(
+            load_site_registry().site("oostvoorne").superlocal_model.production_eligible_after,
+            date(2027, 4, 1),
         )
 
     def test_source_specific_coordinates_are_retained(self) -> None:

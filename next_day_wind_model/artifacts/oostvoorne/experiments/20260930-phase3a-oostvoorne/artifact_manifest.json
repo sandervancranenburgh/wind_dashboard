@@ -1,0 +1,44 @@
+{
+  "extra": {
+    "database_unchanged": true,
+    "p1_features_included": false
+  },
+  "files": {
+    "experimental_intraday_speed.pt": {
+      "sha256": "2c4d5fbeeb9bbec494fdec8e938cce7bf33d4a4c2c91892aa699bb55f5e019e6",
+      "size_bytes": 48133
+    },
+    "experimental_next_day_direction.pt": {
+      "sha256": "7c6a4f0b48ef47cfd43ae7778ef8151b9227298db7cfec8cccd8d4ce561d9ad3",
+      "size_bytes": 144111
+    },
+    "experimental_next_day_speed.pt": {
+      "sha256": "29b34f01f44f12cd7debb08ef16bda0dc08a29f11531015ed8318723bb2e56b6",
+      "size_bytes": 130565
+    },
+    "intraday_speed_rows.csv": {
+      "sha256": "f6a70e43b07b630e86da3d757d3fc92ce72843b7dc5481fa402079cd9ce8251a",
+      "size_bytes": 544043
+    },
+    "next_day_direction_rows.csv": {
+      "sha256": "71f025f9bf5a92d73b8906a071b6c62fe5b6a0ae98c2227a0a09e5d904c81986",
+      "size_bytes": 727610
+    },
+    "next_day_speed_rows.csv": {
+      "sha256": "01241ca17051f82d158854a45cd967114a4d2eab55001cae65bbd58463d775a4",
+      "size_bytes": 731299
+    },
+    "summary.json": {
+      "sha256": "2c0d3e6528371e2ecf533e5ecde3ffed6baf07fe43df63e7d9d5e41aa21aa2b3",
+      "size_bytes": 8328
+    }
+  },
+  "forecast_model": "HARMONIE",
+  "generated_at_utc": "2026-09-30T14:53:27.266749+00:00",
+  "production_eligible": false,
+  "schema_version": 1,
+  "site_id": "oostvoorne",
+  "status": "experimental",
+  "training_data_end_utc": "2026-09-08 11:00:00+00:00",
+  "training_data_start_utc": "2026-05-01 19:00:00+00:00"
+}

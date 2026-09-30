@@ -1086,8 +1086,26 @@ def save_intraday_model(path: Path, bundle: IntradayBundle, extra: dict | None =
     torch.save(payload, path)
 
 
-def load_intraday_model(path: Path, device: torch.device) -> tuple[IntradayBundle, dict]:
+def load_intraday_model(
+    path: Path,
+    device: torch.device,
+    *,
+    expected_site_id: str | None = None,
+    expected_forecast_model: str | None = None,
+    allow_legacy_identity: bool = False,
+) -> tuple[IntradayBundle, dict]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    if expected_site_id is not None or expected_forecast_model is not None:
+        if expected_site_id is None or expected_forecast_model is None:
+            raise ValueError("expected_site_id and expected_forecast_model must be provided together")
+        from next_day_wind_model.site_paths import validate_checkpoint_identity
+
+        validate_checkpoint_identity(
+            ckpt,
+            expected_site_id=expected_site_id,
+            expected_forecast_model=expected_forecast_model,
+            allow_legacy_identity=allow_legacy_identity,
+        )
     model = IntradayResidualMLP(
         n_features=int(ckpt["n_features"]),
         hidden1=int(ckpt.get("hidden1", 128)),

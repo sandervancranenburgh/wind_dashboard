@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -56,6 +57,7 @@ class EcmwfSite(PointSource):
 class SuperlocalModelSite:
     enabled: bool
     publish: bool
+    production_eligible_after: date | None
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class SiteDefinition:
 @dataclass(frozen=True)
 class SiteRegistry:
     schema_version: int
+    default_public_site_id: str
     sites: tuple[SiteDefinition, ...]
 
     @property
@@ -118,6 +121,14 @@ class SiteRegistry:
 
     def rider_spot_values(self) -> tuple[str, ...]:
         return tuple(site.rider_spot_value for site in self.sites)
+
+    def web_output_relative_path(self, site_id: str) -> Path | None:
+        site = self.site(site_id)
+        if not site.superlocal_model.publish:
+            return None
+        if site.site_id == self.default_public_site_id:
+            return Path(".")
+        return Path("spots") / site.site_id
 
 
 def _point_source(value: Mapping[str, Any], context: str) -> PointSource:
@@ -167,9 +178,19 @@ def _site_from_mapping(value: Mapping[str, Any], index: int) -> SiteDefinition:
         longitude=ecmwf_point.longitude,
         observation_site=_required_text(ecmwf_raw, "observation_site", f"{context}.ecmwf"),
     )
+    eligible_after_raw = model_raw.get("production_eligible_after")
+    eligible_after: date | None = None
+    if eligible_after_raw not in (None, ""):
+        try:
+            eligible_after = date.fromisoformat(str(eligible_after_raw))
+        except ValueError as exc:
+            raise ValueError(
+                f"{context}.superlocal_model.production_eligible_after must be YYYY-MM-DD"
+            ) from exc
     model = SuperlocalModelSite(
         enabled=bool(model_raw.get("enabled", False)),
         publish=bool(model_raw.get("publish", False)),
+        production_eligible_after=eligible_after,
     )
     if model.publish and not model.enabled:
         raise ValueError(f"{context}.superlocal_model.publish requires enabled=true")
@@ -204,6 +225,13 @@ def registry_from_mapping(value: Mapping[str, Any]) -> SiteRegistry:
     if len(site_ids) != len(set(site_ids)):
         raise ValueError("site_id values must be unique")
 
+    default_public_site_id = _required_text(value, "default_public_site_id", "registry")
+    if default_public_site_id not in site_ids:
+        raise ValueError("default_public_site_id must name a configured site")
+    default_public_site = next(site for site in sites if site.site_id == default_public_site_id)
+    if not default_public_site.superlocal_model.publish:
+        raise ValueError("default_public_site_id must be publish-enabled")
+
     aliases: dict[str, str] = {}
     for site in sites:
         for name in (site.display_name, site.rider_spot_value, *site.aliases):
@@ -211,7 +239,11 @@ def registry_from_mapping(value: Mapping[str, Any]) -> SiteRegistry:
             owner = aliases.setdefault(folded, site.site_id)
             if owner != site.site_id:
                 raise ValueError(f"site alias {name!r} is shared by {owner!r} and {site.site_id!r}")
-    return SiteRegistry(schema_version=schema_version, sites=sites)
+    return SiteRegistry(
+        schema_version=schema_version,
+        default_public_site_id=default_public_site_id,
+        sites=sites,
+    )
 
 
 @lru_cache(maxsize=None)

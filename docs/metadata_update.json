@@ -2,6 +2,7 @@
   "ecmwf": {
     "arrival_estimate_method": "median_recent_complete_run_latency",
     "arrival_latency_hours": [
+      7.802504201666666,
       6.553977339166667,
       7.803925471666667,
       6.554582061944444,
@@ -12,25 +13,24 @@
       7.8032278080555555,
       6.5550486625,
       7.8033423258333325,
-      6.556088611944444,
-      7.798503305833333
+      6.556088611944444
     ],
     "arrival_sample_count": 12,
     "available": true,
-    "completed_time_utc": "2026-09-30T12:33:14.318421Z",
+    "completed_time_utc": "2026-09-30T19:48:09.015126Z",
     "database_open_mode": "read-only/query-only",
-    "estimated_latency_hours": 7.177295958888889,
-    "information_cutoff_utc": "2026-09-30T19:48:08.119273Z",
-    "last_fetch_utc": "2026-09-30T12:33:14.318421Z",
-    "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~1 October 03:10",
+    "estimated_latency_hours": 7.177592750833333,
+    "information_cutoff_utc": "2026-09-30T19:54:08.444158Z",
+    "last_fetch_utc": "2026-09-30T19:48:09.015126Z",
+    "metadata_line": "Last ECMWF fetch: 21:48 - Next expected fetch: ~1 October 03:10",
     "model_version": "50r1",
-    "next_expected_fetch_utc": "2026-10-01T01:10:38.265452Z",
+    "next_expected_fetch_utc": "2026-10-01T01:10:39.333903Z",
     "next_expected_run_utc": "2026-09-30T18:00:00Z",
     "reason": null,
     "resolution": "0.25 degrees",
-    "rows_loaded": 16,
-    "run_identity": "2026-09-30T06:00:00Z|2026-09-30T12:33:14.318421Z",
-    "run_time_utc": "2026-09-30T06:00:00Z",
+    "rows_loaded": 14,
+    "run_identity": "2026-09-30T12:00:00Z|2026-09-30T19:48:09.015126Z",
+    "run_time_utc": "2026-09-30T12:00:00Z",
     "selected_grid": [
       52.25,
       4.5
@@ -38,10 +38,10 @@
     "source": "ecmwf_open_data"
   },
   "ecmwf_arrival_estimate_method": "median_recent_complete_run_latency",
-  "ecmwf_last_fetch_utc": "2026-09-30T12:33:14.318421Z",
-  "ecmwf_next_expected_fetch_utc": "2026-10-01T01:10:38.265452Z",
-  "ecmwf_run_time_utc": "2026-09-30T06:00:00Z",
-  "generated_at_utc": "2026-09-30T19:48:10.983614+00:00",
+  "ecmwf_last_fetch_utc": "2026-09-30T19:48:09.015126Z",
+  "ecmwf_next_expected_fetch_utc": "2026-10-01T01:10:39.333903Z",
+  "ecmwf_run_time_utc": "2026-09-30T12:00:00Z",
+  "generated_at_utc": "2026-09-30T19:54:12.439171+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
     "2026-09-29T12:54:03.434000+00:00",
@@ -78,11 +78,11 @@
     "current_day_interactive_data.json",
     "next_day_interactive_data.json"
   ],
-  "latest_observation_time_utc": "2026-09-30T19:45:12+00:00",
+  "latest_observation_time_utc": "2026-09-30T19:51:12+00:00",
   "measured_only_update": true,
   "model_last_trained_at_utc": "2026-09-12T05:25:17.609879+00:00",
   "plot_update_interval_minutes": 6,
-  "plot_updated_at_utc": "2026-09-30T19:48:08.119273+00:00",
+  "plot_updated_at_utc": "2026-09-30T19:54:08.444158+00:00",
   "prediction_generated_at_utc": "2026-09-30T19:36:16.274607+00:00",
   "prediction_updated_at_utc": "2026-09-30T19:36:36.010587+00:00",
   "static_images": [
@@ -96,5 +96,5 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-09-30T19:48:10.983614+00:00"
+  "static_plot_generated_at_utc": "2026-09-30T19:54:12.439171+00:00"
 }

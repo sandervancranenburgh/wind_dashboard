@@ -53,3 +53,14 @@ All experiment files are written below
 prediction-log, champion-selection, Git, or registry-write code path.
 
 Phase 3B deployment remains separately gated and is not part of these tools.
+
+## Phase 3B Valkenburg cutover
+
+The production wrapper now selects
+`next_day_wind_model/artifacts/valkenburgsemeer/` explicitly for both generated
+and model artifacts. The legacy directory remains in place during monitoring.
+Set `WIND_USE_LEGACY_MODEL_ARTIFACTS=1` on a controlled wrapper invocation to
+return immediately to the pre-Phase 3B artifact path.
+
+This cutover does not enable Oostvoorne and does not change its publication
+state or eligibility date.

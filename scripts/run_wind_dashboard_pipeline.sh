@@ -4,6 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${WIND_FETCHER_PYTHON_BIN:-/home/sandervancranenburgh/Documents/python_envs/env/bin/python}"
+SITE_ID="valkenburgsemeer"
+LEGACY_ARTIFACT_DIR="next_day_wind_model/artifacts"
+SITE_ARTIFACT_DIR="${LEGACY_ARTIFACT_DIR}/${SITE_ID}"
+
+# Emergency rollback switch: one environment variable restores the pre-Phase
+# 3B artifact path without changing code. Keep the legacy directory intact
+# until the post-cutover monitoring window is complete.
+if [ "${WIND_USE_LEGACY_MODEL_ARTIFACTS:-0}" = "1" ]; then
+    MODEL_ARTIFACT_DIR="${LEGACY_ARTIFACT_DIR}"
+else
+    MODEL_ARTIFACT_DIR="${SITE_ARTIFACT_DIR}"
+fi
 
 cd "${REPO_ROOT}"
 
@@ -20,7 +32,9 @@ fi
 
 exec "${PYTHON_BIN}" next_day_wind_model/update_model_and_predict.py \
     --db data/wind_data_all_sites.db \
-    --site valkenburgsemeer \
+    --site "${SITE_ID}" \
+    --out-dir "${MODEL_ARTIFACT_DIR}" \
+    --model-artifact-dir "${MODEL_ARTIFACT_DIR}" \
     --window-hours 72 \
     --skip-training \
     --skip-data-refresh-check \

@@ -642,6 +642,7 @@ def _launcher_parser() -> argparse.ArgumentParser:
         default="data/ecmwf_archive/ecmwf_shadow.sqlite",
     )
     parser.add_argument("--site", required=True)
+    parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
     parser.add_argument("--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
                         default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1")
     parser.add_argument("--model", default="HARMONIE")
@@ -704,7 +705,8 @@ def operational_model_fingerprint(args, model_dir):
         return fingerprint
     manifest = model_dir / "day_after_tomorrow" / "champions.json"
     identity = manifest.read_bytes() if manifest.exists() else b"no_d2_champion"
-    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + identity).hexdigest()
+    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + identity
+                          + getattr(args, "day_after_tomorrow_calibration", "none").encode()).hexdigest()
 
 
 def _child_command(script_path: Path, argv: Sequence[str], *, measured_only: bool) -> list[str]:

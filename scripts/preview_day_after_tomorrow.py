@@ -30,7 +30,7 @@ def write_review(output, state, previous=None):
             pd.read_csv(artifact / "calibration_predictions.csv"))
     selection = diagnostic["training"].get("calibration_training", {}).get("selection")
     audit_path = artifact / "calibration_selection_audit.json"
-    if not selection and not audit_path.exists():
+    if not selection and not audit_path.exists() and diagnostic["training"].get("calibration_policy", "legacy") != "none":
         # Older in-flight fits may predate selection-metadata export. Reproduce
         # the selection on their exact pre-gate validation data for reporting;
         # never retrain the network or choose a different deployed calibration.
@@ -61,7 +61,9 @@ def write_review(output, state, previous=None):
     metrics = diagnostic["matched_hours"]
     before = None
     if previous:
-        old_path = previous / "validation/calibration_diagnostic.json"
+        old_path = previous / "models/day_after_tomorrow/calibration_diagnostic.json"
+        if not old_path.exists():
+            old_path = previous / "validation/calibration_diagnostic.json"
         if old_path.exists():
             before = json.loads(old_path.read_text())
     fit = diagnostic["training"]
@@ -72,25 +74,26 @@ def write_review(output, state, previous=None):
             "first_usable_target_date": usable.target_date.min(), "by_month": coverage.to_dict("records")},
         "diagnostic": diagnostic, "previous_review": before,
         "evaluation_dates": [state["gate"]["evaluation_start"], state["gate"]["evaluation_end"]],
-        "no_gate_tuning": True, "validation_reused_for_epoch_selection_and_calibration": True}
+        "no_gate_parameter_tuning": True, "historical_gate_informed_calibration_policy": fit.get("calibration_policy") == "none",
+        "validation_reused_for_epoch_selection_and_calibration": diagnostic.get("calibration") is not None}
     d2.write_json(output / "review_report.json", report)
     rows = []
-    for name, title in [("harmonie", "HARMONIE"), ("uncalibrated", "D+2 before calibration"), ("prediction", "D+2 calibrated")]:
+    for name, title in [("harmonie", "HARMONIE"), ("uncalibrated", "D+2 before calibration"), ("prediction", "D+2 delivered forecast")]:
         m = metrics[name]
         rows.append(f"| {title} | {m['mae']:.3f} | {m['rmse']:.3f} | {m['bias']:+.3f} |")
     calibration = diagnostic.get("calibration")
-    selected_type = calibration["type"] if calibration else "none: no candidate improved fitting MAE"
+    selected_type = calibration["type"] if calibration else "none: deliberately disabled"
     gain = metrics["prediction"]["relative_mae_improvement"]
     interval = metrics["prediction"]["date_bootstrap"]["ci95"]
     comparison = ""
     if before:
-        comparison = (f"\nPrevious development run: uncalibrated MAE {before['uncalibrated']['mae']:.3f}, "
-            f"calibrated MAE {before['calibrated']['mae']:.3f}, HARMONIE MAE {before['harmonie']['mae']:.3f} knots. "
+        comparison = (f"\nPrevious development run: uncalibrated MAE {before.get('matched_hours', before)['uncalibrated']['mae']:.3f}, "
+            f"calibrated MAE {before.get('matched_hours', before).get('prediction', before.get('calibrated', {}))['mae']:.3f}, HARMONIE MAE {before.get('matched_hours', before)['harmonie']['mae']:.3f} knots. "
             "The new run uses a fresh snapshot and batch size 16, matching next-day; this is not a controlled attribution of each change.\n")
     monthly = pd.read_csv(artifact / "calibration_breakdowns.csv")
     monthly = monthly.loc[monthly.dimension == "month"].pivot(index="value", columns="model", values="mae")
     fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
-    for name, title, color in [("harmonie", "HARMONIE", "grey"), ("uncalibrated", "Before calibration", "#1f77b4"), ("prediction", "Calibrated D+2", "#ff7f0e")]:
+    for name, title, color in [("harmonie", "HARMONIE", "grey"), ("uncalibrated", "Before calibration", "#1f77b4"), ("prediction", "Delivered D+2", "#ff7f0e")]:
         axes[0].plot(monthly.index, monthly[name], marker="o", label=title, color=color)
     axes[0].set_ylabel("Speed MAE (knots)")
     axes[0].legend()
@@ -105,6 +108,9 @@ def write_review(output, state, previous=None):
     fig.tight_layout()
     fig.savefig(output / "calibration_monthly_diagnostic.png", dpi=150)
     plt.close(fig)
+    validation_note = ("Validation is used for neural early stopping; speed calibration is deliberately disabled."
+                       if fit.get("calibration_policy") == "none" else
+                       "Validation is reused for epoch selection and calibration; it is not an independent calibration acceptance set.")
     markdown = f'''# Aligned D+2 review
 
 Development only; production databases, models, scheduling and publication are unchanged.
@@ -123,8 +129,8 @@ Monthly coverage and exclusion reasons are in the model directory's `coverage_by
 Fresh model: {fit['model_id']}. Training: {fit['training_dates'][0]}–{fit['training_dates'][-1]},
 {fit['training_samples']:,} contexts. Validation/calibration: {fit['validation_dates'][0]}–{fit['validation_dates'][-1]},
 {fit['validation_samples']:,} contexts. Gate: {report['evaluation_dates'][0]}–{report['evaluation_dates'][1]}.
-Validation is reused for epoch selection and calibration, following next-day; it is not an independent calibration acceptance set.
-Gate observations were excluded from all fitting and model/calibration selection.
+{validation_note}
+Gate observations were excluded from parameter fitting. Earlier gate results informed the decision to disable calibration; this is a historical diagnostic, not fresh confirmation. Confirmation on 20 new target dates is pending.
 
 ## Holdout performance
 
@@ -132,9 +138,9 @@ Gate observations were excluded from all fitting and model/calibration selection
 |---|---:|---:|---:|
 {chr(10).join(rows)}
 
-Selected calibration: **{selected_type}**. Calibrated speed MAE improvement over HARMONIE: **{gain:.1%}**;
+Selected calibration: **{selected_type}**. Delivered speed MAE improvement over HARMONIE: **{gain:.1%}**;
 95% target-date bootstrap interval for absolute improvement: **{interval[0]:.3f}–{interval[1]:.3f} knots**.
-{'The calibrated forecast is worse than HARMONIE.' if gain < 0 else 'The calibrated forecast improves on HARMONIE in this holdout.'}
+{'The delivered forecast is worse than HARMONIE.' if gain < 0 else 'The delivered forecast improves on HARMONIE in this holdout.'}
 {comparison}
 The JSON report includes complete-window scores, circular direction errors, fitting dates, coefficients and monthly corrections.
 `calibration_predictions.csv` and `calibration_breakdowns.csv` contain provenance and grouped speed metrics.
@@ -162,6 +168,7 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--issue-time", required=True)
     parser.add_argument("--stage", choices=["train", "predict", "refresh"], default="train")
+    parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--speed-constraint-eps", type=float, default=.2)
@@ -183,10 +190,26 @@ def main():
     args = SimpleNamespace(site=d2.SITE, enable_day_after_tomorrow=True,
         epochs=options.epochs, batch_size=options.batch_size, challenge_min_eval_samples=60,
         promotion_margin_pct=1., ecmwf_archive_db=ec, seed=42, web_out_dir=output / "dashboard",
-        speed_constraint_eps=options.speed_constraint_eps)
+        speed_constraint_eps=options.speed_constraint_eps, day_after_tomorrow_calibration=options.day_after_tomorrow_calibration)
     artifacts, models = output / "artifacts", output / "models"
     artifacts.mkdir(exist_ok=True)
     models.mkdir(exist_ok=True)
+    if options.stage == "train" and options.previous_review and not (models / d2.PREFIX / "champions.json").exists():
+        prior = options.previous_review / "models" / d2.PREFIX
+        target = models / d2.PREFIX
+        target.mkdir(exist_ok=True)
+        manifest = json.loads((prior / "champions.json").read_text())
+        for entry in manifest.values():
+            source = prior / entry["checkpoint"]
+            destination = target / entry["checkpoint"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            if source.with_suffix(".scalers.npz").exists():
+                shutil.copy2(source.with_suffix(".scalers.npz"), destination.with_suffix(".scalers.npz"))
+        d2.write_json(target / "champions.json", manifest)
+        history = prior / f"{d2.PREFIX}_model_gate_eval_history.csv"
+        if history.exists():
+            shutil.copy2(history, target / history.name)
     core.torch.set_num_threads(2)
     if options.sample_cache:
         cache_artifact = models / d2.PREFIX
@@ -214,6 +237,13 @@ def main():
             current_gate = current_day_gate_assets(artifacts, destination, gate)
     sources = options.reference_dashboard
     paths = lambda name: sources / name if (sources / name).exists() else None
+    study_assets = {}
+    study = output / "research"
+    for name in ["d2_historical_report.json", "next_day_historical_report.json", "affine_selection.json",
+                 "d2_historical_predictions.csv", "next_day_historical_predictions.csv", "d2_historical_breakdowns.csv",
+                 "next_day_historical_breakdowns.csv", "frozen_manifest.json", "confirmation_status.json", "calibration_comparison.png"]:
+        if (study / name).exists():
+            study_assets[f"day_after_tomorrow_study_{name}"] = study / name
     published = publish_web_dashboard(web_out_dir=output / "dashboard", local_tz=core.TZ,
         web_refresh_seconds=360, spot_name="Valkenburgse Meer",
         next_day_png=sources / "next_day_predictions.png", next_day_png_mobile=paths("next_day_predictions_mobile.png"),
@@ -224,7 +254,7 @@ def main():
         direction_spider_png=paths("model_gate_direction_spider.png"), direction_spider_csv=paths("model_gate_speed_by_direction.csv"),
         current_day_direction_spider_png=paths("current_day_direction_spider.png"), current_day_direction_spider_csv=paths("current_day_speed_by_direction.csv"),
         companion_app_base_url="https://portal-cityailab.tbm.tudelft.nl", day_after_tomorrow_state=state,
-        day_after_tomorrow_assets=d2.artifact_inputs(artifacts, state), plot_updated_at_utc=core.utc(options.issue_time),
+        day_after_tomorrow_assets={**d2.artifact_inputs(artifacts, state), **study_assets}, plot_updated_at_utc=core.utc(options.issue_time),
         **current_gate)
     result = {"day_after_tomorrow": state, "published_files": sorted(published),
               "development_only": True, "reference_forecasts": "Copied public artifacts retain their original timestamps"}

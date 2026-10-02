@@ -361,14 +361,16 @@ def predict(fit: Fit, samples: list[Sample], calibrate: bool = True) -> np.ndarr
                 fit.y_mean, fit.y_std, "constrained_logratio", fit.info.get("constraint_eps", EPS), None, None, torch.device("cpu"))
         batches.append(batch)
     result = np.concatenate(batches)
-    if fit.kind == "speed" and calibrate:
+    if fit.kind == "speed" and calibrate and fit.calibration:
         result = apply_speed_regime_calibration(result, baseline, fit.calibration, calibration_context(samples),
             target_mask=np.stack([s.forecast_mask for s in samples]))
     return np.where(np.stack([s.forecast_mask for s in samples]), result, np.nan)
 
 
 def fit_model(samples: list[Sample], cutoff: pd.Timestamp, kind: str, ecmwf: bool,
-              epochs: int, batch_size: int, seed: int, constraint_eps: float = EPS) -> Fit:
+              epochs: int, batch_size: int, seed: int, constraint_eps: float = EPS, calibration_policy: str = "legacy") -> Fit:
+    if calibration_policy not in {"none", "legacy"}:
+        raise ValueError("Unknown D+2 calibration policy")
     training, validation = purged_split(samples, cutoff)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -421,9 +423,9 @@ def fit_model(samples: list[Sample], cutoff: pd.Timestamp, kind: str, ecmwf: boo
             "training_samples": len(training), "validation_samples": len(validation),
             "epochs_ran": epoch + 1, "best_validation_loss": best, "seed": seed,
             "model_class": type(model).__name__, "ecmwf": ecmwf, "kind": kind,
-            "constraint_eps": constraint_eps, "batch_size": batch_size, "max_epochs": epochs}
+            "constraint_eps": constraint_eps, "batch_size": batch_size, "max_epochs": epochs, "calibration_policy": calibration_policy if kind == "speed" else "none"}
     fit = Fit(model, x_mean, x_std, y_mean, y_std, kind, ecmwf, None, info)
-    if kind == "speed":
+    if kind == "speed" and calibration_policy == "legacy":
         # The same three-method selector as next-day, preserving window-level
         # signals and excluding missing target observations from every fit.
         pred = predict(fit, validation, calibrate=False)
@@ -450,6 +452,7 @@ def save_fit(fit: Fit, path: Path) -> None:
                 "n_features": len(fit.x_mean), "target_mode": "residual" if fit.kind == "direction" else "constrained_logratio",
                 "constraint_eps": fit.info.get("constraint_eps", EPS), "x_mean": torch.from_numpy(fit.x_mean), "x_std": torch.from_numpy(fit.x_std),
                 "y_mean": fit.y_mean, "y_std": fit.y_std, "calibration": fit.calibration,
+                "calibration_policy": fit.info.get("calibration_policy", "legacy" if getattr(fit, "calibration", None) else "none"),
                 "training": fit.info}, path)
     np.savez(path.with_suffix(".scalers.npz"), x_mean=fit.x_mean, x_std=fit.x_std,
              y_mean=fit.y_mean, y_std=fit.y_std)
@@ -483,6 +486,7 @@ def prediction_rows(samples: list[Sample], predictions: np.ndarray, fit: Fit | N
                          "ecmwf_run_time": sample.ec_provenance.get("run_time"),
                          "ecmwf_completed_time": sample.ec_provenance.get("completed_time"),
                          "model_training_cutoff_utc": None if fit is None else fit.info["cutoff_utc"],
+                         "calibration_policy": None if fit is None else fit.info.get("calibration_policy", "legacy" if getattr(fit, "calibration", None) else "none"),
                          "model_latest_label_end_utc": None if fit is None else fit.info["max_label_end_utc"],
                          "forecast_available": bool(sample.forecast_mask[i]),
                          "scorable": bool(sample.speed_mask[i]),

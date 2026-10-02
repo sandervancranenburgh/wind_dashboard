@@ -120,7 +120,7 @@ def historical_samples(db: Path, cutoff: pd.Timestamp, artifact: Path):
     return samples
 
 
-def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2):
+def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2, calibration_policy="none"):
     from next_day_wind_model import day_after_tomorrow_core as core
     from next_day_wind_model.update_model_and_predict import (
         append_model_gate_eval_history, save_model_gate_eval_history_plot)
@@ -143,7 +143,7 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
         previous_threads = core.torch.get_num_threads()
         try:
             core.torch.set_num_threads(min(previous_threads, 2))
-            candidate = core.fit_model(supervised_fitting, boundary, kind, False, epochs, batch_size, seed, constraint_eps)
+            candidate = core.fit_model(supervised_fitting, boundary, kind, False, epochs, batch_size, seed, constraint_eps, calibration_policy=calibration_policy)
         finally:
             core.torch.set_num_threads(previous_threads)
         candidate.info.update(model_id=f"{gate_id}_{kind}", operational=True,
@@ -162,7 +162,7 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
         core.save_fit(candidate, path)
         if score["promote"]:
             new_state[kind] = {"checkpoint": str(path.relative_to(artifact)),
-                               "model_id": candidate.info["model_id"], "trained_at_utc": cutoff.isoformat()}
+                               "model_id": candidate.info["model_id"], "trained_at_utc": cutoff.isoformat(), "calibration_policy": candidate.info["calibration_policy"]}
         selected[kind] = candidate_values if score["promote"] else prior_values
         selected_fits[kind] = candidate if score["promote"] else prior
         candidates[kind], prior_predictions[kind], results[kind] = candidate_values, prior_values, score
@@ -184,7 +184,8 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
                "direction_mae_champion": (results["direction"]["champion"] or results["direction"]["candidate"])["mae"],
                "promote_speed": speed["promote"], "promote_direction": results["direction"]["promote"],
                "speed_selected": new_state["speed"]["model_id"], "direction_selected": new_state["direction"]["model_id"],
-               "gate_target_dates": sorted({s.day for s in gate}), "decisions": results}
+               "gate_target_dates": sorted({s.day for s in gate}), "decisions": results, "calibration_policy": selected_fits["speed"].info.get("calibration_policy", "legacy"),
+               "historical_choice_informed_by_gate": calibration_policy == "none"}
     rows = pd.DataFrame(core.prediction_rows(gate, selected["speed"], selected_fits["speed"], "operational_gate", selected["direction"]))
     rows["speed_model_id"] = new_state["speed"]["model_id"]
     rows["direction_model_id"] = new_state["direction"]["model_id"]
@@ -290,10 +291,12 @@ def infer(db: Path, issue, artifact: Path, output: Path):
     table["harmonie_fetched_ts"] = sample.frame.fetched_ts.to_numpy()
     table["speed_model_id"] = state["speed"]["model_id"]
     table["direction_model_id"] = state["direction"]["model_id"]
+    policy = speed.info.get("calibration_policy", "legacy" if speed.calibration else "none")
+    table["calibration_policy"] = policy
     table.to_csv(output / f"{PREFIX}_predictions.csv", index=False)
     metadata = {"status": "available", "issue_time_utc": issue.isoformat(), "target_date": sample.day,
                 "available_hours": int(sample.forecast_mask.sum()), "expected_hours": 15,
-                "champions": state, "experimental": True,
+                "champions": state, "experimental": True, "calibration_policy": policy,
                 "harmonie_fetched_at_utc": pd.Timestamp(sample.frame.fetched_ts.max(), unit="ms", tz="UTC").isoformat()}
     write_json(output / f"{PREFIX}_metadata.json", metadata)
     return sample, table, metadata
@@ -318,7 +321,7 @@ def log_predictions(db: Path, sample, table: pd.DataFrame, metadata: dict):
                 "prediction_value": float(value), "harmonie_value": float(table.iloc[i][baseline]),
                 "harmonie_run_ts": int(sample.frame.iloc[i].run_ts),
                 "harmonie_fetched_ts": int(sample.frame.iloc[i].fetched_ts),
-                "run_context": "day_after_tomorrow", "metadata_json": json.dumps({"experimental": True, "coverage": metadata["available_hours"]})})
+                "run_context": "day_after_tomorrow", "metadata_json": json.dumps({"experimental": True, "coverage": metadata["available_hours"], "calibration_policy": metadata.get("calibration_policy")})})
     with sqlite3.connect(db) as conn:
         init_db(conn)
         log_prediction_batch(conn, rows)
@@ -458,7 +461,8 @@ def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
             try:
                 train(samples, issue, artifact, epochs=args.epochs, batch_size=args.batch_size,
                       seed=getattr(args, "seed", 42), minimum=args.challenge_min_eval_samples,
-                      margin=args.promotion_margin_pct, constraint_eps=getattr(args, "speed_constraint_eps", .2))
+                      margin=args.promotion_margin_pct, constraint_eps=getattr(args, "speed_constraint_eps", .2),
+                      calibration_policy=getattr(args, "day_after_tomorrow_calibration", "none"))
             except Exception as exc:
                 # Keep active champions and previous successful evaluation intact.
                 write_json(artifact / "last_training_attempt.json", {"status": "failed", "at": now.isoformat(), "reason": str(exc)})
@@ -526,7 +530,7 @@ def refresh_published(*, args, db_path, out_dir, model_artifact_dir, now=None, f
     if index.exists():
         content = index.read_text()
         replacement = status_text(state)
-        updated = re.sub(r'(<p id="day-after-tomorrow-status"[^>]*>).*?(</p>)',
+        updated = re.sub(r'(<p\b(?=[^>]*\bid="day-after-tomorrow-status")[^>]*>).*?(</p>)',
                          lambda match: match[1] + html.escape(replacement) + match[2], content, flags=re.DOTALL)
         if updated != content:
             index.write_text(updated)
@@ -541,4 +545,6 @@ def status_text(state: dict) -> str:
         return "Experimental D+2 forecast unavailable. " + state.get("reason", "")
     issue = pd.Timestamp(state["issue_time_utc"]).tz_convert(TZ).strftime("%d %b %Y %H:%M %Z")
     return (f"Experimental · {state['status']} · issued {issue} · target {state['target_date']} "
-            f"08:00–22:00 · HARMONIE available for {state['available_hours']} of 15 forecast hours. Missing hours remain gaps.")
+            f"08:00–22:00 · HARMONIE available for {state['available_hours']} of 15 forecast hours. Missing hours remain gaps."
+            + (" Speed calibration disabled; historical results informed this choice. New-date confirmation pending."
+               if state.get("calibration_policy") == "none" else ""))

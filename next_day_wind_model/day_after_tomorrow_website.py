@@ -66,6 +66,10 @@ def evaluation_content(state, assets, version, kind=None):
             caption += " HARMONIE performs better for " + ", ".join(worse.sector) + "."
     if gate:
         caption += f" Evaluated active model: {gate['spider_model_id']}."
+    if gate.get("calibration_policy") == "none":
+        note = " Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending."
+        caption += note
+        gate_caption += note
     pieces = []
     for name, title in [(f"{PREFIX}_direction_spider", "Day-after-tomorrow performance by wind direction · experimental"),
                          (f"{PREFIX}_model_gate_eval_history", "Day-after-tomorrow model-gate evaluation history")]:

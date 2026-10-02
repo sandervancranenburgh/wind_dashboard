@@ -67,9 +67,9 @@ class GateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             artifact = Path(temp)
             stored, candidate_error = {}, [2.]
-            def fit(_samples, cutoff, kind, *_args):
+            def fit(_samples, cutoff, kind, *_args, calibration_policy="none"):
                 return SimpleNamespace(kind=kind, error=candidate_error[0], info={"cutoff_utc": cutoff.isoformat(),
-                    "max_label_end_utc": max(s.label_end for s in _samples).isoformat()})
+                    "max_label_end_utc": max(s.label_end for s in _samples).isoformat(), "calibration_policy": calibration_policy})
             def predict(fit, gate):
                 return np.stack([s.actual if fit.kind == "speed" else s.actual_dir for s in gate]) + fit.error
             def save(fit, path):
@@ -93,7 +93,7 @@ class GateTests(unittest.TestCase):
                 active = (artifact / "champions.json").read_bytes()
                 active_paths = {artifact / value["checkpoint"] for value in json.loads(active).values()}
                 saved_paths = set(stored)
-                def fail_direction(_samples, cutoff, kind, *_args):
+                def fail_direction(_samples, cutoff, kind, *_args, calibration_policy="none"):
                     if kind == "direction":
                         raise ValueError("No directional validation labels")
                     return fit(_samples, cutoff, kind)

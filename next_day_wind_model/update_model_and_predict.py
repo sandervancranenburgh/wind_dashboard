@@ -168,6 +168,7 @@ def parse_args() -> argparse.Namespace:
         help="Fallback IFS availability latency until enough completed runs exist.",
     )
     parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
+    parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
     parser.add_argument(
         "--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
         default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1",
@@ -7315,7 +7316,8 @@ def publish_web_dashboard(
         <img src="daily_mae_history.png?v={cache_bust}" alt="Realised forecast MAE history"></picture>
         <p><a href="daily_mae_history.csv">Download daily MAE CSV</a></p></section>'''
     downloads = ''.join(f'<li><a href="{name}">{html.escape(name)}</a></li>' for name in copied
-                        if name.endswith(".csv") and "predictions" not in name)
+                        if (name.endswith(".csv") and "predictions" not in name)
+                        or (name.startswith("day_after_tomorrow_study_") and name.endswith((".csv", ".json", ".png"))))
     evaluation_sections += f'<section class="card"><h2>Evaluation downloads</h2><ul>{downloads}</ul></section>'
     performance_section = '<section class="card"><h2 class="section-title"><a href="evaluation.html">How much better are the super local forecasts?</a></h2></section>'
     gate_eval_card = ""

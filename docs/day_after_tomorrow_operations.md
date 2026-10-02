@@ -43,7 +43,7 @@ holdout issue. Within fitting data, 20% of dates form validation; training label
 are purged before validation issues. Scalers, calibration and early stopping
 never see gate observations. Direction requires its own supervised contexts.
 
-Speed calibration now uses the complete next-day selector: threshold,
+Legacy speed calibration uses the complete next-day selector: threshold,
 contextual and target-hour ridge methods, choosing the improving candidate
 with the lowest fitting MAE. An optional mask excludes unavailable targets
 without flattening forecast windows or changing existing next-day defaults.
@@ -137,9 +137,8 @@ python -m http.server 8766 --bind 127.0.0.1 \
 ```
 
 Open `/dashboard/index.html` and `/dashboard/evaluation.html`. Static plots
-remain available if Plotly cannot load. The interactive D+2 view provides exact
-speed/direction/weather values and an ECMWF line; its “Show full forecast plot”
-button opens the complete existing static presentation.
+remain available if Plotly cannot load. D+2 uses the shared next-day static presentation with direction, weather and
+ECMWF; there is no separate D+2 interactive component.
 
 ## Deployment procedure — explicit approval required
 
@@ -210,3 +209,103 @@ all three spiders before all three model gates. Review artifacts live in
 and operational experiments remain separate. Repository validation passed
 257 tests and 60 subtests, plus desktop/mobile navigation, download, fallback
 and cache-refresh checks. Production remains unchanged by this work.
+
+## Uncalibrated D+2 review and calibration research — 2 October 2026
+
+The operational D+2 training policy now defaults to
+`--day-after-tomorrow-calibration none`. This skips both calibration fitting
+and application; the constrained neural speed output remains non-negative.
+`legacy` explicitly reproduces the existing three-method selector for research.
+Next-day defaults and checkpoint behavior are unchanged. A stored checkpoint
+keeps its own calibration: changing a training option does not reinterpret an
+old champion. New candidates still pass the independent speed/direction gate,
+and failures retain existing champions. Policy changes participate in refresh
+fingerprints, and forecasts/log metadata identify the actual active policy.
+
+The isolated review is under
+`next_day_wind_model/artifacts_dev/d2_uncalibrated_review/20261002/`.
+The fresh full-archive scan found 4,653 usable contexts and 47,999 matched
+hours. The uncalibrated challenger passed the local speed gate (MAE 1.841
+knots versus prior champion 3.269 and HARMONIE 2.250); direction retained its
+prior champion. Earlier historical gate results informed the decision to remove
+calibration, so this is a diagnostic rather than a fresh independent acceptance
+result. The previous experiments and champions remain separately available.
+
+Serve the review root on an available local port and open
+`/dashboard/index.html` or `/dashboard/evaluation.html`. Both pages retain the
+shared desktop/mobile forecast presentation, experimental label, six-plot
+ordering, and downloadable artifacts. The current preview uses port 8768.
+
+The separate research runner does not train operational candidates, publish,
+promote, or schedule anything:
+
+```bash
+python scripts/study_day_after_tomorrow_calibration.py prepare \
+  --review-dir next_day_wind_model/artifacts_dev/d2_uncalibrated_review/20261002 \
+  --reference-model-artifacts /path/to/production/next_day_wind_model/artifacts \
+  --output-dir next_day_wind_model/artifacts_dev/d2_uncalibrated_review/20261002/research
+```
+
+Preparation requires a new output directory. It copies a consistent next-day
+champion/scaler/reference snapshot, checking source hashes around the copy.
+Its paired historical predictions reproduce the saved aligned gate within
+`atol=1e-4, rtol=1e-5`. Historical observation values come from that saved gate:
+its last partially observed hour subsequently changed, and replacing those
+values with later completed-hour averages would change the comparison.
+
+D+2's affine experiment uses identical neural predictions, no seasonal or
+context terms, and non-negative slope/output. Mean squared fitting loss plus
+ridge penalties `{0.1, 1, 10, 100}` shrinks the correction toward identity.
+The first 70% of validation dates fit calibration; the last 30% select it,
+with labels purged before selection issues. At least seven fitting dates,
+five selection dates, and 32 usable contexts per partition are required.
+A candidate must improve selection MAE by 1%; ties within 1e-9 MAE prefer
+stronger regularisation. No candidate passed this review: selection MAE was
+1.739 knots without correction, and even ridge 100 was slightly worse.
+The reported `simple` variant therefore means the identity fallback; it is
+not an enabled affine correction. Neural early stopping already used validation,
+so this subdivision is not an independent final model test.
+
+For next-day, calibration reduced historical MAE from 1.440 to 1.372 knots
+(4.7%), and bias from +0.600 to -0.101 knots. The 95% target-date bootstrap
+interval for its absolute gain is -0.009 to +0.142 knots, crossing zero:
+added value is inconclusive. Next-day's saved gate uses rolling 24-hour windows;
+D+2 uses 08:00–22:00, so headline scores across horizons are not directly comparable.
+
+Preparation seals `frozen_manifest.json`, its checksum, the D+2 model/scalers,
+calibration coefficients/selection audit, and next-day reference artifacts.
+For this review the freeze is 2 October 2026 at 20:30 UTC; the first eligible
+confirmation target date is 5 October. The confirmation runner has no fitting
+or promotion options, verifies all sealed hashes, and fails if they change:
+
+```bash
+python scripts/study_day_after_tomorrow_calibration.py confirm \
+  --experiment-dir next_day_wind_model/artifacts_dev/d2_uncalibrated_review/20261002/research \
+  --db /path/to/source/wind_data_all_sites.db \
+  --ecmwf-archive /path/to/source/ecmwf_shadow.sqlite \
+  --as-of 2026-10-25T12:00:00+01:00
+```
+
+Run it manually as new data arrives. It refreshes a weather-only online snapshot
+through a read-only source connection, replays frozen models at eligible hourly
+issues, and labels predictions `replay_with_frozen_models`, not saved-at-issuance
+forecasts. The next-day replay uses its shared features/model with the actual
+issue cutoff and 72 completed history hours; it never advances history into
+later evening hours. Native next-day input remains 24 hours, with evaluation
+restricted to local 08:00–22:00. ECMWF is a protected source path but is not a
+learned feature or confirmation input.
+
+Assess once on the first 20 completed target dates with shared observed target
+hours and at least 60 usable issue contexts per horizon. Coverage exclusions
+are reported; the selected 20-date period is never extended because a result is
+inconclusive. Fewer contexts at its end produce an insufficient-data result.
+A relative MAE gain of at least 1% with a target-date bootstrap interval above
+zero is promising; otherwise report inconclusive or worse. The simple fallback
+cannot demonstrate a calibration gain when none passed selection. Results never
+activate calibration or promote production models. Subsequent calls after final
+assessment return the existing result.
+
+Review `research/calibration_review.md`, paired CSVs, JSON metrics, monthly
+figures and `confirmation_status.json`. Deployment/rollback remains the separate
+explicitly approved procedure above; do not copy these research weights into
+production or add an automatic confirmation schedule.

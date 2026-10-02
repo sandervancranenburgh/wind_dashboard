@@ -78,9 +78,12 @@ def historical_samples(db: Path, cutoff: pd.Timestamp, artifact: Path):
     # Cached completed targets are stable. Reload the latest three dates so
     # newly completed/corrected observations near the cutoff can be included.
     samples = []
-    if cache.exists() and provenance.exists() and json.loads(provenance.read_text()) == identity:
+    coverage_path = artifact / "coverage.csv"
+    coverage = []
+    if cache.exists() and provenance.exists() and coverage_path.exists() and json.loads(provenance.read_text()) == identity:
         samples = [s for s in core.load_samples(cache)
                    if s.label_end <= cutoff - pd.Timedelta(days=3)]
+        coverage = pd.read_csv(coverage_path).to_dict("records")
     start = obs.index.min().tz_convert(TZ).date() + timedelta(days=3)
     if samples:
         start = max(start, max(s.issue.tz_convert(TZ).date() for s in samples) + timedelta(days=1))
@@ -89,16 +92,35 @@ def historical_samples(db: Path, cutoff: pd.Timestamp, artifact: Path):
     for day in pd.date_range(start, last, freq="D"):
         for hour in range(7, 23):
             issue = pd.Timestamp(datetime.combine(day.date(), time(hour)), tz=TZ).tz_convert("UTC")
-            sample = core.make_sample(lookup, obs, archive, issue)
+            rejection = {}
+            sample = core.make_sample(lookup, obs, archive, issue, rejection)
+            complete = sample is not None and sample.label_end <= cutoff
+            usable = complete and sample.speed_mask.any()
+            reason = rejection.get("reason") if sample is None else (
+                "target_observations_incomplete" if not complete else "no_matched_observations" if not usable else "usable")
+            coverage.append({"issue_time_utc": issue.isoformat(), "target_date": core.calendar_targets(issue)[0].tz_convert(TZ).date().isoformat(),
+                "forecast_hours": 0 if sample is None else int(sample.forecast_mask.sum()),
+                "scorable_hours": int(sample.speed_mask.sum()) if complete else 0,
+                "usable": bool(usable), "reason": reason})
             if sample is not None and sample.label_end <= cutoff and sample.speed_mask.any():
                 samples.append(sample)
+        if day.day == 1:
+            print(f"D+2 archive scan through {day.date()}: {len(samples)} usable contexts", flush=True)
+    artifact.mkdir(parents=True, exist_ok=True)
+    inventory = pd.DataFrame(coverage).drop_duplicates("issue_time_utc", keep="last").sort_values("issue_time_utc")
+    inventory.to_csv(coverage_path, index=False)
+    inventory["month"] = inventory.target_date.str[:7]
+    inventory.groupby("month").agg(contexts=("usable", "size"), usable_contexts=("usable", "sum"),
+        matched_target_hours=("scorable_hours", "sum"), available_forecast_hours=("forecast_hours", "sum")).assign(
+        excluded_contexts=lambda x: x.contexts - x.usable_contexts).to_csv(artifact / "coverage_by_month.csv")
+    inventory.groupby(["month", "reason"]).size().rename("contexts").to_csv(artifact / "coverage_exclusions.csv")
     if samples:
         core.save_samples(samples, cache)
         write_json(provenance, identity)
     return samples
 
 
-def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1.):
+def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2):
     from next_day_wind_model import day_after_tomorrow_core as core
     from next_day_wind_model.update_model_and_predict import (
         append_model_gate_eval_history, save_model_gate_eval_history_plot)
@@ -111,6 +133,7 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     new_state = dict(state)
     results, selected, candidates, prior_predictions, selected_fits = {}, {}, {}, {}, {}
+    speed_diagnostic = None
     for kind in ["speed", "direction"]:
         supervised_gate = [s for s in gate if (s.direction_mask if kind == "direction" else s.speed_mask).any()]
         if len(supervised_gate) < minimum:
@@ -120,7 +143,7 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
         previous_threads = core.torch.get_num_threads()
         try:
             core.torch.set_num_threads(min(previous_threads, 2))
-            candidate = core.fit_model(supervised_fitting, boundary, kind, False, epochs, batch_size, seed)
+            candidate = core.fit_model(supervised_fitting, boundary, kind, False, epochs, batch_size, seed, constraint_eps)
         finally:
             core.torch.set_num_threads(previous_threads)
         candidate.info.update(model_id=f"{gate_id}_{kind}", operational=True,
@@ -143,6 +166,8 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
         selected[kind] = candidate_values if score["promote"] else prior_values
         selected_fits[kind] = candidate if score["promote"] else prior
         candidates[kind], prior_predictions[kind], results[kind] = candidate_values, prior_values, score
+        if kind == "speed" and hasattr(candidate, "calibration"):
+            speed_diagnostic = (candidate, core.predict(candidate, gate, calibrate=False))
     # Candidate files are immutable. Activate only after both fits and their
     # evaluation exports succeed, so a reporting failure also retains models.
     speed = results["speed"]
@@ -183,9 +208,57 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
                                      TZ, detail_path, horizon_label="Day-after-tomorrow")
     summary.update(spider_model_id=new_state["speed"]["model_id"],
                    evaluation_start=min(s.day for s in gate), evaluation_end=max(s.day for s in gate))
+    if speed_diagnostic is not None:
+        fit, uncalibrated = speed_diagnostic
+        diagnostics = pd.DataFrame(core.prediction_rows(gate, candidates["speed"], fit,
+            "operational_gate_diagnostic", candidates["direction"]))
+        diagnostics["uncalibrated"] = uncalibrated.reshape(-1)
+        diagnostics["calibration_correction"] = diagnostics.prediction - diagnostics.uncalibrated
+        diagnostics["month"] = diagnostics.target_date.str[:7]
+        diagnostic_summary = export_calibration_diagnostics(artifact, fit.info, fit.calibration, diagnostics)
+        summary["calibration_diagnostic"] = diagnostic_summary
     write_json(artifact / "gate_summary.json", summary)
     write_json(state_path, new_state)
     return summary
+
+
+def export_calibration_diagnostics(artifact: Path, training: dict, calibration: dict | None, diagnostics: pd.DataFrame) -> dict:
+    """Report fixed predictions; never train, select or activate a model."""
+    from next_day_wind_model import day_after_tomorrow_core as core
+    diagnostics = diagnostics.copy()
+    if "direction_scorable" not in diagnostics:
+        diagnostics["direction_scorable"] = diagnostics.forecast_available & np.isfinite(diagnostics.actual_direction)
+    diagnostics.to_csv(artifact / "calibration_predictions.csv", index=False)
+    def describe(frame):
+        matched = frame.loc[frame.scorable].dropna(subset=["actual", "prediction", "uncalibrated", "harmonie"])
+        metrics = {name: core.metric(matched[name], matched.actual) for name in ["harmonie", "uncalibrated", "prediction"]}
+        for name in ["uncalibrated", "prediction"]:
+            mae = metrics["harmonie"]["mae"]
+            metrics[name]["relative_mae_improvement"] = (mae - metrics[name]["mae"]) / mae if mae else None
+            metrics[name]["date_bootstrap"] = core.bootstrap(matched, name, "harmonie")
+        directions = frame.loc[frame.direction_scorable]
+        metrics["direction"] = {name: core.metric(directions[name], directions.actual_direction, circular=True)
+            for name in ["prediction_direction", "harmonie_direction"]}
+        metrics["direction"]["prediction_direction"]["date_bootstrap"] = core.bootstrap(directions,
+            "prediction_direction", "harmonie_direction", actual_column="actual_direction", circular=True)
+        return metrics
+    diagnostic_summary = {"model_id": training["model_id"], "training": training,
+        "calibration": calibration, "matched_hours": describe(diagnostics),
+        "complete_windows": describe(diagnostics.loc[diagnostics.complete_window]),
+        "monthly_mean_correction_knots": diagnostics.loc[diagnostics.scorable].groupby("month").calibration_correction.mean().to_dict()}
+    write_json(artifact / "calibration_diagnostic.json", diagnostic_summary)
+    breakdown = []
+    for dimension in ["issue_hour", "target_hour", "lead_hours", "target_date", "month"]:
+        for value, group in diagnostics.loc[diagnostics.scorable].groupby(dimension):
+            for name in ["harmonie", "uncalibrated", "prediction"]:
+                breakdown.append({"dimension": dimension, "value": value, "model": name,
+                    **core.metric(group[name], group.actual)})
+        for value, group in diagnostics.loc[diagnostics.direction_scorable].groupby(dimension):
+            for name in ["harmonie_direction", "prediction_direction"]:
+                breakdown.append({"dimension": dimension, "value": value, "model": name,
+                    **core.metric(group[name], group.actual_direction, circular=True)})
+    pd.DataFrame(breakdown).to_csv(artifact / "calibration_breakdowns.csv", index=False)
+    return diagnostic_summary
 
 
 def infer(db: Path, issue, artifact: Path, output: Path):
@@ -351,7 +424,7 @@ def render_cached(output: Path, archive: Path | None, now, *, force=True):
                 model_trained_at_utc=metadata["champions"]["speed"]["trained_at_utc"],
                 harmonie_time_utc=metadata.get("harmonie_fetched_at_utc"),
                 mobile=mobile, ecmwf_speed_series=ec, spot_name="Valkenburgse Meer",
-                experiment_label=f"Experimental D+2 · {metadata['status']} · coverage {metadata['available_hours']}/15 hours")
+                experiment_label="Experimental D+2", operational_forecast=True)
         table["target_time_local"] = table.target_time_utc.dt.tz_convert(TZ).astype(str)
         table["target_time_utc"] = table.target_time_utc.astype(str)
         from next_day_wind_model.weather_conditions import weather_description
@@ -385,7 +458,7 @@ def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
             try:
                 train(samples, issue, artifact, epochs=args.epochs, batch_size=args.batch_size,
                       seed=getattr(args, "seed", 42), minimum=args.challenge_min_eval_samples,
-                      margin=args.promotion_margin_pct)
+                      margin=args.promotion_margin_pct, constraint_eps=getattr(args, "speed_constraint_eps", .2))
             except Exception as exc:
                 # Keep active champions and previous successful evaluation intact.
                 write_json(artifact / "last_training_attempt.json", {"status": "failed", "at": now.isoformat(), "reason": str(exc)})
@@ -468,4 +541,4 @@ def status_text(state: dict) -> str:
         return "Experimental D+2 forecast unavailable. " + state.get("reason", "")
     issue = pd.Timestamp(state["issue_time_utc"]).tz_convert(TZ).strftime("%d %b %Y %H:%M %Z")
     return (f"Experimental · {state['status']} · issued {issue} · target {state['target_date']} "
-            f"08:00–22:00 · HARMONIE coverage {state['available_hours']}/15 hours. Missing hours remain gaps.")
+            f"08:00–22:00 · HARMONIE available for {state['available_hours']} of 15 forecast hours. Missing hours remain gaps.")

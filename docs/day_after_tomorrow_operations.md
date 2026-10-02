@@ -43,6 +43,20 @@ holdout issue. Within fitting data, 20% of dates form validation; training label
 are purged before validation issues. Scalers, calibration and early stopping
 never see gate observations. Direction requires its own supervised contexts.
 
+Speed calibration now uses the complete next-day selector: threshold,
+contextual and target-hour ridge methods, choosing the improving candidate
+with the lowest fitting MAE. An optional mask excludes unavailable targets
+without flattening forecast windows or changing existing next-day defaults.
+As in next-day, validation observations are reused for early stopping and
+calibration; they are not an independent calibration acceptance set. The gate
+remains separate. Do not tune calibration using its scores.
+
+The full-archive scan writes `coverage.csv`, `coverage_by_month.csv` and
+`coverage_exclusions.csv`. Candidate diagnostics compare HARMONIE, the neural
+forecast before calibration and the final calibrated forecast on matched hours
+and complete windows. Calibration type, fitting dates, seasonal corrections,
+date-bootstrap intervals and grouped scores are exported alongside the gate.
+
 Promotion requires at least 1% MAE improvement against the prior D+2 champion,
 independently for speed and circular direction. As in the existing next-day
 rule, a valid initial candidate becomes champion when none exists, even if it
@@ -66,11 +80,20 @@ their own filters.
 
 Forecasts stay on the homepage. Its “How much better are the super local
 forecasts?” link opens the evaluation page, containing all existing evaluation
-content and D+2 spider/gate sections. Navigation uses two equal-width blue
+content in this order: current-day, next-day and D+2 spiders, followed by
+current-day, next-day and D+2 model gates. The current-day gate is rendered
+from its actual aligned holdout artifacts; its model pipeline is unchanged.
+Navigation uses two equal-width blue
 44-pixel buttons: Forecasts and Rider portal. Existing evaluation asset URLs
 and CSV downloads remain available. Missing D+2 evaluations have an explicit
 empty state; cached forecasts retain their actual target date and are labeled
 stale across date rollover or after missed daytime updates.
+
+D+2 uses the exact next-day desktop/mobile renderer and forecast-card
+structure. The former D+2-only interactive renderer has been removed. Shared
+interactive enhancements, when available, follow the next-day component.
+“HARMONIE available for N of 15 forecast hours” describes coverage of the
+displayed 08:00–22:00 window, not the number of training contexts.
 
 ## Safe local rehearsal
 
@@ -81,7 +104,8 @@ python scripts/preview_day_after_tomorrow.py \
   --db /path/to/source/wind_data_all_sites.db \
   --ecmwf-archive /path/to/source/ecmwf_shadow.sqlite \
   --reference-dashboard /path/to/source/docs \
-  --output-dir next_day_wind_model/artifacts_dev/d2_operational_review/20261002 \
+  --reference-model-artifacts /path/to/source/next_day_wind_model/artifacts \
+  --output-dir next_day_wind_model/artifacts_dev/d2_aligned_review/20261002 \
   --issue-time 2026-10-02T15:00:00+02:00
 ```
 
@@ -91,6 +115,12 @@ primary source. All training, logging, evaluation and publication writes go to
 the isolated copies. It refuses production-checkout/live-runtime output paths.
 It never invokes wrappers, collectors, Git publication, cron or services.
 Source paths must refer to the same archive across repeated stages.
+The reference-model-artifacts option copies only current-day gate reporting
+inputs; it never imports existing model weights into D+2 training. Preview
+defaults match the deployed next-day training settings: 30 maximum epochs,
+batch size 16, constrained-speed epsilon 0.2 and seed 42. All model weights
+are initialized from scratch. Legacy caches without an archive coverage
+inventory are rebuilt rather than assumed to contain the full history.
 
 Use `--stage predict` for hourly inference or `--stage refresh` for cached plots.
 Use a later explicit issue cutoff to exercise rollover. `--sample-cache` may
@@ -143,7 +173,7 @@ The initial local frozen gate can perform differently from the rolling
 historical experiment. A worse or inconclusive gate result is reported plainly;
 it is not grounds to silently change the agreed promotion rule or deploy.
 
-### Review finding on 2 October 2026
+### Initial review finding on 2 October 2026
 
 The rehearsal initialized champions, then retained them against a second
 challenger. On 44 gate target dates (9,227 matched issue/target hours), the
@@ -157,3 +187,26 @@ not been silently altered to select a variant using gate observations.
 
 Production is unchanged. Review the calibration diagnostic and holdout reports
 alongside the website before approving any deployment.
+
+### Aligned review on 2 October 2026
+
+A fresh snapshot/full-archive scan found 4,653 usable issue contexts and 47,999
+matched target hours. Fresh speed/direction candidates used the next-day
+settings (30 maximum epochs, batch size 16, epsilon 0.2, seed 42). The speed
+network stopped after 13 epochs; the fit used 3,102 training contexts and 786
+validation/calibration contexts, with the same 44-date untouched gate.
+
+The complete three-method selector still selected target-hour ridge calibration
+on validation-fitting MAE. Gate speed MAE is **1.84 knots before calibration**,
+**3.27 knots after calibration**, versus **2.25 knots for HARMONIE**. The
+calibrated improvement interval is **-1.56 to -0.51 knots**, showing worse
+performance. Calibration still clips the displayed D+2 speeds to zero.
+No alternative was selected using gate observations. The seasonal calibration
+failure remains a separate investigation before deployment.
+
+The corrected development site uses the exact next-day forecast template and
+all three spiders before all three model gates. Review artifacts live in
+`next_day_wind_model/artifacts_dev/d2_aligned_review/20261002`; prior historical
+and operational experiments remain separate. Repository validation passed
+257 tests and 60 subtests, plus desktop/mobile navigation, download, fallback
+and cache-refresh checks. Production remains unchanged by this work.

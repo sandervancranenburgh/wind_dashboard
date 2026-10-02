@@ -31,7 +31,7 @@ from next_day_wind_model import data_pipeline as dp
 from next_day_wind_model.ecmwf_dashboard import MPS_TO_KNOT, load_ecmwf_plot_data
 from next_day_wind_model.train_lstm import NextDayLSTM, TargetAwareNextDayLSTM
 from next_day_wind_model.update_model_and_predict import (
-    _fit_target_hour_speed_calibration,
+    fit_speed_regime_calibration,
     _predict_direction_batch,
     _predict_speed_batch,
     apply_speed_regime_calibration,
@@ -244,17 +244,21 @@ class Sample:
 
 
 def make_sample(lookup: dp.TrainingForecastLookup, obs: pd.DataFrame,
-                archive: ECMWFArchive, issue: pd.Timestamp) -> Sample | None:
+                archive: ECMWFArchive, issue: pd.Timestamp, rejection: dict | None = None) -> Sample | None:
     issue = utc(issue)
     targets = calendar_targets(issue)
     history_times = pd.date_range(end=issue.floor("h") - pd.Timedelta(hours=1), periods=HISTORY_HOURS, freq="h")
     # Only completed history hours are used, not the unfinished issue hour.
     history = dp._build_training_history_forecast_frame(lookup, history_times, dp._target_ms(issue))
     if history is None:
+        if rejection is not None:
+            rejection["reason"] = "missing_cutoff_eligible_72h_history"
         return None
     frame = partial_run(lookup, targets, issue)
     forecast_mask = np.isfinite(frame[["forecast_avg", "forecast_dir"]].to_numpy()).all(axis=1)
     if not forecast_mask.any():
+        if rejection is not None:
+            rejection["reason"] = "no_cutoff_eligible_D2_targets"
         return None
     frame["forecast_max"] = frame.forecast_max.fillna(frame.forecast_avg)
     padded = frame.copy()
@@ -265,6 +269,8 @@ def make_sample(lookup: dp.TrainingForecastLookup, obs: pd.DataFrame,
     built = dp._build_feature_sequence(history, padded, feature_schema="speed_v2")
     direction = dp._build_feature_sequence(history, padded, feature_schema="direction_v2")
     if built is None or direction is None:
+        if rejection is not None:
+            rejection["reason"] = "missing_required_features"
         return None
     speed_x = np.column_stack([built[0], np.r_[np.ones(HISTORY_HOURS), forecast_mask.astype(float)]]).astype(np.float32)
     labels = obs.reindex(targets)
@@ -307,7 +313,7 @@ def input_array(samples: list[Sample], kind: str, ecmwf: bool) -> np.ndarray:
     return array.astype(np.float32)
 
 
-def target_array(samples: list[Sample], kind: str) -> tuple[np.ndarray, np.ndarray]:
+def target_array(samples: list[Sample], kind: str, constraint_eps: float = EPS) -> tuple[np.ndarray, np.ndarray]:
     baseline_col = "forecast_dir" if kind == "direction" else "forecast_avg"
     baseline = np.stack([s.frame[baseline_col].to_numpy(np.float32) for s in samples])
     actual = np.stack([s.actual_dir if kind == "direction" else s.actual for s in samples])
@@ -315,12 +321,14 @@ def target_array(samples: list[Sample], kind: str) -> tuple[np.ndarray, np.ndarr
     if kind == "direction":
         target = (actual - baseline + 180) % 360 - 180
     else:
-        target = np.log(actual + EPS) - np.log(baseline + EPS)
+        target = np.log(actual + constraint_eps) - np.log(baseline + constraint_eps)
     return np.where(mask, target, 0).astype(np.float32), mask
 
 
 def calibration_context(samples: list[Sample]) -> dict:
-    return {"target_forecast_dir_deg": np.stack([s.frame.forecast_dir.to_numpy(float) for s in samples]),
+    return {"anchor_dir_deg": np.asarray([np.degrees(np.arctan2(s.speed_x[HISTORY_HOURS - 1, 2], s.speed_x[HISTORY_HOURS - 1, 3])) % 360 for s in samples]),
+            "target_month": np.asarray([s.targets[0].month for s in samples]),
+            "target_forecast_dir_deg": np.stack([s.frame.forecast_dir.to_numpy(float) for s in samples]),
             "target_times_utc": np.stack([s.targets.astype(str).to_numpy() for s in samples]),
             "target_horizon_hr": np.stack([s.frame.horizon_hr.to_numpy(float) for s in samples])}
 
@@ -350,23 +358,24 @@ def predict(fit: Fit, samples: list[Sample], calibrate: bool = True) -> np.ndarr
                                              fit.y_mean, fit.y_std, torch.device("cpu"))
         else:
             batch = _predict_speed_batch(fit.model, scaled[i:i + 256], baseline[i:i + 256],
-                fit.y_mean, fit.y_std, "constrained_logratio", EPS, None, None, torch.device("cpu"))
+                fit.y_mean, fit.y_std, "constrained_logratio", fit.info.get("constraint_eps", EPS), None, None, torch.device("cpu"))
         batches.append(batch)
     result = np.concatenate(batches)
     if fit.kind == "speed" and calibrate:
-        result = apply_speed_regime_calibration(result, baseline, fit.calibration, calibration_context(samples))
+        result = apply_speed_regime_calibration(result, baseline, fit.calibration, calibration_context(samples),
+            target_mask=np.stack([s.forecast_mask for s in samples]))
     return np.where(np.stack([s.forecast_mask for s in samples]), result, np.nan)
 
 
 def fit_model(samples: list[Sample], cutoff: pd.Timestamp, kind: str, ecmwf: bool,
-              epochs: int, batch_size: int, seed: int) -> Fit:
+              epochs: int, batch_size: int, seed: int, constraint_eps: float = EPS) -> Fit:
     training, validation = purged_split(samples, cutoff)
     torch.manual_seed(seed)
     np.random.seed(seed)
     x_train, x_val = input_array(training, kind, ecmwf), input_array(validation, kind, ecmwf)
     x_mean, x_std = dp._fit_standardizer(x_train)
-    y_train, mask_train = target_array(training, kind)
-    y_val, mask_val = target_array(validation, kind)
+    y_train, mask_train = target_array(training, kind, constraint_eps)
+    y_val, mask_val = target_array(validation, kind, constraint_eps)
     if not mask_train.any() or not mask_val.any():
         raise ValueError(f"Insufficient supervised {kind} training/validation targets")
     y_mean = float(y_train[mask_train].mean())
@@ -411,18 +420,24 @@ def fit_model(samples: list[Sample], cutoff: pd.Timestamp, kind: str, ecmwf: boo
             "training_dates": sorted({s.day for s in training}), "validation_dates": sorted({s.day for s in validation}),
             "training_samples": len(training), "validation_samples": len(validation),
             "epochs_ran": epoch + 1, "best_validation_loss": best, "seed": seed,
-            "model_class": type(model).__name__, "ecmwf": ecmwf, "kind": kind}
+            "model_class": type(model).__name__, "ecmwf": ecmwf, "kind": kind,
+            "constraint_eps": constraint_eps, "batch_size": batch_size, "max_epochs": epochs}
     fit = Fit(model, x_mean, x_std, y_mean, y_std, kind, ecmwf, None, info)
     if kind == "speed":
-        # Existing target-hour ridge calibration, restricted to known validation
-        # labels. Flatten only valid points; missing targets never become zeros.
+        # The same three-method selector as next-day, preserving window-level
+        # signals and excluding missing target observations from every fit.
         pred = predict(fit, validation, calibrate=False)
         mask = np.stack([s.speed_mask for s in validation])
         baseline = np.stack([s.frame.forecast_avg.to_numpy(float) for s in validation])
         actual = np.stack([s.actual for s in validation])
-        context = {key: value[mask].reshape(-1, 1) for key, value in calibration_context(validation).items()}
-        fit.calibration = _fit_target_hour_speed_calibration(pred[mask].reshape(-1, 1),
-                            baseline[mask].reshape(-1, 1), actual[mask].reshape(-1, 1), context)
+        selection = {}
+        fit.calibration = fit_speed_regime_calibration(pred, baseline, actual,
+            calibration_context(validation), signal="pred_max", target_mask=mask, diagnostics=selection)
+        fit.info["calibration_training"] = {"dates": sorted({s.day for s in validation}),
+            "months": sorted({s.day[:7] for s in validation}), "contexts": len(validation),
+            "matched_hours": int(mask.sum()), "selection_rule": "lowest calibration-fitting MAE among improving candidates",
+            "validation_reused_for_epoch_selection": True,
+            "methods": ["threshold_v1", "contextual_linear_v2", "target_hour_ridge_v1"], "selection": selection}
     return fit
 
 
@@ -433,7 +448,7 @@ def save_fit(fit: Fit, path: Path) -> None:
                 "feature_schema": "direction_v2" if fit.kind == "direction" else "speed_v2_d2_masked",
                 "ecmwf_feature_names": EC_FEATURES if fit.ecmwf else [],
                 "n_features": len(fit.x_mean), "target_mode": "residual" if fit.kind == "direction" else "constrained_logratio",
-                "constraint_eps": EPS, "x_mean": torch.from_numpy(fit.x_mean), "x_std": torch.from_numpy(fit.x_std),
+                "constraint_eps": fit.info.get("constraint_eps", EPS), "x_mean": torch.from_numpy(fit.x_mean), "x_std": torch.from_numpy(fit.x_std),
                 "y_mean": fit.y_mean, "y_std": fit.y_std, "calibration": fit.calibration,
                 "training": fit.info}, path)
     np.savez(path.with_suffix(".scalers.npz"), x_mean=fit.x_mean, x_std=fit.x_std,
@@ -471,6 +486,7 @@ def prediction_rows(samples: list[Sample], predictions: np.ndarray, fit: Fit | N
                          "model_latest_label_end_utc": None if fit is None else fit.info["max_label_end_utc"],
                          "forecast_available": bool(sample.forecast_mask[i]),
                          "scorable": bool(sample.speed_mask[i]),
+                         "direction_scorable": bool(sample.direction_mask[i]),
                          "complete_window": bool(sample.speed_mask.all()),
                          "prediction": values[i], "actual": sample.actual[i], "harmonie": f.forecast_avg,
                          "ecmwf": sample.ec[i, 2], "harmonie_direction": f.forecast_dir,
@@ -514,11 +530,15 @@ def metric(prediction: np.ndarray, actual: np.ndarray, circular: bool = False) -
             "bias": float(error.mean()) if len(error) else None}
 
 
-def bootstrap(frame: pd.DataFrame, prediction: str, baseline: str, iterations: int = 2000) -> dict:
-    work = frame[["target_date", prediction, baseline, "actual"]].dropna()
+def bootstrap(frame: pd.DataFrame, prediction: str, baseline: str, iterations: int = 2000,
+              actual_column: str = "actual", circular: bool = False) -> dict:
+    work = frame[["target_date", prediction, baseline, actual_column]].dropna()
     if work.empty:
         return {"days": 0, "ci95": None, "estimate": None}
-    work = work.assign(delta=np.abs(work[baseline] - work.actual) - np.abs(work[prediction] - work.actual))
+    baseline_error, model_error = work[baseline] - work[actual_column], work[prediction] - work[actual_column]
+    if circular:
+        baseline_error, model_error = (baseline_error + 180) % 360 - 180, (model_error + 180) % 360 - 180
+    work = work.assign(delta=np.abs(baseline_error) - np.abs(model_error))
     groups = work.groupby("target_date").delta.agg(["sum", "count"])
     rng = np.random.default_rng(SEED)
     picks = rng.integers(0, len(groups), size=(iterations, len(groups)))

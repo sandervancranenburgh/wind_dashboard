@@ -2577,6 +2577,7 @@ def save_prediction_plot(
     ecmwf_speed_series: pd.DataFrame | None = None,
     spot_name: str | None = None,
     render_diagnostics: dict[str, object] | None = None,
+    experiment_label: str | None = None,
 ) -> None:
     table = table.copy()
     if "target_time_local" not in table.columns:
@@ -2595,6 +2596,8 @@ def save_prediction_plot(
     table["hour_label"] = table["target_time_local"].dt.strftime("%H")
     first_dt = table["target_time_local"].iloc[0]
     day_label = _format_static_day_label(first_dt)
+    if experiment_label:
+        day_label = f"{day_label}\n{experiment_label}"
 
     forecast_core_parts = [
         table["forecast_wind_speed"].dropna(),
@@ -2667,12 +2670,15 @@ def save_prediction_plot(
         ecmwf_frame = ecmwf_frame.dropna(subset=["time_local", "wind_speed_knots"])
         first_target = pd.Timestamp(table["target_time_local"].iloc[0])
         last_target = pd.Timestamp(table["target_time_local"].iloc[-1])
+        before_limit = ecmwf_frame[ecmwf_frame["time_local"] < first_target].tail(1)
         ecmwf_frame = _native_points_through_first_after_limit(
             ecmwf_frame,
             time_column="time_local",
             left=first_target,
             right=last_target,
         )
+        if experiment_label and not before_limit.empty:
+            ecmwf_frame = pd.concat([before_limit, ecmwf_frame], ignore_index=True)
         if not ecmwf_frame.empty:
             ecmwf_x = (
                 (ecmwf_frame["time_local"] - first_target).dt.total_seconds() / 3600.0
@@ -2732,20 +2738,29 @@ def save_prediction_plot(
     direction_ax.grid(False)
     for spine in direction_ax.spines.values():
         spine.set_visible(False)
+    plot_meta_text = _format_plot_meta_text(
+        plot_updated_at_utc,
+        prediction_updated_at_utc,
+        model_trained_at_utc,
+        local_tz,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=plot_update_interval_minutes,
+        harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+    )
+    if experiment_label:
+        def experiment_time(value):
+            return "unknown" if value is None else pd.Timestamp(value).tz_convert(ZoneInfo(local_tz)).strftime("%d %B %H:%M")
+        plot_meta_text = (
+            f"Forecast issued: {experiment_time(prediction_updated_at_utc)}\n"
+            f"HARMONIE fetched: {experiment_time(harmonie_time_utc)}\n"
+            f"Experimental fitting cutoff: {experiment_time(model_trained_at_utc)}"
+        )
     metadata_artist = ax.text(
         0.015,
         meta_y,
-        _format_plot_meta_text(
-            plot_updated_at_utc,
-            prediction_updated_at_utc,
-            model_trained_at_utc,
-            local_tz,
-            harmonie_time_utc=harmonie_time_utc,
-            harmonie_time_kind=harmonie_time_kind,
-            plot_update_interval_minutes=plot_update_interval_minutes,
-            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
-            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
-        ),
+        plot_meta_text,
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -2784,6 +2799,8 @@ def save_prediction_plot(
     direction_arrow_count = 0
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, SUPERLOCAL_FORECAST_COLOR)]:
+            if not np.isfinite(direction_deg):
+                continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
             dy = arrow_len * np.cos(theta)
@@ -2892,6 +2909,8 @@ def save_prediction_plot(
                 "direction_arrow_count": direction_arrow_count,
                 "spot_name": spot_name or "",
                 "model_id_text": model_id_artist.get_text(),
+                "experiment_label": experiment_label,
+                "plot_meta_text": plot_meta_text,
                 "header_bounds_figure": header_bounds,
                 "weather_temperature_bounds_display": weather_temperature_bounds,
                 "weather_icon_bounds_display": weather_icon_bounds,
@@ -6353,7 +6372,13 @@ def _direction_performance_summary_text(direction_csv: Path | None) -> str:
     return " ".join(parts)
 
 
-def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: Path) -> None:
+def save_wind_direction_performance_spider_plot(
+    direction_csv: Path,
+    plot_png: Path,
+    *,
+    model_label: str = "Super local champion model next-day",
+    title: str = "MAE for next-day models by forecast wind direction",
+) -> None:
     if not direction_csv.exists():
         return
     df = pd.read_csv(direction_csv)
@@ -6379,7 +6404,7 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
         weights = np.ones(len(df), dtype=float)
     harmonie_mae = float(np.average(harmonie, weights=weights))
     champion_mae = float(np.average(champion, weights=weights))
-    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
+    angles = np.array([order.index(label) * np.pi / 4 for label in labels])
     angles_closed = np.r_[angles, angles[0]]
     harmonie_closed = np.r_[harmonie, harmonie[0]]
     champion_closed = np.r_[champion, champion[0]]
@@ -6404,7 +6429,7 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
         linewidth=2.3,
         marker="o",
         markersize=4,
-        label=f"Super local champion model next-day ({champion_mae:.2f} kts)",
+        label=f"{model_label} ({champion_mae:.2f} kts)",
     )
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=11)
@@ -6413,7 +6438,7 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(color="#d7d7d7", linewidth=0.8)
     ax.spines["polar"].set_color("#cfcfcf")
-    ax.set_title("MAE for next-day models by forecast wind direction", pad=22, fontsize=14, fontweight="bold")
+    ax.set_title(title, pad=22, fontsize=14, fontweight="bold")
     ax.text(
         0.5,
         -0.08,

@@ -2016,7 +2016,8 @@ class RiderPortalTest(unittest.TestCase):
         detail = self.client.get(f"/experiences/{public_id}?shared=1")
         self.assertEqual(detail.status_code, 200)
         self.assertIn(f'value="http://localhost/share/experience/{token}"'.encode(), detail.data)
-        self.assertNotIn(f"/share/experience/{public_id}".encode(), detail.data)
+        # Match the complete path: a random secure token may start with the ID.
+        self.assertNotIn(f'/share/experience/{public_id}"'.encode(), detail.data)
 
         anonymous_share = self.client.get(f"/share/experience/{token}")
         self.assertEqual(anonymous_share.status_code, 200)

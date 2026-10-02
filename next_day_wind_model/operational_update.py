@@ -642,6 +642,8 @@ def _launcher_parser() -> argparse.ArgumentParser:
         default="data/ecmwf_archive/ecmwf_shadow.sqlite",
     )
     parser.add_argument("--site", required=True)
+    parser.add_argument("--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1")
     parser.add_argument("--model", default="HARMONIE")
     parser.add_argument("--target-hours", type=int, default=24)
     parser.add_argument("--out-dir", default="next_day_wind_model/artifacts")
@@ -673,7 +675,7 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         model=args.model,
         min_target_rows=max(1, int(args.target_hours)),
     )
-    model_fingerprint, _missing_models = compute_model_fingerprint(model_dir)
+    model_fingerprint = operational_model_fingerprint(args, model_dir)
     cached = validate_cached_prediction_artifacts(
         out_dir,
         local_timezone=args.local_timezone,
@@ -694,6 +696,15 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         cached_artifacts=cached,
         ecmwf_run_identity=ecmwf_run_identity,
     )
+
+
+def operational_model_fingerprint(args, model_dir):
+    fingerprint, _missing = compute_model_fingerprint(model_dir)
+    if fingerprint is None or not getattr(args, "enable_day_after_tomorrow", False) or args.site != "valkenburgsemeer":
+        return fingerprint
+    manifest = model_dir / "day_after_tomorrow" / "champions.json"
+    identity = manifest.read_bytes() if manifest.exists() else b"no_d2_champion"
+    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + identity).hexdigest()
 
 
 def _child_command(script_path: Path, argv: Sequence[str], *, measured_only: bool) -> list[str]:
@@ -796,7 +807,7 @@ def launch_operational_update(script_path: Path, argv: Sequence[str]) -> int:
 
     try:
         model_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else Path(args.out_dir)
-        post_model_fingerprint, _missing = compute_model_fingerprint(model_dir)
+        post_model_fingerprint = operational_model_fingerprint(args, model_dir)
         post_cache = validate_cached_prediction_artifacts(
             Path(args.out_dir),
             local_timezone=args.local_timezone,

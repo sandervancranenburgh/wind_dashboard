@@ -182,6 +182,22 @@ class CompositionTests(unittest.TestCase):
 
 
 class MeasuredStageTests(unittest.TestCase):
+    def test_d2_failure_does_not_stop_measured_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path, out_dir, web_dir, args = self._prepare(Path(directory))
+            (web_dir / "evaluation.html").write_text('<script>currentVersion:"old-version"</script>')
+            failed_d2 = mock.Mock(side_effect=ValueError("D+2 cache unavailable"))
+            result = run_measured_only_stage(args=args, db_path=db_path, out_dir=out_dir,
+                build_plot_frame=_fixture_build_plot_frame, save_current_day_plot=self._save_plot,
+                load_prediction_history=lambda **kwargs: [], write_interactive_assets=self._write_interactive,
+                load_harmonie_metadata=lambda *args: (None, "fetched"), auto_push=mock.Mock(),
+                now_utc=NOW_UTC, refresh_day_after_tomorrow=failed_d2)
+            self.assertEqual(result["observation_rows"], 2)
+            failed_d2.assert_called_once()
+            self.assertTrue((web_dir / "current_day_predictions.png").exists())
+            metadata = json.loads((web_dir / "metadata_update.json").read_text())
+            self.assertIn(metadata["generated_at_utc"], (web_dir / "evaluation.html").read_text())
+
     def _prepare(self, root: Path) -> tuple[Path, Path, Path, SimpleNamespace]:
         db_path = root / "fixture.db"
         _create_observation_db(db_path)

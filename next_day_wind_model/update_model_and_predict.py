@@ -167,6 +167,11 @@ def parse_args() -> argparse.Namespace:
         help="Fallback IFS availability latency until enough completed runs exist.",
     )
     parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
+    parser.add_argument(
+        "--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1",
+        help="Enable the isolated operational D+2 model and experimental dashboard panel (default off).",
+    )
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours for Y.")
@@ -5656,6 +5661,7 @@ def save_model_gate_eval_history_plot(
     eval_details_csv: Path | None = None,
     db_path: Path | None = None,
     site: str | None = None,
+    horizon_label: str = "Next-day",
 ) -> None:
     def _model_id_date_label(model_id: str | None) -> str | None:
         value = str(model_id or "").strip()
@@ -5896,7 +5902,7 @@ def save_model_gate_eval_history_plot(
                     linewidth=1.5,
                     label="_nolegend_",
                 )
-                ax_top.set_title("Next-day model selection: wind speed")
+                ax_top.set_title(f"{horizon_label} model selection: wind speed")
                 ax_top.set_ylabel("Wind speed (kts)")
                 ax_top.grid(axis="y", alpha=0.3)
                 ax_top.margins(x=0, y=0)
@@ -6378,6 +6384,7 @@ def save_wind_direction_performance_spider_plot(
     *,
     model_label: str = "Super local champion model next-day",
     title: str = "MAE for next-day models by forecast wind direction",
+    annotate_overflow: bool = False,
 ) -> None:
     if not direction_csv.exists():
         return
@@ -6434,6 +6441,13 @@ def save_wind_direction_performance_spider_plot(
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylim(0.0, 3.5)
+    if annotate_overflow:
+        for values, color in [(harmonie, "#777777"), (champion, "#f28e2b")]:
+            for angle, value in zip(angles, values):
+                if value > 3.5:
+                    ax.scatter([angle], [3.5], marker="^", color=color, s=35, clip_on=False)
+                    ax.annotate(f"{value:.2f}", (angle, 3.5), xytext=(0, 9), textcoords="offset points",
+                                color=color, fontsize=9, ha="center", clip_on=False)
     ax.set_rlabel_position(225)
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(color="#d7d7d7", linewidth=0.8)
@@ -6937,6 +6951,8 @@ def publish_web_dashboard(
     harmonie_arrival_history_utc: list[str] | None = None,
     ecmwf_metadata: dict[str, object] | None = None,
     companion_app_base_url: str | None = None,
+    day_after_tomorrow_assets: dict[str, Path] | None = None,
+    day_after_tomorrow_state: dict | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6957,6 +6973,10 @@ def publish_web_dashboard(
         (current_day_direction_spider_png, "current_day_direction_spider.png"),
         (current_day_direction_spider_csv, "current_day_speed_by_direction.csv"),
     ]
+    for name, source in (day_after_tomorrow_assets or {}).items():
+        if Path(name).name != name or not name.startswith("day_after_tomorrow_"):
+            raise ValueError("Invalid D+2 publication asset name")
+        publish_pairs.append((source, name))
     copied: dict[str, str] = {}
     web_assets_dir = REPO_ROOT / "next_day_wind_model" / "web_assets"
     site_assets_dir = web_out_dir / "site-assets"
@@ -6986,7 +7006,8 @@ def publish_web_dashboard(
         if not src.exists():
             continue
         dst = web_out_dir / dst_name
-        shutil.copy2(src, dst)
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
         copied[dst_name] = str(dst)
 
     for existing_name in ["model_gate_eval_history.png", "model_gate_eval_history.csv"]:
@@ -7033,6 +7054,8 @@ def publish_web_dashboard(
     static_refresh_interval_ms = refresh * 1000
     foreground_min_interval_ms = 5 * 60 * 1000
     static_refresh_metadata = {
+        "day_after_tomorrow": {key: value for key, value in (day_after_tomorrow_state or {}).items()
+                              if key not in ["artifact_dir", "gate"]},
         "static_plot_generated_at_utc": static_plot_generated_at_utc,
         "plot_updated_at_utc": None if plot_updated_at_utc is None else str(plot_updated_at_utc),
         "ecmwf": dict(ecmwf_metadata or {}),
@@ -7157,6 +7180,20 @@ def publish_web_dashboard(
 {current_day_direction_spider_row}
 {direction_spider_row}
     </section>"""
+    from next_day_wind_model.day_after_tomorrow_website import forecast_card, evaluation_content
+    d2_state = day_after_tomorrow_state or {"status": "disabled"}
+    d2_card = forecast_card(d2_state, copied, cache_bust)
+    evaluation_sections = performance_section + gate_eval_card + evaluation_content(d2_state, copied, cache_bust)
+    if "daily_mae_history.png" in copied:
+        evaluation_sections += f'''<section class="card"><h2>Realised forecast MAE history</h2>
+        <picture><source media="(max-width:768px)" srcset="daily_mae_history_mobile.png?v={cache_bust}">
+        <img src="daily_mae_history.png?v={cache_bust}" alt="Realised forecast MAE history"></picture>
+        <p><a href="daily_mae_history.csv">Download daily MAE CSV</a></p></section>'''
+    downloads = ''.join(f'<li><a href="{name}">{html.escape(name)}</a></li>' for name in copied
+                        if name.endswith(".csv") and "predictions" not in name)
+    evaluation_sections += f'<section class="card"><h2>Evaluation downloads</h2><ul>{downloads}</ul></section>'
+    performance_section = '<section class="card"><h2 class="section-title"><a href="evaluation.html">How much better are the super local forecasts?</a></h2></section>'
+    gate_eval_card = ""
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -7174,6 +7211,8 @@ def publish_web_dashboard(
   <title>Super local wind prediction - {spot_display}</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
+    [hidden] {{ display: none !important; }}
+    .card a {{ overflow-wrap: anywhere; }}
     h1 {{ margin: 0 0 8px 0; }}
     .page-header {{ display: block; }}
     .dashboard-actions {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; width: min(100%, 340px); margin: 10px 0 16px 0; }}
@@ -7292,6 +7331,7 @@ def publish_web_dashboard(
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
       </picture>
     </div>
+{d2_card}
 {performance_section}
 {gate_eval_card}
   </div>
@@ -7324,6 +7364,42 @@ def publish_web_dashboard(
 </body>
 </html>
 """
+    if d2_state.get("status") != "disabled":
+        html_doc = html_doc.replace("combines two local machine learning models", "combines three local machine learning models")
+        html_doc = html_doc.replace("A second model is dedicated to next-day (day-ahead) prediction.",
+            "A second model predicts tomorrow. A third, experimental model predicts the day after tomorrow, 08:00–22:00.")
+        html_doc = html_doc.replace("next-day/current-day prediction lines", "all forecast prediction lines")
+        script_src = REPO_ROOT / "next_day_wind_model" / "web_dashboard" / "day_after_tomorrow_interactive.js"
+        if script_src.exists():
+            script_dst = web_out_dir / script_src.name
+            if script_src.resolve() != script_dst.resolve():
+                shutil.copy2(script_src, script_dst)
+            copied[script_dst.name] = str(script_dst)
+            html_doc = html_doc.replace('</body>', f'<script src="{script_dst.name}?v={cache_bust}" defer></script></body>')
+    eval_head = html_doc.split('</head>', 1)[0].replace(
+        f'<title>Super local wind prediction - {spot_display}</title>',
+        f'<title>Model evaluation - {spot_display}</title>')
+    evaluation_doc = eval_head + f'''</head><body><h1>How much better are the super local forecasts?</h1>
+    <p class="spot-line">{spot_display}</p>
+    <nav class="dashboard-actions evaluation-actions" aria-label="Evaluation navigation"
+         style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <a class="button primary dashboard-action" style="height:44px" href="index.html">Forecasts</a>
+      <a class="button primary dashboard-action" style="height:44px" href="{html.escape(companion_base + '/' if companion_base else '/')}">Rider portal</a>
+    </nav><p class="meta">Last updated: {generated_local_str}</p><div class="grid">{evaluation_sections}</div>
+    <script src="{refresh_js_src}" defer></script><script>
+    window.addEventListener("DOMContentLoaded", function () {{
+      if (window.WindDashboardRefresh) window.WindDashboardRefresh.createController({{
+        metadataUrl:"metadata_update.json", currentVersion:{static_plot_generated_at_json},
+        minimumIntervalMs:{foreground_min_interval_ms}, pollIntervalMs:{static_refresh_interval_ms}
+      }}).start();
+    }});</script></body></html>'''
+    evaluation_path = web_out_dir / "evaluation.html"
+    evaluation_path.write_text(evaluation_doc, encoding="utf-8")
+    copied["evaluation.html"] = str(evaluation_path)
+    # Include both pages and newly generated interactive assets in the refresh manifest.
+    static_refresh_metadata["pages"] = ["index.html", "evaluation.html"]
+    static_refresh_metadata["interactive_json"] = sorted(name for name in copied if name.endswith("_interactive_data.json"))
+    static_refresh_metadata_path.write_text(json.dumps(static_refresh_metadata, indent=2), encoding="utf-8")
     index_path = web_out_dir / "index.html"
     index_path.write_text(html_doc, encoding="utf-8")
     copied["index.html"] = str(index_path)
@@ -7745,10 +7821,15 @@ def run_dashboard_stage_from_cached_artifacts(
         if gate_eval_direction_spider_png.exists():
             gate_eval_direction_spider_png_src = gate_eval_direction_spider_png
 
+    from next_day_wind_model.day_after_tomorrow import safe_stage as run_d2_stage, artifact_inputs
+    d2_state = run_d2_stage(args=args, db_path=db_path, out_dir=out_dir,
+                          model_artifact_dir=model_artifact_dir)
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode and _site_publication_allowed(args.site):
         web_publish = publish_web_dashboard(
+            day_after_tomorrow_state=d2_state,
+            day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,
@@ -7984,6 +8065,7 @@ def main() -> None:
 
     if args.operational_measured_only:
         from next_day_wind_model.measured_update import run_measured_only_stage
+        from next_day_wind_model.day_after_tomorrow import refresh_published as refresh_d2
 
         run_measured_only_stage(
             args=args,
@@ -7998,6 +8080,8 @@ def main() -> None:
             load_harmonie_arrival_estimate=_load_harmonie_arrival_estimate,
             save_next_day_plot=save_prediction_plot,
             load_ecmwf_overlay=_load_dashboard_ecmwf,
+            refresh_day_after_tomorrow=lambda **kwargs: refresh_d2(
+                args=args, db_path=db_path, out_dir=out_dir, model_artifact_dir=model_artifact_dir, **kwargs),
         )
         return
 
@@ -9428,6 +9512,10 @@ def main() -> None:
             test_now_local_hour=args.test_now_local_hour,
         )
 
+    from next_day_wind_model.day_after_tomorrow import safe_stage as run_d2_stage, artifact_inputs
+    d2_state = run_d2_stage(args=args, db_path=db_path, out_dir=out_dir,
+                          model_artifact_dir=model_artifact_dir, training=not args.skip_training,
+                          prediction=True, log=not is_test_mode)
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode and publication_allowed:
@@ -9513,6 +9601,8 @@ def main() -> None:
             )
             gate_eval_history_png_src = gate_eval_history_png
         web_publish = publish_web_dashboard(
+            day_after_tomorrow_state=d2_state,
+            day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,

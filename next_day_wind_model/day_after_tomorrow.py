@@ -436,7 +436,7 @@ def render_cached(output: Path, archive: Path | None, now, *, force=True):
         for mobile in [False, True]:
             save_prediction_plot(table, output / f"{PREFIX}_predictions{'_mobile' if mobile else ''}.png", TZ,
                 plot_updated_at_utc=now, prediction_updated_at_utc=metadata["issue_time_utc"],
-                model_trained_at_utc=metadata["champions"]["speed"]["trained_at_utc"],
+                model_trained_at_utc=metadata["champions"]["speed"].get("available_at_utc", metadata["champions"]["speed"]["trained_at_utc"]),
                 harmonie_time_utc=metadata.get("harmonie_fetched_at_utc"),
                 mobile=mobile, ecmwf_speed_series=ec, spot_name="Valkenburgse Meer",
                 experiment_label="Experimental D+2", operational_forecast=True)

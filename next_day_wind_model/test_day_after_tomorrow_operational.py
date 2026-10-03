@@ -303,10 +303,12 @@ print('cached renderer has no training imports')'''
             original = csv.read_bytes()
             d2.write_json(output / "day_after_tomorrow_metadata.json", {"status": "available",
                 "issue_time_utc": "2026-10-02T13:00:00+00:00", "target_date": "2026-10-04",
-                "available_hours": 9, "champions": {"speed": {"trained_at_utc": "2026-10-02T05:00:00+00:00"}}})
+                "available_hours": 9, "champions": {"speed": {"trained_at_utc": "2026-10-02T05:00:00+00:00",
+                    "available_at_utc": "2026-10-02T05:24:00+00:00"}}})
             with patch.object(updater, "save_prediction_plot") as renderer:
                 state = d2.render_cached(output, None, core.utc("2026-10-02T15:06:00+02:00"))
                 self.assertEqual(renderer.call_count, 2)
+                self.assertEqual(renderer.call_args.kwargs["model_trained_at_utc"], "2026-10-02T05:24:00+00:00")
                 self.assertEqual(state["available_hours"], 9)
             payload = json.loads((output / "day_after_tomorrow_interactive_data.json").read_text())
             self.assertEqual(len(payload["rows"]), 15)

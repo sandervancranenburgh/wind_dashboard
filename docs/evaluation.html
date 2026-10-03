@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#062b55">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="icon" href="site-assets/favicon.ico?v=1" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="site-assets/favicon-32x32.png?v=1">
+  <link rel="icon" type="image/png" sizes="16x16" href="site-assets/favicon-16x16.png?v=1">
+  <link rel="apple-touch-icon" sizes="180x180" href="site-assets/apple-touch-icon.png?v=1">
+  <link rel="manifest" href="site.webmanifest?v=1">
+  <title>Model evaluation - Valkenburgse Meer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #111; }
+    [hidden] { display: none !important; }
+    .card a { overflow-wrap: anywhere; }
+    h1 { margin: 0 0 8px 0; }
+    .page-header { display: block; }
+    .dashboard-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; width: min(100%, 340px); margin: 10px 0 16px 0; }
+    .button { display: inline-flex; align-items: center; justify-content: center; border: 1px solid #999; border-radius: 6px; padding: 8px 12px; color: #111; background: #f7f7f7; text-decoration: none; font: inherit; font-size: 15px; cursor: pointer; }
+    .dashboard-action { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; white-space: nowrap; }
+    .button.primary { border-color: #135f86; background: #135f86; color: #fff; }
+    .dashboard-refresh[disabled] { cursor: wait; opacity: 0.72; }
+    .development-status { margin: 0 0 8px 0; color: #777; font-size: 15px; font-style: italic; }
+    .spot-line { margin: 0 0 6px 0; color: #222; font-size: 16px; font-weight: 600; }
+    .page-header .meta { margin: 0; }
+    .meta { color: #555; margin: 0 0 16px 0; }
+    .overview { color: #222; margin: 0 0 16px 0; line-height: 1.5; font-size: 15px; max-width: 1200px; }
+    .overview-mobile { display: none; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1400px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }
+    .desc { margin: 2px 0 10px 0; color: #444; font-size: 16px; line-height: 1.4; }
+    .section-title { margin: 0 0 18px 0; font-size: 24px; line-height: 1.2; color: #111; }
+    .performance-section h3 { margin: 0 0 8px 0; font-size: 19px; }
+    .direction-card { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 18px; }
+    .direction-card + .direction-card { border-top: 1px solid #e6e6e6; margin-top: 18px; padding-top: 18px; }
+    .direction-copy { padding: 4px 8px 4px 2px; }
+    .direction-plot img { max-width: 620px; margin: 0 auto; }
+    img { width: 100%; height: auto; display: block; border-radius: 6px; }
+    .interactive-block { display: none; margin: 8px 0 8px 0; }
+    .interactive-block.is-ready { display: block; }
+    .interactive-block.is-ready + .interactive-fallback-note { display: none; }
+    .interactive-plot { width: 100%; min-height: 520px; }
+    .interactive-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 6px 0; }
+    .interactive-control-label { font-size: 13px; color: #444; font-weight: 600; }
+    .interactive-control { border: 1px solid #aaa; border-radius: 4px; background: #fff; color: #111; font-size: 13px; padding: 5px 8px; }
+    .interactive-control.is-active { border-color: #555; background: #e9e9e9; font-weight: 600; }
+    .interactive-point-details { margin-top: 6px; border: 1px solid #ddd; border-radius: 6px; background: #f7f7f7; color: #222; font-size: 12px; line-height: 1.35; padding: 6px 8px; min-height: 38px; max-height: 56px; overflow: auto; }
+    .js-plotly-plot .modebar { opacity: 0.3; transition: opacity 0.15s ease-in-out; }
+    .js-plotly-plot:hover .modebar { opacity: 0.9; }
+    .interactive-fallback-note { margin: 4px 0 8px 0; color: #666; font-size: 13px; }
+    @media (max-width: 768px) {
+      body { margin: 10px; }
+      .dashboard-actions { margin: 8px 0 10px 0; }
+      h1 { font-size: 24px; margin: 0 0 6px 0; }
+      h2 { font-size: 20px; margin: 0 0 6px 0; }
+      .section-title { font-size: 21px; margin: 0 0 12px 0; }
+      .performance-section h3 { font-size: 17px; margin: 0 0 6px 0; }
+      .meta { margin: 0 0 10px 0; font-size: 14px; }
+      .overview { font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }
+      .overview-desktop { display: none; }
+      .overview-mobile { display: block; margin: 10px 0 0 0; }
+      .grid { gap: 12px; }
+      .card { padding: 8px; border-radius: 6px; }
+      .desc { font-size: 14px; margin: 2px 0 8px 0; }
+      .direction-card { display: block; }
+      .direction-copy { padding: 0; }
+      .direction-plot img { max-width: none; margin: 0; }
+      img { max-height: 60vh; object-fit: contain; }
+      .interactive-plot { min-height: 390px; }
+    }
+  </style>
+</head><body><h1>How much better are the super local forecasts?</h1>
+    <p class="spot-line">Valkenburgse Meer</p>
+    <nav class="dashboard-actions evaluation-actions" aria-label="Evaluation navigation"
+         style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <a class="button primary dashboard-action" style="height:44px" href="index.html">Forecasts</a>
+      <a class="button primary dashboard-action" style="height:44px" href="https://portal-cityailab.tbm.tudelft.nl/">Rider portal</a>
+    </nav><p class="meta">Last updated: 03 October 2026 11:05:32 CEST</p><div class="grid">
+    <section class="card performance-section">
+      <h2 class="section-title">How much better are the super local forecasts?</h2>
+
+      <div class="direction-card">
+      <div class="direction-copy">
+        <h3>Current-day performance by wind direction</h3>
+        <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, NE, SE, S winds; the largest gain is 1.8 kts for E. For that sector the super-local model is close to unbiased on average. The advantage is smallest, or negative, for SW, NW, N winds.</p>
+      </div>
+      <div class="direction-plot">
+        <img src="current_day_direction_spider.png?v=1791018332" alt="Current-day prediction performance by wind direction">
+      </div>
+    </div>
+
+      <div class="direction-card">
+      <div class="direction-copy">
+        <h3>Next-day performance by wind direction</h3>
+        <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for E, NE, SE, NW winds. The advantage is smallest for SW winds.</p>
+      </div>
+      <div class="direction-plot">
+        <img src="model_gate_direction_spider.png?v=1791018332" alt="Next-day prediction performance by wind direction">
+      </div>
+    </div>
+    <div class="direction-card"><div class="direction-copy"><h3>Day-after-tomorrow performance by wind direction · experimental</h3><p class="desc">The spider compares speed MAE by HARMONIE forecast direction; lower values are better. Overlapping forecasts are averaged per target hour before scoring. Evaluation targets: 2026-08-20–2026-10-02. Target-hour average MAE: D+2 1.94 knots; HARMONIE 2.05 knots.  Largest gains: E, SE, NE. HARMONIE performs better for N, S, W, NW. Evaluated active model: 20261003080000_af4b4f24_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p></div><div class="direction-plot"><img src="day_after_tomorrow_direction_spider.png?v=1791018332" alt="Day-after-tomorrow performance by wind direction · experimental"></div></div></section><section class="card"><h2>Current-day model-gate evaluation history</h2>
+        <p class="desc">Aligned current-day holdout predictions and absolute errors, using the existing operational gate evaluation. Evaluation targets: 2026-08-18T19:00:00+00:00–2026-10-03T05:00:00+00:00. Champion: 20260814-0723; challenger: 20261003-0721.</p>
+        <img src="current_day_model_gate_eval_history.png?v=1791018332" alt="Current-day model-gate evaluation history"></section>
+    <div class="card">
+      <h2>Next-day model-gate evaluation history</h2>
+      <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
+      <img src="model_gate_eval_history.png?v=1791018332" alt="Model gate evaluation history">
+    </div><section class="card"><h2>Day-after-tomorrow model-gate evaluation history</h2><p class="desc">Aligned holdout wind speeds above; absolute errors below. Grey: HARMONIE; blue: challenger; orange: prior champion; magenta: observations. Evaluation targets: 2026-08-20–2026-10-02. Promotion requires a 1% MAE improvement over the dedicated champion on identical available targets. Challenger speed MAE: 2.00 knots; HARMONIE: 2.23 knots. The challenger improves on HARMONIE on this holdout. This is the initial champion; no previous D+2 champion existed for comparison. Champion: 20261003080000_af4b4f24_speed; challenger: 20261003080000_af4b4f24_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p><img src="day_after_tomorrow_model_gate_eval_history.png?v=1791018332" alt="Day-after-tomorrow model-gate evaluation history"></section></div>
+    <script src="dashboard_refresh.js?v=1791018332" defer></script><script>
+    window.addEventListener("DOMContentLoaded", function () {
+      if (window.WindDashboardRefresh) window.WindDashboardRefresh.createController({
+        metadataUrl:"metadata_update.json", currentVersion:"2026-10-03T09:05:32.179885+00:00",
+        minimumIntervalMs:300000, pollIntervalMs:900000
+      }).start();
+    });</script></body></html>

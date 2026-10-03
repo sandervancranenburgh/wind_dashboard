@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -649,6 +649,8 @@ def _launcher_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-hours", type=int, default=24)
     parser.add_argument("--out-dir", default="next_day_wind_model/artifacts")
     parser.add_argument("--model-artifact-dir", default=None)
+    parser.add_argument("--day-after-tomorrow-model-artifact-dir",
+                        default=os.environ.get("WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR"))
     parser.add_argument("--web-out-dir", default="next_day_wind_model/web_dashboard")
     parser.add_argument("--local-timezone", default="Europe/Amsterdam")
     parser.add_argument("--skip-training", action="store_true")
@@ -676,7 +678,7 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         model=args.model,
         min_target_rows=max(1, int(args.target_hours)),
     )
-    model_fingerprint = operational_model_fingerprint(args, model_dir)
+    model_fingerprint = operational_model_fingerprint(args, model_dir, now_utc=now_utc)
     cached = validate_cached_prediction_artifacts(
         out_dir,
         local_timezone=args.local_timezone,
@@ -699,7 +701,7 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
     )
 
 
-def operational_model_fingerprint(args, model_dir):
+def operational_model_fingerprint(args, model_dir, *, now_utc=None):
     fingerprint, _missing = compute_model_fingerprint(model_dir)
     if fingerprint is None or not getattr(args, "enable_day_after_tomorrow", False) or args.site != "valkenburgsemeer":
         return fingerprint
@@ -707,7 +709,15 @@ def operational_model_fingerprint(args, model_dir):
     directory = model_directory(args, model_dir)
     manifest = directory / "champions.json"
     identity = manifest.read_bytes() if manifest.exists() else b"no_d2_champion"
+    local_issue = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Amsterdam"))
+    if local_issue.hour < 7:
+        local_issue -= timedelta(days=1)
+        local_issue = local_issue.replace(hour=22)
+    elif local_issue.hour > 22:
+        local_issue = local_issue.replace(hour=22)
+    issue_bucket = local_issue.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
     return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + str(directory.resolve()).encode() + identity
+                          + issue_bucket.encode()
                           + getattr(args, "day_after_tomorrow_calibration", "none").encode()).hexdigest()
 
 

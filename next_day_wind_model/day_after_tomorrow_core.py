@@ -91,6 +91,8 @@ def snapshot(source: Path, destination: Path, tables: tuple[str, ...] | None = N
     if staging.exists():
         staging.unlink()
     with closing(read_only(source)) as src, closing(sqlite3.connect(staging)) as dst:
+        src.execute("BEGIN")
+        src.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
         src.backup(dst, pages=4096, sleep=0.01)
     if tables is not None:
         retain_snapshot_tables(staging, tables)

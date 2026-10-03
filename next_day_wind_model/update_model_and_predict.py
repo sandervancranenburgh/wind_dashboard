@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
     parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
     parser.add_argument(
+        "--current-day-gate-artifact-dir",
+        default=os.environ.get("WIND_CURRENT_DAY_GATE_ARTIFACT_DIR"),
+        help="Read existing current-day gate reports from this directory for all dashboard update paths.",
+    )
+    parser.add_argument(
         "--day-after-tomorrow-model-artifact-dir",
         default=os.environ.get("WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR"),
         help="Dedicated D+2 champion directory shared by daily and hourly jobs; defaults to <model-artifact-dir>/day_after_tomorrow.",
@@ -6974,7 +6979,8 @@ def _site_display_name(site: str) -> str:
         return site_id
 
 
-def current_day_gate_assets(out_dir: Path, details_csv: Path | None = None, gate: dict | None = None) -> dict:
+def current_day_gate_assets(out_dir: Path, details_csv: Path | None = None, gate: dict | None = None,
+                           *, reference_artifact_dir: Path | None = None) -> dict:
     """Adapt the existing intraday gate into the shared plotting contract.
 
     No training or database writes. Cache-only callers reuse the latest actual
@@ -6983,6 +6989,13 @@ def current_day_gate_assets(out_dir: Path, details_csv: Path | None = None, gate
     history = out_dir / "current_day_model_gate_eval_history.csv"
     details = out_dir / "current_day_model_gate_eval_details.csv"
     plot = out_dir / "current_day_model_gate_eval_history.png"
+    if reference_artifact_dir and not (details_csv is not None and gate and gate.get("enabled")):
+        reference = Path(reference_artifact_dir)
+        metadata_path = reference / "metadata_update.json"
+        if metadata_path.exists():
+            gate = json.loads(metadata_path.read_text()).get("intraday_model_selection_gate", {})
+        candidates = sorted((reference / "intraday_model_gate_eval_details").glob("*_intraday_model_gate_eval_speed.csv"))
+        details_csv = candidates[-1] if candidates else None
     if details_csv is None:
         candidates = sorted((out_dir / "intraday_model_gate_eval_details").glob("*_intraday_model_gate_eval_speed.csv"))
         details_csv = candidates[-1] if candidates else None
@@ -7405,7 +7418,7 @@ def publish_web_dashboard(
   </header>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
-    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    The local models learn systematic local deviations from the large-scale model using local measurements.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
@@ -7460,7 +7473,7 @@ def publish_web_dashboard(
   </div>
   <p class="overview overview-mobile">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
-    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    The local models learn systematic local deviations from the large-scale model using local measurements.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
@@ -7946,7 +7959,8 @@ def run_dashboard_stage_from_cached_artifacts(
         web_publish = publish_web_dashboard(
             day_after_tomorrow_state=d2_state,
             day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
-            **current_day_gate_assets(out_dir, gate=metadata.get("intraday_model_selection_gate")),
+            **current_day_gate_assets(out_dir, gate=metadata.get("intraday_model_selection_gate"),
+                                      reference_artifact_dir=getattr(args, "current_day_gate_artifact_dir", None)),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,
@@ -9720,7 +9734,8 @@ def main() -> None:
         web_publish = publish_web_dashboard(
             day_after_tomorrow_state=d2_state,
             day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
-            **current_day_gate_assets(out_dir, intraday_gate_eval_details_csv_src, intraday_model_selection_report),
+            **current_day_gate_assets(out_dir, intraday_gate_eval_details_csv_src, intraday_model_selection_report,
+                                      reference_artifact_dir=getattr(args, "current_day_gate_artifact_dir", None)),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,

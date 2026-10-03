@@ -153,6 +153,27 @@ class PresentationTests(unittest.TestCase):
             self.assertEqual(history.speed_eval_rows.iloc[0], 2)
             self.assertEqual(render.call_args.kwargs["horizon_label"], "Current-day")
 
+    def test_hourly_gate_reads_daily_reports_without_changing_models(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            daily = root / "daily"
+            hourly = root / "hourly"
+            daily.mkdir()
+            hourly.mkdir()
+            details = daily / "intraday_model_gate_eval_details"
+            details.mkdir()
+            source = details / "20261003-052151_intraday_model_gate_eval_speed.csv"
+            pd.DataFrame({"anchor_time_utc": ["2026-09-01T07:00Z"], "target_time_utc": ["2026-09-01T09:00Z"],
+                "actual_value": [5.], "harmonie_value": [7.], "challenger_prediction_value": [6.],
+                "champion_prediction_value": [5.]}).to_csv(source, index=False)
+            gate = {"enabled": True, "intraday_model_id_champion": "daily-champion", "intraday_model_id_challenger": "daily-challenger"}
+            (daily / "metadata_update.json").write_text(json.dumps({"intraday_model_selection_gate": gate}))
+            with patch.object(updater, "save_model_gate_eval_history_plot"):
+                result = updater.current_day_gate_assets(hourly, gate={"enabled": False}, reference_artifact_dir=daily)
+            self.assertEqual(pd.read_csv(result["current_day_gate_eval_csv"]).speed_model_id_champion.iloc[0], "daily-champion")
+            self.assertTrue(result["current_day_gate_eval_details_csv"].is_relative_to(hourly))
+            self.assertEqual(len(list(daily.iterdir())), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

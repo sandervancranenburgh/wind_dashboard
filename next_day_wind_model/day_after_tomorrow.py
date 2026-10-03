@@ -126,7 +126,7 @@ def historical_samples(db: Path, cutoff: pd.Timestamp, artifact: Path):
     return samples
 
 
-def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2, calibration_policy="none"):
+def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2, calibration_policy="none", availability_clock=None):
     from next_day_wind_model import day_after_tomorrow_core as core
     from next_day_wind_model.update_model_and_predict import (
         append_model_gate_eval_history, save_model_gate_eval_history_plot)
@@ -225,6 +225,11 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
         diagnostic_summary = export_calibration_diagnostics(artifact, fit.info, fit.calibration, diagnostics)
         summary["calibration_diagnostic"] = diagnostic_summary
     write_json(artifact / "gate_summary.json", summary)
+    if availability_clock is not None:
+        available = max(cutoff, pd.Timestamp(availability_clock()).tz_convert("UTC")).isoformat()
+        for kind in ["speed", "direction"]:
+            if results[kind]["promote"]:
+                new_state[kind]["available_at_utc"] = available
     write_json(state_path, new_state)
     return summary
 
@@ -276,7 +281,8 @@ def infer(db: Path, issue, artifact: Path, output: Path):
     for kind, fit in [("speed", speed), ("direction", direction)]:
         if not fit.info.get("operational"):
             raise ValueError("Refusing an experimental checkpoint as the operational champion")
-        if pd.Timestamp(state[kind]["trained_at_utc"]) > issue or pd.Timestamp(fit.info["max_label_end_utc"]) > issue:
+        available = state[kind].get("available_at_utc", state[kind]["trained_at_utc"])
+        if pd.Timestamp(available) > issue or pd.Timestamp(fit.info["max_label_end_utc"]) > issue:
             raise ValueError("D+2 champion was not available at this issue cutoff")
     lookup = core.dp.load_training_forecast_lookup(db, core.dp.DatasetConfig(site=SITE), read_only=True,
         target_start_ts_ms=int((issue - pd.Timedelta(hours=80)).timestamp() * 1000),
@@ -452,6 +458,7 @@ def render_cached(output: Path, archive: Path | None, now, *, force=True):
 
 def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
               training=False, prediction=False, now=None, samples=None, log=True, force_render=True):
+    live_clock = now is None
     now = pd.Timestamp(now or datetime.now(timezone.utc)).tz_convert("UTC")
     enabled = bool(getattr(args, "enable_day_after_tomorrow", False)) and args.site == SITE
     if not enabled:
@@ -468,7 +475,8 @@ def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
                 train(samples, issue, artifact, epochs=args.epochs, batch_size=args.batch_size,
                       seed=getattr(args, "seed", 42), minimum=args.challenge_min_eval_samples,
                       margin=args.promotion_margin_pct, constraint_eps=getattr(args, "speed_constraint_eps", .2),
-                      calibration_policy=getattr(args, "day_after_tomorrow_calibration", "none"))
+                      calibration_policy=getattr(args, "day_after_tomorrow_calibration", "none"),
+                      availability_clock=(lambda: datetime.now(timezone.utc)) if live_clock else None)
             except Exception as exc:
                 # Keep active champions and previous successful evaluation intact.
                 write_json(artifact / "last_training_attempt.json", {"status": "failed", "at": now.isoformat(), "reason": str(exc)})

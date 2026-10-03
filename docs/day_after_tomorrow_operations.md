@@ -38,6 +38,21 @@ and hourly commands use different parent directories for the other horizons.
 The D+2 override preserves those existing paths and participates in the refresh
 fingerprint along with the champion manifest. No override preserves the original
 `<model-artifact-dir>/day_after_tomorrow/` behavior.
+The enabled fingerprint also includes the current valid hourly issue cutoff,
+so a new daytime hour refreshes D+2 even if HARMONIE has not changed. It remains
+stable within the hour and overnight, preserving lightweight cached updates.
+New live champions record `available_at_utc` when their gate exports finish.
+Inference cannot use them at an earlier hourly cutoff. A midday initialization
+therefore becomes usable at the next issue hour; existing champions without
+this field retain their stored training-time compatibility. Explicit local
+replays retain their supplied simulated clock.
+
+`--current-day-gate-artifact-dir` (environment default
+`WIND_CURRENT_DAY_GATE_ARTIFACT_DIR`) lets the hourly and cached publishers read
+the current-day gate from the existing daily artifact directory. It reads only
+evaluation CSVs and metadata, preserves all model paths, and writes rendered
+assets to the caller's output directory. Omit it to retain existing callers'
+behavior. A newly completed daily gate takes priority over the reference.
 
 The operational pipeline reuses shared masked sampling/training in
 `day_after_tomorrow_core.py`; the historical experiment remains available in

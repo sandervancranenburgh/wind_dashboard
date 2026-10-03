@@ -150,7 +150,8 @@ The JSON report includes complete-window scores, circular direction errors, fitt
 ## Website and deployment
 
 D+2 uses the next-day desktop/mobile renderer. Evaluation order: current-day, next-day and D+2 spiders,
-then current-day, next-day and D+2 model gates, followed by realised history and downloads.
+then current-day, next-day and D+2 model gates. Internal CSV artifacts remain available;
+the forecast-download link, realised history and evaluation-downloads sections are omitted.
 Current/next-day images retain their actual public timestamps; current-day gate details and identities are copied reporting inputs.
 
 Deployment requires separate approval, fresh verified backups and the repository deployment workflow.

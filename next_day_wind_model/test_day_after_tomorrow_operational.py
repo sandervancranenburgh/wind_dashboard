@@ -39,8 +39,23 @@ def args(**extra):
 
 
 class SharedDirectoryTests(unittest.TestCase):
+    def test_hourly_issue_refresh_even_with_unchanged_forecast(self):
+        with tempfile.TemporaryDirectory() as temp:
+            configured = args(day_after_tomorrow_model_artifact_dir=temp)
+            with patch.object(operational_update, "compute_model_fingerprint", return_value=("existing", [])):
+                def identity(stamp):
+                    return operational_update.operational_model_fingerprint(configured, Path(temp), now_utc=pd.Timestamp(stamp).to_pydatetime())
+                self.assertEqual(identity("2026-10-03T07:00Z"), identity("2026-10-03T07:54Z"))
+                self.assertNotEqual(identity("2026-10-03T07:54Z"), identity("2026-10-03T08:00Z"))
+                self.assertEqual(identity("2026-10-03T20:00Z"), identity("2026-10-04T04:59Z"))
+                self.assertNotEqual(identity("2026-10-04T04:59Z"), identity("2026-10-04T05:00Z"))
+
     def test_cli_environment_and_explicit_directory(self):
-        with patch.dict(os.environ, {"WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR": "/tmp/shared-d2"}):
+        with patch.dict(os.environ, {"WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR": "/tmp/shared-d2", "WIND_ENABLE_DAY_AFTER_TOMORROW": "1"}):
+            launch = operational_update._launcher_parser().parse_args(["--site", d2.SITE])
+            self.assertTrue(launch.enable_day_after_tomorrow)
+            self.assertEqual(launch.day_after_tomorrow_model_artifact_dir, "/tmp/shared-d2")
+            self.assertFalse(operational_update._launcher_parser().parse_args(["--site", d2.SITE, "--no-enable-day-after-tomorrow"]).enable_day_after_tomorrow)
             with patch.object(sys, "argv", ["updater", "--site", d2.SITE]):
                 self.assertEqual(updater.parse_args().day_after_tomorrow_model_artifact_dir, "/tmp/shared-d2")
             with patch.object(sys, "argv", ["updater", "--site", d2.SITE, "--day-after-tomorrow-model-artifact-dir", "/tmp/explicit-d2"]):
@@ -113,7 +128,10 @@ class GateTests(unittest.TestCase):
             with patch.object(core, "fit_model", side_effect=fit), patch.object(core, "predict", side_effect=predict), \
                  patch.object(core, "save_fit", side_effect=save), patch.object(core, "load_fit", side_effect=lambda p: stored[p]), \
                  patch.object(updater, "save_model_gate_eval_history_plot"):
-                first = d2.train(samples(), core.utc("2026-08-20T07:00:00+02:00"), artifact)
+                first = d2.train(samples(), core.utc("2026-08-20T07:00:00+02:00"), artifact,
+                                availability_clock=lambda: core.utc("2026-08-20T07:24:00+02:00"))
+                self.assertTrue(all(value["available_at_utc"] == "2026-08-20T05:24:00+00:00"
+                                    for value in json.loads((artifact / "champions.json").read_text()).values()))
                 self.assertTrue(first["promote_speed"])
                 original = (artifact / "champions.json").read_bytes()
                 candidate_error[0] = 3.
@@ -142,6 +160,20 @@ class GateTests(unittest.TestCase):
 
 
 class StageTests(unittest.TestCase):
+    def test_new_champion_cannot_be_backdated_to_training_issue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            issue = core.utc("2026-10-03T10:00:00+02:00")
+            state = {kind: {"checkpoint": kind + ".pt", "trained_at_utc": issue.isoformat(),
+                    "available_at_utc": (issue + pd.Timedelta(minutes=24)).isoformat()}
+                    for kind in ["speed", "direction"]}
+            d2.write_json(root / "champions.json", state)
+            fit = SimpleNamespace(info={"operational": True, "max_label_end_utc": (issue - pd.Timedelta(days=1)).isoformat()})
+            with patch.object(core, "load_fit", return_value=fit), patch.object(core.dp, "load_training_forecast_lookup") as lookup:
+                with self.assertRaisesRegex(ValueError, "not available"):
+                    d2.infer(root / "unused.db", issue, root, root)
+                lookup.assert_not_called()
+
     def test_standalone_cached_refresh_loads_no_training_stack(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)

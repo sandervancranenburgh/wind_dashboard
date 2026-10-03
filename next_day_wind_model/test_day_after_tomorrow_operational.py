@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import pandas as pd
 from next_day_wind_model import day_after_tomorrow as d2
 from next_day_wind_model import day_after_tomorrow_core as core
 from next_day_wind_model import update_model_and_predict as updater
+from next_day_wind_model import operational_update
 from next_day_wind_model.test_day_after_tomorrow_experiment import sample
 
 
@@ -34,6 +36,38 @@ def samples():
 def args(**extra):
     return SimpleNamespace(site=d2.SITE, enable_day_after_tomorrow=True, epochs=1,
         batch_size=32, challenge_min_eval_samples=60, promotion_margin_pct=1., **extra)
+
+
+class SharedDirectoryTests(unittest.TestCase):
+    def test_cli_environment_and_explicit_directory(self):
+        with patch.dict(os.environ, {"WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR": "/tmp/shared-d2"}):
+            with patch.object(sys, "argv", ["updater", "--site", d2.SITE]):
+                self.assertEqual(updater.parse_args().day_after_tomorrow_model_artifact_dir, "/tmp/shared-d2")
+            with patch.object(sys, "argv", ["updater", "--site", d2.SITE, "--day-after-tomorrow-model-artifact-dir", "/tmp/explicit-d2"]):
+                self.assertEqual(updater.parse_args().day_after_tomorrow_model_artifact_dir, "/tmp/explicit-d2")
+        self.assertEqual(d2.model_directory(args(), Path("legacy")), Path("legacy/day_after_tomorrow"))
+
+    def test_daily_hourly_and_cached_refresh_read_same_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shared = root / "shared"
+            shared.mkdir()
+            (shared / "gate_summary.json").write_text('{"gate_id":"shared-gate"}')
+            configured = args(day_after_tomorrow_model_artifact_dir=str(shared))
+            with patch.object(d2, "render_cached", return_value={"status": "available"}):
+                for parent in [root / "legacy", root / "site"]:
+                    state = d2.run_stage(args=configured, db_path=root / "unused.db", out_dir=root / parent.name,
+                        model_artifact_dir=parent, now=pd.Timestamp("2026-10-03T10:00Z"))
+                    self.assertEqual(state["artifact_dir"], str(shared))
+                    self.assertEqual(state["gate"]["gate_id"], "shared-gate")
+            with patch.object(operational_update, "compute_model_fingerprint", return_value=("existing", [])):
+                before = operational_update.operational_model_fingerprint(configured, root / "legacy")
+                self.assertEqual(before, operational_update.operational_model_fingerprint(configured, root / "site"))
+                (shared / "champions.json").write_text('{"speed":{"model_id":"new"}}')
+                after = operational_update.operational_model_fingerprint(configured, root / "site")
+                self.assertNotEqual(before, after)
+                other = args(day_after_tomorrow_model_artifact_dir=str(root / "other"))
+                self.assertNotEqual(after, operational_update.operational_model_fingerprint(other, root / "site"))
 
 
 class GateTests(unittest.TestCase):
@@ -274,7 +308,8 @@ class PublicationTests(unittest.TestCase):
             self.assertNotIn('alt="Next-day prediction performance by wind direction"', index)
             self.assertIn('alt="Model gate evaluation history"', evaluation)
             self.assertIn('alt="Next-day prediction performance by wind direction"', evaluation)
-            self.assertIn("Realised forecast MAE history", evaluation)
+            self.assertNotIn("Realised forecast MAE history", evaluation)
+            self.assertNotIn("Evaluation downloads", evaluation)
             self.assertIn('href="index.html">Forecasts</a>', evaluation)
             self.assertIn('href="https://portal.example/">Rider portal</a>', evaluation)
             self.assertEqual(evaluation.count('style="height:44px"'), 2)

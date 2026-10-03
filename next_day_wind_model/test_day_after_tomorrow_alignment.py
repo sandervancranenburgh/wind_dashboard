@@ -119,10 +119,13 @@ class PresentationTests(unittest.TestCase):
             evaluation = (root / "web/evaluation.html").read_text()
             titles = ["Current-day performance by wind direction", "Next-day performance by wind direction",
                 "Day-after-tomorrow performance by wind direction", "Current-day model-gate evaluation history",
-                "Next-day model-gate evaluation history", "Day-after-tomorrow model-gate evaluation history", "Realised forecast MAE history"]
+                "Next-day model-gate evaluation history", "Day-after-tomorrow model-gate evaluation history"]
             positions = [evaluation.index(title) for title in titles]
             self.assertEqual(positions, sorted(positions))
             index = (root / "web/index.html").read_text()
+            for removed in ["Download forecast CSV", "Realised forecast MAE history", "Evaluation downloads"]:
+                self.assertNotIn(removed, index)
+                self.assertNotIn(removed, evaluation)
             self.assertIn('data-plot-id="day-after-tomorrow-interactive-plot"', index)
             self.assertIn('id="day-after-tomorrow-fallback"', index)
             self.assertNotIn("day_after_tomorrow_interactive.js", index)

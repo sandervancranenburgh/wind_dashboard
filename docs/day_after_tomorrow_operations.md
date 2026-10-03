@@ -30,6 +30,15 @@ Output forecast PNGs, mobile PNGs, CSV, interactive JSON and metadata use the
 `day_after_tomorrow_` prefix. The CSV records the information cutoff, coverage,
 model identities and HARMONIE run/fetch provenance.
 
+`--day-after-tomorrow-model-artifact-dir` overrides the dedicated D+2 directory
+directly (do not append another `day_after_tomorrow`). Its environment default
+is `WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR`. Configure one absolute directory
+for both daily training and hourly/cached updates: production's existing daily
+and hourly commands use different parent directories for the other horizons.
+The D+2 override preserves those existing paths and participates in the refresh
+fingerprint along with the champion manifest. No override preserves the original
+`<model-artifact-dir>/day_after_tomorrow/` behavior.
+
 The operational pipeline reuses shared masked sampling/training in
 `day_after_tomorrow_core.py`; the historical experiment remains available in
 `day_after_tomorrow_experiment.py`. Neither source collectors nor the ECMWF
@@ -84,8 +93,10 @@ content in this order: current-day, next-day and D+2 spiders, followed by
 current-day, next-day and D+2 model gates. The current-day gate is rendered
 from its actual aligned holdout artifacts; its model pipeline is unchanged.
 Navigation uses two equal-width blue
-44-pixel buttons: Forecasts and Rider portal. Existing evaluation asset URLs
-and CSV downloads remain available. Missing D+2 evaluations have an explicit
+44-pixel buttons: Forecasts and Rider portal. Prediction and evaluation CSVs
+remain available as internal artifacts, but the forecast CSV link, realised-MAE
+history section and evaluation-downloads section are omitted from the pages.
+Missing D+2 evaluations have an explicit
 empty state; cached forecasts retain their actual target date and are labeled
 stale across date rollover or after missed daytime updates.
 
@@ -152,13 +163,21 @@ ECMWF; there is no separate D+2 interactive component.
    production. Keep D+2 disabled while verifying existing forecasts and the
    new evaluation-page navigation. Preserve scheduled execution times,
    collector guards, portal configuration and the ECMWF environment.
-4. Enable D+2 for both existing training and six-minute update commands through
-   the shared crontab environment `WIND_ENABLE_DAY_AFTER_TOMORROW=1` (or their
-   explicit CLI switch). Initialize fresh production champions with the existing
-   locked training command. Do not copy development databases or checkpoints.
+4. Initialize fresh production champions by running only the D+2 training stage
+   under the existing lock: seed 42, batch size 16, at most 30 epochs and speed
+   calibration `none`. Do not retrain the other horizons during initialization,
+   copy development databases/checkpoints, or nest a lock wrapper inside an
+   already-held lock. Require valid gate evaluation before enabling the new
+   horizon. Then configure both existing daily and six-minute commands through
+   the shared crontab environment `WIND_ENABLE_DAY_AFTER_TOMORROW=1` and
+   `WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR` pointing to the same dedicated
+   production D+2 directory. Preserve the other horizons' directories and all
+   scheduled execution times. Outside 07:00–22:00, leave issuance unavailable
+   until the next valid hour; do not backdate a new champion's prediction.
 5. Publish both pages and assets through the existing configured publication
    workflow. Verify issue/target date, gaps, model IDs, evaluation dates,
-   navigation, downloads and desktop/mobile output on the live website.
+   navigation, six-plot order, removed sections and desktop/mobile output on the
+   live website.
 6. Observe the next hourly inference and next daily training/gate run. Verify
    idempotent D+2 logging and that other horizons continue after a D+2 failure.
 

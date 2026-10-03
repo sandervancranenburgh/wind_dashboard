@@ -703,9 +703,11 @@ def operational_model_fingerprint(args, model_dir):
     fingerprint, _missing = compute_model_fingerprint(model_dir)
     if fingerprint is None or not getattr(args, "enable_day_after_tomorrow", False) or args.site != "valkenburgsemeer":
         return fingerprint
-    manifest = model_dir / "day_after_tomorrow" / "champions.json"
+    from next_day_wind_model.day_after_tomorrow import model_directory
+    directory = model_directory(args, model_dir)
+    manifest = directory / "champions.json"
     identity = manifest.read_bytes() if manifest.exists() else b"no_d2_champion"
-    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + identity
+    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + str(directory.resolve()).encode() + identity
                           + getattr(args, "day_after_tomorrow_calibration", "none").encode()).hexdigest()
 
 

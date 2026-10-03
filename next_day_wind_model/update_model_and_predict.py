@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
     parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
     parser.add_argument(
+        "--day-after-tomorrow-model-artifact-dir",
+        default=os.environ.get("WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR"),
+        help="Dedicated D+2 champion directory shared by daily and hourly jobs; defaults to <model-artifact-dir>/day_after_tomorrow.",
+    )
+    parser.add_argument(
         "--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
         default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1",
         help="Enable the isolated operational D+2 model and experimental dashboard panel (default off).",
@@ -7310,15 +7315,6 @@ def publish_web_dashboard(
         <img src="current_day_model_gate_eval_history.png?v={cache_bust}" alt="Current-day model-gate evaluation history"></section>'''
     gate_eval_card = gate_eval_card.replace("<h2>Model-gate evaluation history</h2>", "<h2>Next-day model-gate evaluation history</h2>")
     evaluation_sections = performance_section + current_gate_card + gate_eval_card + evaluation_content(d2_state, copied, cache_bust, kind="gate")
-    if "daily_mae_history.png" in copied:
-        evaluation_sections += f'''<section class="card"><h2>Realised forecast MAE history</h2>
-        <picture><source media="(max-width:768px)" srcset="daily_mae_history_mobile.png?v={cache_bust}">
-        <img src="daily_mae_history.png?v={cache_bust}" alt="Realised forecast MAE history"></picture>
-        <p><a href="daily_mae_history.csv">Download daily MAE CSV</a></p></section>'''
-    downloads = ''.join(f'<li><a href="{name}">{html.escape(name)}</a></li>' for name in copied
-                        if (name.endswith(".csv") and "predictions" not in name)
-                        or (name.startswith("day_after_tomorrow_study_") and name.endswith((".csv", ".json", ".png"))))
-    evaluation_sections += f'<section class="card"><h2>Evaluation downloads</h2><ul>{downloads}</ul></section>'
     performance_section = '<section class="card"><h2 class="section-title"><a href="evaluation.html">How much better are the super local forecasts?</a></h2></section>'
     gate_eval_card = ""
     html_doc = f"""<!doctype html>

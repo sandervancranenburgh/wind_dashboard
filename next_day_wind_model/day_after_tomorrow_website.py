@@ -21,7 +21,7 @@ def forecast_card(state, assets, version):
         <picture id="day-after-tomorrow-fallback">
           <source media="(max-width:768px)" srcset="{PREFIX}_predictions_mobile.png?v={version}">
           <img src="{PREFIX}_predictions.png?v={version}" alt="Experimental day-after-tomorrow forecast">
-        </picture><p><a href="{PREFIX}_predictions.csv">Download forecast CSV</a></p>'''
+        </picture>'''
     return f'''<section class="card"><h2>Day-after-tomorrow prediction · experimental</h2>
         <p class="desc" id="day-after-tomorrow-status">{description}</p>{plot}</section>'''
 

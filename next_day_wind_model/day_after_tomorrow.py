@@ -26,6 +26,12 @@ SITE = "valkenburgsemeer"
 TZ = "Europe/Amsterdam"
 
 
+def model_directory(args, parent: Path) -> Path:
+    """Resolve one dedicated champion directory across daily and hourly jobs."""
+    configured = getattr(args, "day_after_tomorrow_model_artifact_dir", None)
+    return Path(configured).expanduser().resolve() if configured else Path(parent) / PREFIX
+
+
 def write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".partial")
@@ -450,7 +456,7 @@ def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
     enabled = bool(getattr(args, "enable_day_after_tomorrow", False)) and args.site == SITE
     if not enabled:
         return {"status": "disabled"}
-    artifact = model_artifact_dir / PREFIX
+    artifact = model_directory(args, model_artifact_dir)
     issue = now.floor("h")
     error = None
     try:

@@ -304,6 +304,7 @@ def run_measured_only_stage(
     save_next_day_plot: Callable[..., None] | None = None,
     load_ecmwf_overlay: Callable[..., tuple[pd.DataFrame, dict[str, Any]]] | None = None,
     now_utc: datetime | None = None,
+    refresh_day_after_tomorrow: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     current_csv = out_dir / "current_day_predictions.csv"
     metadata_path = out_dir / "metadata_update.json"
@@ -565,6 +566,13 @@ def run_measured_only_stage(
             (json.dumps(metadata, indent=2) + "\n").encode("utf-8"),
         )
 
+    d2_state = None
+    if refresh_day_after_tomorrow is not None:
+        try:
+            d2_state, d2_changes = refresh_day_after_tomorrow(now=now_utc, force_render=ecmwf_changed)
+            web_changes.update(d2_changes)
+        except Exception as exc:
+            print(f"D+2 cached refresh skipped: {type(exc).__name__}: {exc}")
     meaningful_web_change = any(web_changes.values())
     latest_observation_utc = observations.index.max().tz_convert("UTC").isoformat()
     web_metadata_path = Path(args.web_out_dir) / "metadata_update.json"
@@ -620,6 +628,8 @@ def run_measured_only_stage(
                     "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
                     "model_last_trained_at_utc": model_trained_at_utc,
                     "measured_only_update": True,
+                    **({"day_after_tomorrow": {key: value for key, value in d2_state.items()
+                                               if key not in ["artifact_dir", "gate"]}} if d2_state else {}),
                 }
             )
             metadata_changed = write_bytes_if_changed(
@@ -638,6 +648,12 @@ def run_measured_only_stage(
                 refresh_next_day=next_day_rendered,
             ),
         )
+        evaluation_path = Path(args.web_out_dir) / "evaluation.html"
+        if evaluation_path.exists():
+            evaluation = evaluation_path.read_text()
+            evaluation = re.sub(r'currentVersion:\s*"[^"]+"',
+                                lambda _: 'currentVersion:' + json.dumps(generated_at), evaluation)
+            web_changes["evaluation.html"] = write_bytes_if_changed(evaluation_path, evaluation.encode())
 
     git_publish: dict[str, Any] = {
         "enabled": bool(args.git_auto_push_pages),

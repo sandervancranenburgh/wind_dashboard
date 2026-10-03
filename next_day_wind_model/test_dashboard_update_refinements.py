@@ -132,14 +132,18 @@ class UpdateMetadataTests(unittest.TestCase):
             estimate.expected_at_utc,
             datetime(2026, 8, 20, 20, 42, 30, tzinfo=timezone.utc),
         )
-        text = _format_plot_meta_text(
-            "2026-08-20T19:48:00+00:00",
-            "2026-08-20T19:47:00+00:00",
-            None,
-            "Europe/Amsterdam",
-            harmonie_time_utc=arrivals[-1],
-            harmonie_expected_next_at_utc=estimate.expected_at_utc,
-        )
+        # The compact labels depend on today's date; keep this historical
+        # cadence fixture deterministic after 20 August has passed.
+        with mock.patch("next_day_wind_model.update_model_and_predict.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 8, 20, 19, 48, tzinfo=timezone.utc)
+            text = _format_plot_meta_text(
+                "2026-08-20T19:48:00+00:00",
+                "2026-08-20T19:47:00+00:00",
+                None,
+                "Europe/Amsterdam",
+                harmonie_time_utc=arrivals[-1],
+                harmonie_expected_next_at_utc=estimate.expected_at_utc,
+            )
         self.assertIn("Last prediction update: 21:47 - Next expected update: ~22:42", text)
         self.assertIn("Last HARMONIE fetch: 21:42 - Next expected fetch: ~22:42", text)
 

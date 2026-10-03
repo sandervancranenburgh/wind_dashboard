@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -642,10 +642,15 @@ def _launcher_parser() -> argparse.ArgumentParser:
         default="data/ecmwf_archive/ecmwf_shadow.sqlite",
     )
     parser.add_argument("--site", required=True)
+    parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
+    parser.add_argument("--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1")
     parser.add_argument("--model", default="HARMONIE")
     parser.add_argument("--target-hours", type=int, default=24)
     parser.add_argument("--out-dir", default="next_day_wind_model/artifacts")
     parser.add_argument("--model-artifact-dir", default=None)
+    parser.add_argument("--day-after-tomorrow-model-artifact-dir",
+                        default=os.environ.get("WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR"))
     parser.add_argument("--web-out-dir", default="next_day_wind_model/web_dashboard")
     parser.add_argument("--local-timezone", default="Europe/Amsterdam")
     parser.add_argument("--skip-training", action="store_true")
@@ -673,7 +678,7 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         model=args.model,
         min_target_rows=max(1, int(args.target_hours)),
     )
-    model_fingerprint, _missing_models = compute_model_fingerprint(model_dir)
+    model_fingerprint = operational_model_fingerprint(args, model_dir, now_utc=now_utc)
     cached = validate_cached_prediction_artifacts(
         out_dir,
         local_timezone=args.local_timezone,
@@ -694,6 +699,26 @@ def _collect_snapshot(args: argparse.Namespace, *, now_utc: datetime | None = No
         cached_artifacts=cached,
         ecmwf_run_identity=ecmwf_run_identity,
     )
+
+
+def operational_model_fingerprint(args, model_dir, *, now_utc=None):
+    fingerprint, _missing = compute_model_fingerprint(model_dir)
+    if fingerprint is None or not getattr(args, "enable_day_after_tomorrow", False) or args.site != "valkenburgsemeer":
+        return fingerprint
+    from next_day_wind_model.day_after_tomorrow import model_directory
+    directory = model_directory(args, model_dir)
+    manifest = directory / "champions.json"
+    identity = manifest.read_bytes() if manifest.exists() else b"no_d2_champion"
+    local_issue = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Amsterdam"))
+    if local_issue.hour < 7:
+        local_issue -= timedelta(days=1)
+        local_issue = local_issue.replace(hour=22)
+    elif local_issue.hour > 22:
+        local_issue = local_issue.replace(hour=22)
+    issue_bucket = local_issue.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+    return hashlib.sha256(fingerprint.encode() + b"d2_enabled" + str(directory.resolve()).encode() + identity
+                          + issue_bucket.encode()
+                          + getattr(args, "day_after_tomorrow_calibration", "none").encode()).hexdigest()
 
 
 def _child_command(script_path: Path, argv: Sequence[str], *, measured_only: bool) -> list[str]:
@@ -796,7 +821,7 @@ def launch_operational_update(script_path: Path, argv: Sequence[str]) -> int:
 
     try:
         model_dir = Path(args.model_artifact_dir) if args.model_artifact_dir else Path(args.out_dir)
-        post_model_fingerprint, _missing = compute_model_fingerprint(model_dir)
+        post_model_fingerprint = operational_model_fingerprint(args, model_dir)
         post_cache = validate_cached_prediction_artifacts(
             Path(args.out_dir),
             local_timezone=args.local_timezone,

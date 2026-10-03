@@ -7,6 +7,7 @@ import html
 import json
 import os
 import resource
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -167,6 +168,22 @@ def parse_args() -> argparse.Namespace:
         help="Fallback IFS availability latency until enough completed runs exist.",
     )
     parser.add_argument("--site", required=True, help="Canonical site ID from config/sites.json.")
+    parser.add_argument("--day-after-tomorrow-calibration", choices=["none", "legacy"], default="none")
+    parser.add_argument(
+        "--current-day-gate-artifact-dir",
+        default=os.environ.get("WIND_CURRENT_DAY_GATE_ARTIFACT_DIR"),
+        help="Read existing current-day gate reports from this directory for all dashboard update paths.",
+    )
+    parser.add_argument(
+        "--day-after-tomorrow-model-artifact-dir",
+        default=os.environ.get("WIND_DAY_AFTER_TOMORROW_MODEL_ARTIFACT_DIR"),
+        help="Dedicated D+2 champion directory shared by daily and hourly jobs; defaults to <model-artifact-dir>/day_after_tomorrow.",
+    )
+    parser.add_argument(
+        "--enable-day-after-tomorrow", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("WIND_ENABLE_DAY_AFTER_TOMORROW", "0") == "1",
+        help="Enable the isolated operational D+2 model and experimental dashboard panel (default off).",
+    )
     parser.add_argument("--model", default="HARMONIE", help="Forecast model name in DB.")
     parser.add_argument("--window-hours", type=int, default=72, help="Input history length for X.")
     parser.add_argument("--target-hours", type=int, default=24, help="Prediction horizon in hours for Y.")
@@ -561,10 +578,18 @@ def _extract_speed_regime_signal(
     pred_speed: np.ndarray,
     forecast_speed: np.ndarray,
     signal: str,
+    target_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     pred_arr = np.asarray(pred_speed, dtype=np.float32)
     forecast_arr = np.asarray(forecast_speed, dtype=np.float32)
     mode = str(signal).strip().lower()
+    if target_mask is not None:
+        values = pred_arr if mode.startswith("pred_") else forecast_arr
+        masked = np.where(target_mask, values, np.nan)
+        if mode in {"pred_max", "forecast_max"}:
+            return np.nanmax(masked, axis=1).astype(np.float32)
+        if mode in {"pred_mean", "forecast_mean"}:
+            return np.nanmean(masked, axis=1).astype(np.float32)
     if mode == "pred_max":
         return pred_arr.max(axis=1).astype(np.float32)
     if mode == "pred_mean":
@@ -801,14 +826,20 @@ def _target_hour_speed_calibration_feature_matrix(
     }
 
 
+def _calibration_mae(predicted, actual, target_mask=None):
+    error = np.abs(predicted - actual)
+    return float(np.mean(error if target_mask is None else error[target_mask]))
+
+
 def _fit_threshold_speed_calibration(
     pred_arr: np.ndarray,
     forecast_arr: np.ndarray,
     actual_arr: np.ndarray,
     signal_values: np.ndarray,
     signal: str,
+    target_mask: np.ndarray | None = None,
 ) -> dict | None:
-    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    baseline_mae = _calibration_mae(pred_arr, actual_arr, target_mask)
     sig_min = float(np.min(signal_values))
     sig_max = float(np.max(signal_values))
     if not np.isfinite(sig_min) or not np.isfinite(sig_max) or sig_max - sig_min < 0.5:
@@ -827,7 +858,7 @@ def _fit_threshold_speed_calibration(
                 scale = (1.0 + (float(min_scale) - 1.0) * t).astype(np.float32)
                 cand = forecast_arr + scale[:, None] * (pred_arr - forecast_arr)
                 cand = np.maximum(cand, 0.0).astype(np.float32)
-                mae = float(np.mean(np.abs(cand - actual_arr)))
+                mae = _calibration_mae(cand, actual_arr, target_mask)
                 if mae + 1e-9 < best_mae:
                     best_mae = mae
                     best_params = (float(start), float(end), float(min_scale))
@@ -861,12 +892,16 @@ def _fit_contextual_speed_calibration(
     signal_values: np.ndarray,
     speed_calibration_context: dict | None,
     signal: str,
+    target_mask: np.ndarray | None = None,
 ) -> dict | None:
     if speed_calibration_context is None:
         return None
 
     delta = (pred_arr - forecast_arr).astype(np.float32)
     target_delta = (actual_arr - forecast_arr).astype(np.float32)
+    if target_mask is not None:
+        delta = np.where(target_mask, delta, 0.0)
+        target_delta = np.where(target_mask, target_delta, 0.0)
     denom = np.sum(delta * delta, axis=1).astype(np.float32)
     informative = denom > 1e-6
     if int(np.sum(informative)) < 32:
@@ -881,7 +916,7 @@ def _fit_contextual_speed_calibration(
     sample_w = np.sqrt(np.clip(denom / max(mean_denom, 1e-6), 0.25, 4.0)).astype(np.float32)
 
     best_coef: np.ndarray | None = None
-    best_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    best_mae = _calibration_mae(pred_arr, actual_arr, target_mask)
     best_ridge = None
     xt = X.astype(np.float64)
     yt = target_scale.astype(np.float64)
@@ -899,7 +934,7 @@ def _fit_contextual_speed_calibration(
         scale = np.clip(xt @ coef.astype(np.float64), 0.0, 1.0).astype(np.float32)
         cand = forecast_arr + scale[:, None] * delta
         cand = np.maximum(cand, 0.0).astype(np.float32)
-        mae = float(np.mean(np.abs(cand - actual_arr)))
+        mae = _calibration_mae(cand, actual_arr, target_mask)
         if mae + 1e-9 < best_mae:
             best_mae = mae
             best_coef = coef
@@ -908,7 +943,7 @@ def _fit_contextual_speed_calibration(
     if best_coef is None:
         return None
 
-    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
+    baseline_mae = _calibration_mae(pred_arr, actual_arr, target_mask)
     improvement_abs = baseline_mae - best_mae
     if improvement_abs <= 1e-6:
         return None
@@ -934,6 +969,7 @@ def _fit_target_hour_speed_calibration(
     forecast_arr: np.ndarray,
     actual_arr: np.ndarray,
     speed_calibration_context: dict | None,
+    target_mask: np.ndarray | None = None,
 ) -> dict | None:
     built = _target_hour_speed_calibration_feature_matrix(
         pred_arr,
@@ -945,6 +981,8 @@ def _fit_target_hour_speed_calibration(
     X, feature_meta = built
     y = (actual_arr - pred_arr).reshape(-1).astype(np.float32)
     mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    if target_mask is not None:
+        mask &= target_mask.reshape(-1)
     if int(np.sum(mask)) < 64:
         return None
 
@@ -979,8 +1017,8 @@ def _fit_target_hour_speed_calibration(
     correction = (X.astype(np.float32) @ best_coef).reshape(pred_arr.shape)
     calibrated = np.maximum(pred_arr + correction.astype(np.float32), 0.0)
 
-    baseline_mae = float(np.mean(np.abs(pred_arr - actual_arr)))
-    calibrated_mae = float(np.mean(np.abs(calibrated - actual_arr)))
+    baseline_mae = _calibration_mae(pred_arr, actual_arr, target_mask)
+    calibrated_mae = _calibration_mae(calibrated, actual_arr, target_mask)
     improvement_abs = baseline_mae - calibrated_mae
     if improvement_abs <= 1e-6:
         return None
@@ -1013,17 +1051,37 @@ def fit_speed_regime_calibration(
     actual_speed: np.ndarray,
     speed_calibration_context: dict | None = None,
     signal: str = "pred_max",
+    target_mask: np.ndarray | None = None,
+    diagnostics: dict | None = None,
 ) -> dict | None:
     pred_arr = np.asarray(pred_speed, dtype=np.float32)
     forecast_arr = np.asarray(forecast_speed, dtype=np.float32)
     actual_arr = np.asarray(actual_speed, dtype=np.float32)
     if pred_arr.ndim != 2 or forecast_arr.shape != pred_arr.shape or actual_arr.shape != pred_arr.shape:
         raise ValueError("Speed calibration expects (samples, horizon) arrays of identical shape.")
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask, dtype=bool)
+        if target_mask.shape != pred_arr.shape:
+            raise ValueError("Calibration target mask must match prediction shape")
+        target_mask = target_mask & np.isfinite(pred_arr) & np.isfinite(forecast_arr) & np.isfinite(actual_arr)
+        usable = target_mask.any(axis=1)
+        pred_arr, forecast_arr, actual_arr, target_mask = [a[usable] for a in (pred_arr, forecast_arr, actual_arr, target_mask)]
+        speed_calibration_context = _slice_speed_calibration_context(speed_calibration_context, usable)
+        if target_mask.all():
+            # Preserve the existing complete-window path exactly.
+            target_mask = None
+        else:
+            pred_arr, forecast_arr, actual_arr = [np.where(target_mask, a, np.nan) for a in (pred_arr, forecast_arr, actual_arr)]
+            if speed_calibration_context is not None:
+                speed_calibration_context = dict(speed_calibration_context)
+                for key in ("target_forecast_dir_deg", "target_horizon_hr"):
+                    if key in speed_calibration_context:
+                        speed_calibration_context[key] = np.where(target_mask, speed_calibration_context[key], np.nan)
     if pred_arr.shape[0] < 32:
         return None
 
-    signal_values = _extract_speed_regime_signal(pred_arr, forecast_arr, signal)
-    threshold_cal = _fit_threshold_speed_calibration(pred_arr, forecast_arr, actual_arr, signal_values, signal)
+    signal_values = _extract_speed_regime_signal(pred_arr, forecast_arr, signal, target_mask)
+    threshold_cal = _fit_threshold_speed_calibration(pred_arr, forecast_arr, actual_arr, signal_values, signal, target_mask)
     contextual_cal = _fit_contextual_speed_calibration(
         pred_arr,
         forecast_arr,
@@ -1031,14 +1089,20 @@ def fit_speed_regime_calibration(
         signal_values,
         speed_calibration_context,
         signal,
+        target_mask,
     )
     target_hour_cal = _fit_target_hour_speed_calibration(
         pred_arr,
         forecast_arr,
         actual_arr,
         speed_calibration_context,
+        target_mask,
     )
     candidates = [c for c in [threshold_cal, contextual_cal, target_hour_cal] if c is not None]
+    if diagnostics is not None:
+        diagnostics.update(baseline_mae=_calibration_mae(pred_arr, actual_arr, target_mask),
+            candidates={name: value for name, value in [("threshold_v1", threshold_cal),
+                ("contextual_linear_v2", contextual_cal), ("target_hour_ridge_v1", target_hour_cal)]})
     if not candidates:
         return None
     return min(candidates, key=lambda c: float(c["calibrated_mae"]))
@@ -1049,6 +1113,7 @@ def apply_speed_regime_calibration(
     forecast_speed: np.ndarray,
     speed_calibration: dict | None,
     speed_calibration_context: dict | None = None,
+    target_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     if not speed_calibration or not bool(speed_calibration.get("enabled", False)):
         return np.asarray(pred_speed, dtype=np.float32)
@@ -1089,6 +1154,7 @@ def apply_speed_regime_calibration(
         pred_arr,
         forecast_arr,
         str(speed_calibration.get("signal", "pred_max")),
+        target_mask,
     )
     if cal_type == "contextual_linear_v2":
         features, _ = _speed_calibration_feature_matrix(
@@ -2577,6 +2643,8 @@ def save_prediction_plot(
     ecmwf_speed_series: pd.DataFrame | None = None,
     spot_name: str | None = None,
     render_diagnostics: dict[str, object] | None = None,
+    experiment_label: str | None = None,
+    operational_forecast: bool = False,
 ) -> None:
     table = table.copy()
     if "target_time_local" not in table.columns:
@@ -2595,6 +2663,8 @@ def save_prediction_plot(
     table["hour_label"] = table["target_time_local"].dt.strftime("%H")
     first_dt = table["target_time_local"].iloc[0]
     day_label = _format_static_day_label(first_dt)
+    if experiment_label:
+        day_label = f"{day_label}\n{experiment_label}"
 
     forecast_core_parts = [
         table["forecast_wind_speed"].dropna(),
@@ -2667,12 +2737,15 @@ def save_prediction_plot(
         ecmwf_frame = ecmwf_frame.dropna(subset=["time_local", "wind_speed_knots"])
         first_target = pd.Timestamp(table["target_time_local"].iloc[0])
         last_target = pd.Timestamp(table["target_time_local"].iloc[-1])
+        before_limit = ecmwf_frame[ecmwf_frame["time_local"] < first_target].tail(1)
         ecmwf_frame = _native_points_through_first_after_limit(
             ecmwf_frame,
             time_column="time_local",
             left=first_target,
             right=last_target,
         )
+        if experiment_label and not before_limit.empty:
+            ecmwf_frame = pd.concat([before_limit, ecmwf_frame], ignore_index=True)
         if not ecmwf_frame.empty:
             ecmwf_x = (
                 (ecmwf_frame["time_local"] - first_target).dt.total_seconds() / 3600.0
@@ -2732,20 +2805,29 @@ def save_prediction_plot(
     direction_ax.grid(False)
     for spine in direction_ax.spines.values():
         spine.set_visible(False)
+    plot_meta_text = _format_plot_meta_text(
+        plot_updated_at_utc,
+        prediction_updated_at_utc,
+        model_trained_at_utc,
+        local_tz,
+        harmonie_time_utc=harmonie_time_utc,
+        harmonie_time_kind=harmonie_time_kind,
+        plot_update_interval_minutes=plot_update_interval_minutes,
+        harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+        harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+    )
+    if experiment_label and not operational_forecast:
+        def experiment_time(value):
+            return "unknown" if value is None else pd.Timestamp(value).tz_convert(ZoneInfo(local_tz)).strftime("%d %B %H:%M")
+        plot_meta_text = (
+            f"Forecast issued: {experiment_time(prediction_updated_at_utc)}\n"
+            f"HARMONIE fetched: {experiment_time(harmonie_time_utc)}\n"
+            f"Experimental fitting cutoff: {experiment_time(model_trained_at_utc)}"
+        )
     metadata_artist = ax.text(
         0.015,
         meta_y,
-        _format_plot_meta_text(
-            plot_updated_at_utc,
-            prediction_updated_at_utc,
-            model_trained_at_utc,
-            local_tz,
-            harmonie_time_utc=harmonie_time_utc,
-            harmonie_time_kind=harmonie_time_kind,
-            plot_update_interval_minutes=plot_update_interval_minutes,
-            harmonie_update_interval_minutes=harmonie_update_interval_minutes,
-            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
-        ),
+        plot_meta_text,
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -2784,6 +2866,8 @@ def save_prediction_plot(
     direction_arrow_count = 0
     for i, (fdir, ldir) in enumerate(zip(table["forecast_wind_dir_deg"], table["lstm_pred_wind_dir_deg"])):
         for direction_deg, color in [(fdir, "gray"), (ldir, SUPERLOCAL_FORECAST_COLOR)]:
+            if not np.isfinite(direction_deg):
+                continue
             theta = np.deg2rad((float(direction_deg) + 180.0) % 360.0)
             dx = 0.22 * np.sin(theta)
             dy = arrow_len * np.cos(theta)
@@ -2892,6 +2976,8 @@ def save_prediction_plot(
                 "direction_arrow_count": direction_arrow_count,
                 "spot_name": spot_name or "",
                 "model_id_text": model_id_artist.get_text(),
+                "experiment_label": experiment_label,
+                "plot_meta_text": plot_meta_text,
                 "header_bounds_figure": header_bounds,
                 "weather_temperature_bounds_display": weather_temperature_bounds,
                 "weather_icon_bounds_display": weather_icon_bounds,
@@ -5637,6 +5723,7 @@ def save_model_gate_eval_history_plot(
     eval_details_csv: Path | None = None,
     db_path: Path | None = None,
     site: str | None = None,
+    horizon_label: str = "Next-day",
 ) -> None:
     def _model_id_date_label(model_id: str | None) -> str | None:
         value = str(model_id or "").strip()
@@ -5877,7 +5964,7 @@ def save_model_gate_eval_history_plot(
                     linewidth=1.5,
                     label="_nolegend_",
                 )
-                ax_top.set_title("Next-day model selection: wind speed")
+                ax_top.set_title(f"{horizon_label} model selection: wind speed")
                 ax_top.set_ylabel("Wind speed (kts)")
                 ax_top.grid(axis="y", alpha=0.3)
                 ax_top.margins(x=0, y=0)
@@ -6236,7 +6323,7 @@ def save_model_gate_eval_history_plot(
             zorder=3,
             label="Promotion run",
         )
-    ax_top.set_title("Next-day model selection: evaluation coverage")
+    ax_top.set_title(f"{horizon_label} model selection: evaluation coverage")
     ax_top.set_ylabel("Samples")
     ax_top.grid(axis="y", alpha=0.3)
     ax_top.legend(loc="upper left", fontsize=9)
@@ -6282,7 +6369,7 @@ def save_model_gate_eval_history_plot(
         markersize=3.0,
         label=chall_mae_label,
     )
-    ax_bottom.set_title("Next-day model selection: mean absolute error")
+    ax_bottom.set_title(f"{horizon_label} model selection: mean absolute error")
     ax_bottom.set_xlabel("Run date")
     ax_bottom.set_ylabel("MAE (kts)")
     ax_bottom.grid(axis="y", alpha=0.3)
@@ -6353,7 +6440,14 @@ def _direction_performance_summary_text(direction_csv: Path | None) -> str:
     return " ".join(parts)
 
 
-def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: Path) -> None:
+def save_wind_direction_performance_spider_plot(
+    direction_csv: Path,
+    plot_png: Path,
+    *,
+    model_label: str = "Super local champion model next-day",
+    title: str = "MAE for next-day models by forecast wind direction",
+    annotate_overflow: bool = False,
+) -> None:
     if not direction_csv.exists():
         return
     df = pd.read_csv(direction_csv)
@@ -6379,7 +6473,7 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
         weights = np.ones(len(df), dtype=float)
     harmonie_mae = float(np.average(harmonie, weights=weights))
     champion_mae = float(np.average(champion, weights=weights))
-    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
+    angles = np.array([order.index(label) * np.pi / 4 for label in labels])
     angles_closed = np.r_[angles, angles[0]]
     harmonie_closed = np.r_[harmonie, harmonie[0]]
     champion_closed = np.r_[champion, champion[0]]
@@ -6404,16 +6498,23 @@ def save_wind_direction_performance_spider_plot(direction_csv: Path, plot_png: P
         linewidth=2.3,
         marker="o",
         markersize=4,
-        label=f"Super local champion model next-day ({champion_mae:.2f} kts)",
+        label=f"{model_label} ({champion_mae:.2f} kts)",
     )
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylim(0.0, 3.5)
+    if annotate_overflow:
+        for values, color in [(harmonie, "#777777"), (champion, "#f28e2b")]:
+            for angle, value in zip(angles, values):
+                if value > 3.5:
+                    ax.scatter([angle], [3.5], marker="^", color=color, s=35, clip_on=False)
+                    ax.annotate(f"{value:.2f}", (angle, 3.5), xytext=(0, 9), textcoords="offset points",
+                                color=color, fontsize=9, ha="center", clip_on=False)
     ax.set_rlabel_position(225)
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(color="#d7d7d7", linewidth=0.8)
     ax.spines["polar"].set_color("#cfcfcf")
-    ax.set_title("MAE for next-day models by forecast wind direction", pad=22, fontsize=14, fontweight="bold")
+    ax.set_title(title, pad=22, fontsize=14, fontweight="bold")
     ax.text(
         0.5,
         -0.08,
@@ -6878,6 +6979,62 @@ def _site_display_name(site: str) -> str:
         return site_id
 
 
+def current_day_gate_assets(out_dir: Path, details_csv: Path | None = None, gate: dict | None = None,
+                           *, reference_artifact_dir: Path | None = None) -> dict:
+    """Adapt the existing intraday gate into the shared plotting contract.
+
+    No training or database writes. Cache-only callers reuse the latest actual
+    evaluation rather than manufacturing a new comparison or model identity.
+    """
+    history = out_dir / "current_day_model_gate_eval_history.csv"
+    details = out_dir / "current_day_model_gate_eval_details.csv"
+    plot = out_dir / "current_day_model_gate_eval_history.png"
+    if reference_artifact_dir and not (details_csv is not None and gate and gate.get("enabled")):
+        reference = Path(reference_artifact_dir)
+        metadata_path = reference / "metadata_update.json"
+        if metadata_path.exists():
+            gate = json.loads(metadata_path.read_text()).get("intraday_model_selection_gate", {})
+        candidates = sorted((reference / "intraday_model_gate_eval_details").glob("*_intraday_model_gate_eval_speed.csv"))
+        details_csv = candidates[-1] if candidates else None
+    if details_csv is None:
+        candidates = sorted((out_dir / "intraday_model_gate_eval_details").glob("*_intraday_model_gate_eval_speed.csv"))
+        details_csv = candidates[-1] if candidates else None
+    if details_csv is not None and details_csv.exists() and gate and gate.get("enabled"):
+        raw = pd.read_csv(details_csv)
+        mapping = {"actual_value": "actual_wind_speed", "harmonie_value": "forecast_wind_speed",
+            "challenger_prediction_value": "challenger_wind_speed", "champion_prediction_value": "champion_wind_speed"}
+        raw = raw.rename(columns=mapping)
+        raw["target_time_utc"] = pd.to_datetime(raw.target_time_utc, utc=True, errors="coerce")
+        for column in mapping.values():
+            raw[column] = pd.to_numeric(raw[column], errors="coerce")
+        required = ["target_time_utc", "actual_wind_speed", "forecast_wind_speed", "challenger_wind_speed"]
+        if raw.champion_wind_speed.notna().any():
+            required.append("champion_wind_speed")
+        raw = raw.dropna(subset=required)
+        if not raw.empty:
+            aligned = raw.groupby("target_time_utc", as_index=False)[list(mapping.values())].mean()
+            aligned.to_csv(details, index=False)
+            stamp = re.search(r"(\d{8}-\d{6})", details_csv.name)
+            run_utc = (pd.to_datetime(stamp.group(1), format="%Y%m%d-%H%M%S", utc=True).isoformat()
+                       if stamp else datetime.now(timezone.utc).isoformat())
+            row = {"run_utc": run_utc, "speed_model_id_champion": gate.get("intraday_model_id_champion"),
+                "speed_model_id_challenger": gate.get("intraday_model_id_challenger"),
+                "evaluation_start": aligned.target_time_utc.min().isoformat(), "evaluation_end": aligned.target_time_utc.max().isoformat(),
+                "speed_eval_rows": len(raw), "speed_eval_samples": raw.anchor_time_utc.nunique(),
+                "promote_speed": gate.get("promote_intraday", False), "promotion_margin_pct": gate.get("promotion_margin_pct", 1.)}
+            for name, column in [("forecast", "forecast_wind_speed"), ("champion", "champion_wind_speed"), ("challenger", "challenger_wind_speed")]:
+                error = raw[column] - raw.actual_wind_speed
+                row[f"speed_mae_{name}"] = float(error.abs().mean())
+                row[f"speed_rmse_{name}"] = float(np.sqrt(error.pow(2).mean()))
+            previous = pd.read_csv(history) if history.exists() else pd.DataFrame()
+            pd.concat([previous, pd.DataFrame([row])], ignore_index=True).drop_duplicates("run_utc", keep="last").to_csv(history, index=False)
+    if history.exists() and details.exists():
+        save_model_gate_eval_history_plot(history, plot, eval_details_csv=details, horizon_label="Current-day")
+    return {"current_day_gate_eval_png": plot if plot.exists() else None,
+        "current_day_gate_eval_csv": history if history.exists() else None,
+        "current_day_gate_eval_details_csv": details if details.exists() else None}
+
+
 def publish_web_dashboard(
     web_out_dir: Path,
     local_tz: str,
@@ -6912,6 +7069,11 @@ def publish_web_dashboard(
     harmonie_arrival_history_utc: list[str] | None = None,
     ecmwf_metadata: dict[str, object] | None = None,
     companion_app_base_url: str | None = None,
+    day_after_tomorrow_assets: dict[str, Path] | None = None,
+    day_after_tomorrow_state: dict | None = None,
+    current_day_gate_eval_png: Path | None = None,
+    current_day_gate_eval_csv: Path | None = None,
+    current_day_gate_eval_details_csv: Path | None = None,
 ) -> dict:
     web_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6931,7 +7093,14 @@ def publish_web_dashboard(
         (direction_spider_csv, "model_gate_speed_by_direction.csv"),
         (current_day_direction_spider_png, "current_day_direction_spider.png"),
         (current_day_direction_spider_csv, "current_day_speed_by_direction.csv"),
+        (current_day_gate_eval_png, "current_day_model_gate_eval_history.png"),
+        (current_day_gate_eval_csv, "current_day_model_gate_eval_history.csv"),
+        (current_day_gate_eval_details_csv, "current_day_model_gate_eval_details.csv"),
     ]
+    for name, source in (day_after_tomorrow_assets or {}).items():
+        if Path(name).name != name or not name.startswith("day_after_tomorrow_"):
+            raise ValueError("Invalid D+2 publication asset name")
+        publish_pairs.append((source, name))
     copied: dict[str, str] = {}
     web_assets_dir = REPO_ROOT / "next_day_wind_model" / "web_assets"
     site_assets_dir = web_out_dir / "site-assets"
@@ -6961,7 +7130,8 @@ def publish_web_dashboard(
         if not src.exists():
             continue
         dst = web_out_dir / dst_name
-        shutil.copy2(src, dst)
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
         copied[dst_name] = str(dst)
 
     for existing_name in ["model_gate_eval_history.png", "model_gate_eval_history.csv"]:
@@ -7008,6 +7178,8 @@ def publish_web_dashboard(
     static_refresh_interval_ms = refresh * 1000
     foreground_min_interval_ms = 5 * 60 * 1000
     static_refresh_metadata = {
+        "day_after_tomorrow": {key: value for key, value in (day_after_tomorrow_state or {}).items()
+                              if key not in ["artifact_dir", "gate"]},
         "static_plot_generated_at_utc": static_plot_generated_at_utc,
         "plot_updated_at_utc": None if plot_updated_at_utc is None else str(plot_updated_at_utc),
         "ecmwf": dict(ecmwf_metadata or {}),
@@ -7132,6 +7304,32 @@ def publish_web_dashboard(
 {current_day_direction_spider_row}
 {direction_spider_row}
     </section>"""
+    from next_day_wind_model.day_after_tomorrow_website import forecast_card, evaluation_content
+    d2_state = day_after_tomorrow_state or {"status": "disabled"}
+    d2_card = forecast_card(d2_state, copied, cache_bust)
+    d2_spider = evaluation_content(d2_state, copied, cache_bust, kind="spider")
+    if d2_spider:
+        if performance_section:
+            performance_section = performance_section.replace("</section>", d2_spider + "</section>", 1)
+        else:
+            performance_section = f'<section class="card performance-section">{d2_spider}</section>'
+    current_gate_card = ""
+    if "current_day_model_gate_eval_history.png" in copied:
+        current_gate_caption = "Aligned current-day holdout predictions and absolute errors, using the existing operational gate evaluation."
+        current_history = copied.get("current_day_model_gate_eval_history.csv")
+        if current_history:
+            current_rows = pd.read_csv(current_history)
+            if not current_rows.empty:
+                latest = current_rows.iloc[-1]
+                current_gate_caption += (f" Evaluation targets: {latest.get('evaluation_start', 'unknown')}–{latest.get('evaluation_end', 'unknown')}."
+                    f" Champion: {latest.get('speed_model_id_champion', 'unknown')}; challenger: {latest.get('speed_model_id_challenger', 'unknown')}.")
+        current_gate_card = f'''<section class="card"><h2>Current-day model-gate evaluation history</h2>
+        <p class="desc">{html.escape(current_gate_caption)}</p>
+        <img src="current_day_model_gate_eval_history.png?v={cache_bust}" alt="Current-day model-gate evaluation history"></section>'''
+    gate_eval_card = gate_eval_card.replace("<h2>Model-gate evaluation history</h2>", "<h2>Next-day model-gate evaluation history</h2>")
+    evaluation_sections = performance_section + current_gate_card + gate_eval_card + evaluation_content(d2_state, copied, cache_bust, kind="gate")
+    performance_section = '<section class="card"><h2 class="section-title"><a href="evaluation.html">How much better are the super local forecasts?</a></h2></section>'
+    gate_eval_card = ""
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -7149,6 +7347,8 @@ def publish_web_dashboard(
   <title>Super local wind prediction - {spot_display}</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 16px; color: #111; }}
+    [hidden] {{ display: none !important; }}
+    .card a {{ overflow-wrap: anywhere; }}
     h1 {{ margin: 0 0 8px 0; }}
     .page-header {{ display: block; }}
     .dashboard-actions {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; width: min(100%, 340px); margin: 10px 0 16px 0; }}
@@ -7218,7 +7418,7 @@ def publish_web_dashboard(
   </header>
   <p class="overview overview-desktop">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
-    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    The local models learn systematic local deviations from the large-scale model using local measurements.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
@@ -7267,12 +7467,13 @@ def publish_web_dashboard(
         <img src="next_day_predictions.png?v={cache_bust}" alt="Next day prediction">
       </picture>
     </div>
+{d2_card}
 {performance_section}
 {gate_eval_card}
   </div>
   <p class="overview overview-mobile">
     <strong>What is the super local forecast?</strong> This dashboard combines two local machine learning models that take large-scale wind-model predictions as input and are trained on historical forecast values with matching measured wind values at this location.
-    The local models are calibrated to local data to improve prediction performance by learning systematic local deviations from the large-scale model.
+    The local models learn systematic local deviations from the large-scale model using local measurements.
     One model is dedicated to the remaining part of the current day and gives strong weight to the most recent measured wind updates.
     A second model is dedicated to next-day (day-ahead) prediction.
     Models are retrained daily, next-day/current-day prediction lines are refreshed hourly during daytime, and measured-wind updates on the current-day plot are refreshed every 6 minutes.
@@ -7299,6 +7500,35 @@ def publish_web_dashboard(
 </body>
 </html>
 """
+    if d2_state.get("status") != "disabled":
+        html_doc = html_doc.replace("combines two local machine learning models", "combines three local machine learning models")
+        html_doc = html_doc.replace("A second model is dedicated to next-day (day-ahead) prediction.",
+            "A second model predicts tomorrow. A third, experimental model predicts the day after tomorrow, 08:00–22:00.")
+        html_doc = html_doc.replace("next-day/current-day prediction lines", "all forecast prediction lines")
+    eval_head = html_doc.split('</head>', 1)[0].replace(
+        f'<title>Super local wind prediction - {spot_display}</title>',
+        f'<title>Model evaluation - {spot_display}</title>')
+    evaluation_doc = eval_head + f'''</head><body><h1>How much better are the super local forecasts?</h1>
+    <p class="spot-line">{spot_display}</p>
+    <nav class="dashboard-actions evaluation-actions" aria-label="Evaluation navigation"
+         style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <a class="button primary dashboard-action" style="height:44px" href="index.html">Forecasts</a>
+      <a class="button primary dashboard-action" style="height:44px" href="{html.escape(companion_base + '/' if companion_base else '/')}">Rider portal</a>
+    </nav><p class="meta">Last updated: {generated_local_str}</p><div class="grid">{evaluation_sections}</div>
+    <script src="{refresh_js_src}" defer></script><script>
+    window.addEventListener("DOMContentLoaded", function () {{
+      if (window.WindDashboardRefresh) window.WindDashboardRefresh.createController({{
+        metadataUrl:"metadata_update.json", currentVersion:{static_plot_generated_at_json},
+        minimumIntervalMs:{foreground_min_interval_ms}, pollIntervalMs:{static_refresh_interval_ms}
+      }}).start();
+    }});</script></body></html>'''
+    evaluation_path = web_out_dir / "evaluation.html"
+    evaluation_path.write_text(evaluation_doc, encoding="utf-8")
+    copied["evaluation.html"] = str(evaluation_path)
+    # Include both pages and newly generated interactive assets in the refresh manifest.
+    static_refresh_metadata["pages"] = ["index.html", "evaluation.html"]
+    static_refresh_metadata["interactive_json"] = sorted(name for name in copied if name.endswith("_interactive_data.json"))
+    static_refresh_metadata_path.write_text(json.dumps(static_refresh_metadata, indent=2), encoding="utf-8")
     index_path = web_out_dir / "index.html"
     index_path.write_text(html_doc, encoding="utf-8")
     copied["index.html"] = str(index_path)
@@ -7720,10 +7950,17 @@ def run_dashboard_stage_from_cached_artifacts(
         if gate_eval_direction_spider_png.exists():
             gate_eval_direction_spider_png_src = gate_eval_direction_spider_png
 
+    from next_day_wind_model.day_after_tomorrow import safe_stage as run_d2_stage, artifact_inputs
+    d2_state = run_d2_stage(args=args, db_path=db_path, out_dir=out_dir,
+                          model_artifact_dir=model_artifact_dir)
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode and _site_publication_allowed(args.site):
         web_publish = publish_web_dashboard(
+            day_after_tomorrow_state=d2_state,
+            day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
+            **current_day_gate_assets(out_dir, gate=metadata.get("intraday_model_selection_gate"),
+                                      reference_artifact_dir=getattr(args, "current_day_gate_artifact_dir", None)),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,
@@ -7959,6 +8196,7 @@ def main() -> None:
 
     if args.operational_measured_only:
         from next_day_wind_model.measured_update import run_measured_only_stage
+        from next_day_wind_model.day_after_tomorrow import refresh_published as refresh_d2
 
         run_measured_only_stage(
             args=args,
@@ -7973,6 +8211,8 @@ def main() -> None:
             load_harmonie_arrival_estimate=_load_harmonie_arrival_estimate,
             save_next_day_plot=save_prediction_plot,
             load_ecmwf_overlay=_load_dashboard_ecmwf,
+            refresh_day_after_tomorrow=lambda **kwargs: refresh_d2(
+                args=args, db_path=db_path, out_dir=out_dir, model_artifact_dir=model_artifact_dir, **kwargs),
         )
         return
 
@@ -9403,6 +9643,10 @@ def main() -> None:
             test_now_local_hour=args.test_now_local_hour,
         )
 
+    from next_day_wind_model.day_after_tomorrow import safe_stage as run_d2_stage, artifact_inputs
+    d2_state = run_d2_stage(args=args, db_path=db_path, out_dir=out_dir,
+                          model_artifact_dir=model_artifact_dir, training=not args.skip_training,
+                          prediction=True, log=not is_test_mode)
     web_publish = None
     git_publish = {"enabled": bool(args.git_auto_push_pages), "pushed": False, "reason": "disabled"}
     if not is_test_mode and publication_allowed:
@@ -9488,6 +9732,10 @@ def main() -> None:
             )
             gate_eval_history_png_src = gate_eval_history_png
         web_publish = publish_web_dashboard(
+            day_after_tomorrow_state=d2_state,
+            day_after_tomorrow_assets=artifact_inputs(out_dir, d2_state),
+            **current_day_gate_assets(out_dir, intraday_gate_eval_details_csv_src, intraday_model_selection_report,
+                                      reference_artifact_dir=getattr(args, "current_day_gate_artifact_dir", None)),
             web_out_dir=Path(args.web_out_dir),
             local_tz=args.local_timezone,
             web_refresh_seconds=args.web_refresh_seconds,

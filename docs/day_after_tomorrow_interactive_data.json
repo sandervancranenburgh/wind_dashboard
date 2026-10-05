@@ -3,8 +3,8 @@
   "timezone": "Europe/Amsterdam",
   "metadata": {
     "status": "available",
-    "issue_time_utc": "2026-10-05T05:00:00+00:00",
-    "target_date": "2026-10-07",
+    "issue_time_utc": "2026-10-04T05:00:00+00:00",
+    "target_date": "2026-10-06",
     "available_hours": 1,
     "expected_hours": 15,
     "champions": {
@@ -25,76 +25,38 @@
     },
     "experimental": true,
     "calibration_policy": "none",
-    "harmonie_fetched_at_utc": "2026-10-04T20:54:05.697000+00:00",
-    "ecmwf": {
-      "available": true,
-      "reason": null,
-      "run_identity": "2026-10-04T18:00:00Z|2026-10-05T00:33:31.637444Z",
-      "run_time_utc": "2026-10-04T18:00:00Z",
-      "completed_time_utc": "2026-10-05T00:33:31.637444Z",
-      "last_fetch_utc": "2026-10-05T00:33:31.637444Z",
-      "next_expected_run_utc": "2026-10-05T00:00:00Z",
-      "next_expected_fetch_utc": "2026-10-05T07:10:43.834006Z",
-      "arrival_estimate_method": "median_recent_complete_run_latency",
-      "arrival_sample_count": 12,
-      "arrival_latency_hours": [
-        6.558788178888889,
-        7.811776756666667,
-        6.5548306330555555,
-        7.804127491111111,
-        6.554919540833334,
-        7.805032848055555,
-        6.558462708333333,
-        7.803379202777778,
-        6.557437040833333,
-        7.79889738,
-        6.558317924444444,
-        7.812789835277778
-      ],
-      "estimated_latency_hours": 7.1788427794444445,
-      "information_cutoff_utc": "2026-10-05T05:05:58.574996Z",
-      "database_open_mode": "read-only/query-only",
-      "rows_loaded": 7,
-      "metadata_line": "Last ECMWF fetch: 02:33 - Next expected fetch: ~09:10",
-      "model_version": "50r1",
-      "resolution": "0.25 degrees",
-      "source": "ecmwf_open_data",
-      "selected_grid": [
-        52.25,
-        4.5
-      ]
-    }
+    "harmonie_fetched_at_utc": "2026-10-03T20:54:04.997000+00:00"
   },
   "rows": [
     {
-      "target_time_utc": "2026-10-07 06:00:00+00:00",
-      "target_time_local": "2026-10-07 08:00:00+02:00",
-      "forecast_wind_speed": 5.0,
-      "forecast_wind_min": 5.0,
-      "forecast_wind_max": 8.0,
-      "lstm_pred_wind_speed": 3.0257494,
-      "forecast_wind_dir_deg": 69.0,
-      "lstm_pred_wind_dir_deg": 60.371044,
-      "forecast_temperature_c": 14.6,
-      "weather_code": 1.0,
+      "target_time_utc": "2026-10-06 06:00:00+00:00",
+      "target_time_local": "2026-10-06 08:00:00+02:00",
+      "forecast_wind_speed": 4.0,
+      "forecast_wind_min": 4.0,
+      "forecast_wind_max": 7.0,
+      "lstm_pred_wind_speed": 3.7434094,
+      "forecast_wind_dir_deg": 186.0,
+      "lstm_pred_wind_dir_deg": 178.92311,
+      "forecast_temperature_c": 16.0,
+      "weather_code": 3.0,
       "weather_source": "windsurfice",
       "is_daylight": 1,
       "hour_utc": 6,
       "hour_local": 8,
-      "delta_speed_lstm_minus_forecast": -1.9742506,
-      "delta_dir_lstm_minus_forecast": -8.628952,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "delta_speed_lstm_minus_forecast": -0.2565906,
+      "delta_dir_lstm_minus_forecast": -7.076889,
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 1,
-      "harmonie_run_ts": 1791147245697.0,
-      "harmonie_fetched_ts": 1791147245697.0,
+      "harmonie_run_ts": 1791060844997.0,
+      "harmonie_fetched_ts": 1791060844997.0,
       "speed_model_id": "20261003080000_af4b4f24_speed",
       "direction_model_id": "20261003080000_af4b4f24_direction",
       "calibration_policy": "none",
-      "weather_description": "Mainly clear"
+      "weather_description": "Overcast"
     },
     {
-      "target_time_utc": "2026-10-07 07:00:00+00:00",
-      "target_time_local": "2026-10-07 09:00:00+02:00",
+      "target_time_utc": "2026-10-06 07:00:00+00:00",
+      "target_time_local": "2026-10-06 09:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -109,7 +71,7 @@
       "hour_local": 9,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -119,8 +81,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 08:00:00+00:00",
-      "target_time_local": "2026-10-07 10:00:00+02:00",
+      "target_time_utc": "2026-10-06 08:00:00+00:00",
+      "target_time_local": "2026-10-06 10:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -135,7 +97,7 @@
       "hour_local": 10,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -145,8 +107,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 09:00:00+00:00",
-      "target_time_local": "2026-10-07 11:00:00+02:00",
+      "target_time_utc": "2026-10-06 09:00:00+00:00",
+      "target_time_local": "2026-10-06 11:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -161,7 +123,7 @@
       "hour_local": 11,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -171,8 +133,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 10:00:00+00:00",
-      "target_time_local": "2026-10-07 12:00:00+02:00",
+      "target_time_utc": "2026-10-06 10:00:00+00:00",
+      "target_time_local": "2026-10-06 12:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -187,7 +149,7 @@
       "hour_local": 12,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -197,8 +159,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 11:00:00+00:00",
-      "target_time_local": "2026-10-07 13:00:00+02:00",
+      "target_time_utc": "2026-10-06 11:00:00+00:00",
+      "target_time_local": "2026-10-06 13:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -213,7 +175,7 @@
       "hour_local": 13,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -223,8 +185,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 12:00:00+00:00",
-      "target_time_local": "2026-10-07 14:00:00+02:00",
+      "target_time_utc": "2026-10-06 12:00:00+00:00",
+      "target_time_local": "2026-10-06 14:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -239,7 +201,7 @@
       "hour_local": 14,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -249,8 +211,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 13:00:00+00:00",
-      "target_time_local": "2026-10-07 15:00:00+02:00",
+      "target_time_utc": "2026-10-06 13:00:00+00:00",
+      "target_time_local": "2026-10-06 15:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -265,7 +227,7 @@
       "hour_local": 15,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -275,8 +237,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 14:00:00+00:00",
-      "target_time_local": "2026-10-07 16:00:00+02:00",
+      "target_time_utc": "2026-10-06 14:00:00+00:00",
+      "target_time_local": "2026-10-06 16:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -291,7 +253,7 @@
       "hour_local": 16,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -301,8 +263,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 15:00:00+00:00",
-      "target_time_local": "2026-10-07 17:00:00+02:00",
+      "target_time_utc": "2026-10-06 15:00:00+00:00",
+      "target_time_local": "2026-10-06 17:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -317,7 +279,7 @@
       "hour_local": 17,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -327,8 +289,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 16:00:00+00:00",
-      "target_time_local": "2026-10-07 18:00:00+02:00",
+      "target_time_utc": "2026-10-06 16:00:00+00:00",
+      "target_time_local": "2026-10-06 18:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -343,7 +305,7 @@
       "hour_local": 18,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -353,8 +315,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 17:00:00+00:00",
-      "target_time_local": "2026-10-07 19:00:00+02:00",
+      "target_time_utc": "2026-10-06 17:00:00+00:00",
+      "target_time_local": "2026-10-06 19:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -369,7 +331,7 @@
       "hour_local": 19,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -379,8 +341,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 18:00:00+00:00",
-      "target_time_local": "2026-10-07 20:00:00+02:00",
+      "target_time_utc": "2026-10-06 18:00:00+00:00",
+      "target_time_local": "2026-10-06 20:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -395,7 +357,7 @@
       "hour_local": 20,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -405,8 +367,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 19:00:00+00:00",
-      "target_time_local": "2026-10-07 21:00:00+02:00",
+      "target_time_utc": "2026-10-06 19:00:00+00:00",
+      "target_time_local": "2026-10-06 21:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -421,7 +383,7 @@
       "hour_local": 21,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -431,8 +393,8 @@
       "weather_description": null
     },
     {
-      "target_time_utc": "2026-10-07 20:00:00+00:00",
-      "target_time_local": "2026-10-07 22:00:00+02:00",
+      "target_time_utc": "2026-10-06 20:00:00+00:00",
+      "target_time_local": "2026-10-06 22:00:00+02:00",
       "forecast_wind_speed": null,
       "forecast_wind_min": null,
       "forecast_wind_max": null,
@@ -447,7 +409,7 @@
       "hour_local": 22,
       "delta_speed_lstm_minus_forecast": null,
       "delta_dir_lstm_minus_forecast": null,
-      "issue_time_utc": "2026-10-05T05:00:00+00:00",
+      "issue_time_utc": "2026-10-04T05:00:00+00:00",
       "forecast_available": 0,
       "harmonie_run_ts": null,
       "harmonie_fetched_ts": null,
@@ -459,39 +421,39 @@
   ],
   "ecmwf": [
     {
-      "time_utc": "2026-10-07 03:00:00+00:00",
-      "time_local": "2026-10-07 05:00:00+02:00",
-      "wind_speed_knots": 2.9276847585884127
+      "time_utc": "2026-10-06 03:00:00+00:00",
+      "time_local": "2026-10-06 05:00:00+02:00",
+      "wind_speed_knots": 5.699128158503149
     },
     {
-      "time_utc": "2026-10-07 06:00:00+00:00",
-      "time_local": "2026-10-07 08:00:00+02:00",
-      "wind_speed_knots": 2.5870591279470747
+      "time_utc": "2026-10-06 06:00:00+00:00",
+      "time_local": "2026-10-06 08:00:00+02:00",
+      "wind_speed_knots": 3.0714374210184174
     },
     {
-      "time_utc": "2026-10-07 09:00:00+00:00",
-      "time_local": "2026-10-07 11:00:00+02:00",
-      "wind_speed_knots": 2.636050055361486
+      "time_utc": "2026-10-06 09:00:00+00:00",
+      "time_local": "2026-10-06 11:00:00+02:00",
+      "wind_speed_knots": 2.308176926080128
     },
     {
-      "time_utc": "2026-10-07 12:00:00+00:00",
-      "time_local": "2026-10-07 14:00:00+02:00",
-      "wind_speed_knots": 1.373939385419947
+      "time_utc": "2026-10-06 12:00:00+00:00",
+      "time_local": "2026-10-06 14:00:00+02:00",
+      "wind_speed_knots": 4.021404866596658
     },
     {
-      "time_utc": "2026-10-07 15:00:00+00:00",
-      "time_local": "2026-10-07 17:00:00+02:00",
-      "wind_speed_knots": 6.036178436238101
+      "time_utc": "2026-10-06 15:00:00+00:00",
+      "time_local": "2026-10-06 17:00:00+02:00",
+      "wind_speed_knots": 5.4743736645938785
     },
     {
-      "time_utc": "2026-10-07 18:00:00+00:00",
-      "time_local": "2026-10-07 20:00:00+02:00",
-      "wind_speed_knots": 5.487850202415052
+      "time_utc": "2026-10-06 18:00:00+00:00",
+      "time_local": "2026-10-06 20:00:00+02:00",
+      "wind_speed_knots": 1.8912916646155609
     },
     {
-      "time_utc": "2026-10-07 21:00:00+00:00",
-      "time_local": "2026-10-07 23:00:00+02:00",
-      "wind_speed_knots": 7.77171139637935
+      "time_utc": "2026-10-06 21:00:00+00:00",
+      "time_local": "2026-10-06 23:00:00+02:00",
+      "wind_speed_knots": 2.8684266182374167
     }
   ]
 }

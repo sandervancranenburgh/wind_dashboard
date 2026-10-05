@@ -25,7 +25,45 @@
     },
     "experimental": true,
     "calibration_policy": "none",
-    "harmonie_fetched_at_utc": "2026-10-05T08:54:01.991000+00:00"
+    "harmonie_fetched_at_utc": "2026-10-05T08:54:01.991000+00:00",
+    "ecmwf": {
+      "available": true,
+      "reason": null,
+      "run_identity": "2026-10-05T00:00:00Z|2026-10-05T07:48:28.606746Z",
+      "run_time_utc": "2026-10-05T00:00:00Z",
+      "completed_time_utc": "2026-10-05T07:48:28.606746Z",
+      "last_fetch_utc": "2026-10-05T07:48:28.606746Z",
+      "next_expected_run_utc": "2026-10-05T06:00:00Z",
+      "next_expected_fetch_utc": "2026-10-05T13:10:43.834006Z",
+      "arrival_estimate_method": "median_recent_complete_run_latency",
+      "arrival_sample_count": 12,
+      "arrival_latency_hours": [
+        7.807946318333333,
+        6.558788178888889,
+        7.811776756666667,
+        6.5548306330555555,
+        7.804127491111111,
+        6.554919540833334,
+        7.805032848055555,
+        6.558462708333333,
+        7.803379202777778,
+        6.557437040833333,
+        7.79889738,
+        6.558317924444444
+      ],
+      "estimated_latency_hours": 7.1788427794444445,
+      "information_cutoff_utc": "2026-10-05T09:40:52.828505Z",
+      "database_open_mode": "read-only/query-only",
+      "rows_loaded": 7,
+      "metadata_line": "Last ECMWF fetch: 09:48 - Next expected fetch: ~15:10",
+      "model_version": "50r1",
+      "resolution": "0.25 degrees",
+      "source": "ecmwf_open_data",
+      "selected_grid": [
+        52.25,
+        4.5
+      ]
+    }
   },
   "rows": [
     {

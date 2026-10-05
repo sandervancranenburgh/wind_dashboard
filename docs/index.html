@@ -80,7 +80,7 @@
       <h1>Super local wind prediction</h1>
       <p class="development-status"># Under development #</p>
       <p class="spot-line"><span>Spot:</span> <strong data-dashboard-spot>Valkenburgse Meer</strong></p>
-      <p class="meta" data-dashboard-version="2026-10-05T11:54:12.126226+00:00">Last updated: 05 October 2026 13:54:12 CEST</p>
+      <p class="meta" data-dashboard-version="2026-10-05T12:05:08.557494+00:00">Last updated: 05 October 2026 14:05:08 CEST</p>
     </div>
 
     <nav class="dashboard-actions" aria-label="Dashboard actions">
@@ -107,15 +107,15 @@
                 data-controls-id="current-day-interactive-controls"
                 data-details-id="current-day-interactive-details"
                 data-fallback-id="current-day-fallback"
-                data-json-url="current_day_interactive_data.json?v=1791201252126226"
+                data-json-url="current_day_interactive_data.json?v=1791201908"
             >
                 <div class="interactive-controls" id="current-day-interactive-controls"></div>
                 <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="current-day-fallback">
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1791201252126226" data-static-refresh-src="current_day_predictions_mobile.png">
-        <img src="current_day_predictions.png?v=1791201252126226" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1791201908" data-static-refresh-src="current_day_predictions_mobile.png">
+        <img src="current_day_predictions.png?v=1791201908" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
@@ -128,29 +128,29 @@
                 data-controls-id="next-day-interactive-controls"
                 data-details-id="next-day-interactive-details"
                 data-fallback-id="next-day-fallback"
-                data-json-url="next_day_interactive_data.json?v=1791200470"
+                data-json-url="next_day_interactive_data.json?v=1791201908"
             >
                 <div class="interactive-controls" id="next-day-interactive-controls"></div>
                 <div class="interactive-plot" id="next-day-interactive-plot" aria-label="Interactive next-day wind plot"></div>
                 <div class="interactive-point-details" id="next-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="next-day-fallback">
-        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1791200470">
-        <img src="next_day_predictions.png?v=1791200470" alt="Next day prediction">
+        <source media="(max-width: 768px)" srcset="next_day_predictions_mobile.png?v=1791201908">
+        <img src="next_day_predictions.png?v=1791201908" alt="Next day prediction">
       </picture>
     </div>
 <section class="card"><h2>Day-after-tomorrow prediction · experimental</h2>
-        <p class="desc" id="day-after-tomorrow-status">Experimental · available · issued 05 Oct 2026 13:00 CEST · target 2026-10-07 08:00–22:00 · HARMONIE available for 15 of 15 forecast hours. Missing hours remain gaps. Speed calibration disabled; historical results informed this choice. New-date confirmation pending.</p><div class="interactive-block" data-interactive-wind-block="true"
+        <p class="desc" id="day-after-tomorrow-status">Experimental · available · issued 05 Oct 2026 14:00 CEST · target 2026-10-07 08:00–22:00 · HARMONIE available for 15 of 15 forecast hours. Missing hours remain gaps. Speed calibration disabled; historical results informed this choice. New-date confirmation pending.</p><div class="interactive-block" data-interactive-wind-block="true"
              data-plot-id="day-after-tomorrow-interactive-plot" data-controls-id="day-after-tomorrow-interactive-controls"
              data-details-id="day-after-tomorrow-interactive-details" data-fallback-id="day-after-tomorrow-fallback"
-             data-json-url="day_after_tomorrow_interactive_data.json?v=1791200470">
+             data-json-url="day_after_tomorrow_interactive_data.json?v=1791201908">
           <div class="interactive-controls" id="day-after-tomorrow-interactive-controls"></div>
           <div class="interactive-plot" id="day-after-tomorrow-interactive-plot" aria-label="Interactive day-after-tomorrow wind plot"></div>
           <div class="interactive-point-details" id="day-after-tomorrow-interactive-details">Click a plotted point to view exact values.</div>
         </div>
         <picture id="day-after-tomorrow-fallback">
-          <source media="(max-width:768px)" srcset="day_after_tomorrow_predictions_mobile.png?v=1791200470">
-          <img src="day_after_tomorrow_predictions.png?v=1791200470" alt="Experimental day-after-tomorrow forecast">
+          <source media="(max-width:768px)" srcset="day_after_tomorrow_predictions_mobile.png?v=1791201908">
+          <img src="day_after_tomorrow_predictions.png?v=1791201908" alt="Experimental day-after-tomorrow forecast">
         </picture></section>
 <section class="card"><h2 class="section-title"><a href="evaluation.html">How much better are the super local forecasts?</a></h2></section>
 
@@ -164,7 +164,7 @@
   </p>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
     
-    <script src="dashboard_refresh.js?v=1791200470" defer></script>
+    <script src="dashboard_refresh.js?v=1791201908" defer></script>
     <script>
         window.addEventListener("DOMContentLoaded", function () {
             if (window.WindDashboardInteractive && typeof window.WindDashboardInteractive.initInteractiveWindDashboard === "function") {
@@ -173,7 +173,7 @@
             if (window.WindDashboardRefresh && typeof window.WindDashboardRefresh.createController === "function") {
                 window.__windDashboardRefresh = window.WindDashboardRefresh.createController({
                     metadataUrl: "metadata_update.json",
-                    currentVersion: "2026-10-05T11:54:12.126226+00:00",
+                    currentVersion: "2026-10-05T12:05:08.557494+00:00",
                     minimumIntervalMs: 300000,
                     pollIntervalMs: 900000,
                     refreshButton: document.getElementById("dashboard-refresh")

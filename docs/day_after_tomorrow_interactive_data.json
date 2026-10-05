@@ -2,7 +2,7 @@
   "plot_kind": "next_day",
   "timezone": "Europe/Amsterdam",
   "metadata": {
-    "status": "available",
+    "status": "stale",
     "issue_time_utc": "2026-10-05T05:00:00+00:00",
     "target_date": "2026-10-07",
     "available_hours": 1,
@@ -52,7 +52,7 @@
         7.812789835277778
       ],
       "estimated_latency_hours": 7.1788427794444445,
-      "information_cutoff_utc": "2026-10-05T05:05:58.574996Z",
+      "information_cutoff_utc": "2026-10-05T05:12:10.874677Z",
       "database_open_mode": "read-only/query-only",
       "rows_loaded": 7,
       "metadata_line": "Last ECMWF fetch: 02:33 - Next expected fetch: ~09:10",
@@ -63,7 +63,8 @@
         52.25,
         4.5
       ]
-    }
+    },
+    "reason": "D+2 champion was not available at this issue cutoff"
   },
   "rows": [
     {

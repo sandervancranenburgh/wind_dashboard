@@ -79,7 +79,7 @@
          style="grid-template-columns:repeat(2,minmax(0,1fr))">
       <a class="button primary dashboard-action" style="height:44px" href="index.html">Forecasts</a>
       <a class="button primary dashboard-action" style="height:44px" href="https://portal-cityailab.tbm.tudelft.nl/">Rider portal</a>
-    </nav><p class="meta">Last updated: 05 October 2026 09:41:06 CEST</p><div class="grid">
+    </nav><p class="meta">Last updated: 05 October 2026 10:05:04 CEST</p><div class="grid">
     <section class="card performance-section">
       <h2 class="section-title">How much better are the super local forecasts?</h2>
 
@@ -89,7 +89,7 @@
         <p class="desc">The spider diagram compares realised current-day forecast error by forecast wind direction; lower values are better. Super local improves most for E, NE, SE, S winds; the largest gain is 1.8 kts for E. For that sector the super-local model is close to unbiased on average. The advantage is smallest, or negative, for SW, N, NW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="current_day_direction_spider.png?v=1791186066" alt="Current-day prediction performance by wind direction">
+        <img src="current_day_direction_spider.png?v=1791187504" alt="Current-day prediction performance by wind direction">
       </div>
     </div>
 
@@ -99,21 +99,21 @@
         <p class="desc">The spider diagram compares mean absolute error by forecast wind direction; lower values are better. The next-day champion improves most for E, NE, SE, NW winds. The advantage is smallest for SW winds.</p>
       </div>
       <div class="direction-plot">
-        <img src="model_gate_direction_spider.png?v=1791186066" alt="Next-day prediction performance by wind direction">
+        <img src="model_gate_direction_spider.png?v=1791187504" alt="Next-day prediction performance by wind direction">
       </div>
     </div>
-    <div class="direction-card"><div class="direction-copy"><h3>Day-after-tomorrow performance by wind direction · experimental</h3><p class="desc">The spider compares speed MAE by HARMONIE forecast direction; lower values are better. Overlapping forecasts are averaged per target hour before scoring. Evaluation targets: 2026-08-21–2026-10-04. Target-hour average MAE: D+2 1.72 knots; HARMONIE 2.03 knots.  Largest gains: E, SE, NE. HARMONIE performs better for N, W, NW. Evaluated active model: 20261005050000_83f1ade7_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p></div><div class="direction-plot"><img src="day_after_tomorrow_direction_spider.png?v=1791186066" alt="Day-after-tomorrow performance by wind direction · experimental"></div></div></section><section class="card"><h2>Current-day model-gate evaluation history</h2>
+    <div class="direction-card"><div class="direction-copy"><h3>Day-after-tomorrow performance by wind direction · experimental</h3><p class="desc">The spider compares speed MAE by HARMONIE forecast direction; lower values are better. Overlapping forecasts are averaged per target hour before scoring. Evaluation targets: 2026-08-21–2026-10-04. Target-hour average MAE: D+2 1.72 knots; HARMONIE 2.03 knots.  Largest gains: E, SE, NE. HARMONIE performs better for N, W, NW. Evaluated active model: 20261005050000_83f1ade7_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p></div><div class="direction-plot"><img src="day_after_tomorrow_direction_spider.png?v=1791187504" alt="Day-after-tomorrow performance by wind direction · experimental"></div></div></section><section class="card"><h2>Current-day model-gate evaluation history</h2>
         <p class="desc">Aligned current-day holdout predictions and absolute errors, using the existing operational gate evaluation. Evaluation targets: 2026-08-20T12:00:00+00:00–2026-10-05T05:00:00+00:00. Champion: 20260814-0723; challenger: 20261005-0721.</p>
-        <img src="current_day_model_gate_eval_history.png?v=1791186066" alt="Current-day model-gate evaluation history"></section>
+        <img src="current_day_model_gate_eval_history.png?v=1791187504" alt="Current-day model-gate evaluation history"></section>
     <div class="card">
       <h2>Next-day model-gate evaluation history</h2>
       <p class="desc">Top panel shows the holdout wind-speed comparison used by the model gate, including the aligned Harmonie baseline from the same holdout forecast inputs. Bottom panel shows the corresponding MAE comparison for Harmonie, challenger, and champion.</p>
-      <img src="model_gate_eval_history.png?v=1791186066" alt="Model gate evaluation history">
-    </div><section class="card"><h2>Day-after-tomorrow model-gate evaluation history</h2><p class="desc">Aligned holdout wind speeds above; absolute errors below. Grey: HARMONIE; blue: challenger; orange: prior champion; magenta: observations. Evaluation targets: 2026-08-21–2026-10-04. Promotion requires a 1% MAE improvement over the dedicated champion on identical available targets. Challenger speed MAE: 1.82 knots; HARMONIE: 2.20 knots. The challenger improves on HARMONIE on this holdout. Champion: 20261003080000_af4b4f24_speed; challenger: 20261005050000_83f1ade7_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p><img src="day_after_tomorrow_model_gate_eval_history.png?v=1791186066" alt="Day-after-tomorrow model-gate evaluation history"></section></div>
-    <script src="dashboard_refresh.js?v=1791186066" defer></script><script>
+      <img src="model_gate_eval_history.png?v=1791187504" alt="Model gate evaluation history">
+    </div><section class="card"><h2>Day-after-tomorrow model-gate evaluation history</h2><p class="desc">Aligned holdout wind speeds above; absolute errors below. Grey: HARMONIE; blue: challenger; orange: prior champion; magenta: observations. Evaluation targets: 2026-08-21–2026-10-04. Promotion requires a 1% MAE improvement over the dedicated champion on identical available targets. Challenger speed MAE: 1.82 knots; HARMONIE: 2.20 knots. The challenger improves on HARMONIE on this holdout. Champion: 20261003080000_af4b4f24_speed; challenger: 20261005050000_83f1ade7_speed. Speed calibration disabled. These historical results informed the choice; confirmation on 20 new dates is pending.</p><img src="day_after_tomorrow_model_gate_eval_history.png?v=1791187504" alt="Day-after-tomorrow model-gate evaluation history"></section></div>
+    <script src="dashboard_refresh.js?v=1791187504" defer></script><script>
     window.addEventListener("DOMContentLoaded", function () {
       if (window.WindDashboardRefresh) window.WindDashboardRefresh.createController({
-        metadataUrl:"metadata_update.json", currentVersion:"2026-10-05T07:54:12.616768+00:00",
+        metadataUrl:"metadata_update.json", currentVersion:"2026-10-05T08:05:04.180016+00:00",
         minimumIntervalMs:300000, pollIntervalMs:900000
       }).start();
     });</script></body></html>

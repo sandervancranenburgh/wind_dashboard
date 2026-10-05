@@ -1,16 +1,16 @@
 {
-  "status": "stale",
-  "issue_time_utc": "2026-10-05T05:00:00+00:00",
+  "status": "available",
+  "issue_time_utc": "2026-10-05T06:00:00+00:00",
   "target_date": "2026-10-07",
-  "available_hours": 1,
+  "available_hours": 10,
   "expected_hours": 15,
   "champions": {
     "speed": {
-      "checkpoint": "candidates/20261003080000_af4b4f24_speed.pt",
-      "model_id": "20261003080000_af4b4f24_speed",
-      "trained_at_utc": "2026-10-03T08:00:00+00:00",
+      "checkpoint": "candidates/20261005050000_83f1ade7_speed.pt",
+      "model_id": "20261005050000_83f1ade7_speed",
+      "trained_at_utc": "2026-10-05T05:00:00+00:00",
       "calibration_policy": "none",
-      "available_at_utc": "2026-10-03T08:45:02.482108+00:00"
+      "available_at_utc": "2026-10-05T05:28:28.108711+00:00"
     },
     "direction": {
       "checkpoint": "candidates/20261003080000_af4b4f24_direction.pt",
@@ -22,7 +22,7 @@
   },
   "experimental": true,
   "calibration_policy": "none",
-  "harmonie_fetched_at_utc": "2026-10-04T20:54:05.697000+00:00",
+  "harmonie_fetched_at_utc": "2026-10-05T05:54:05.484000+00:00",
   "ecmwf": {
     "available": true,
     "reason": null,
@@ -49,7 +49,7 @@
       7.812789835277778
     ],
     "estimated_latency_hours": 7.1788427794444445,
-    "information_cutoff_utc": "2026-10-05T05:54:10.150415Z",
+    "information_cutoff_utc": "2026-10-05T06:04:42.714489Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 7,
     "metadata_line": "Last ECMWF fetch: 02:33 - Next expected fetch: ~09:10",
@@ -60,6 +60,5 @@
       52.25,
       4.5
     ]
-  },
-  "reason": "D+2 champion was not available at this issue cutoff"
+  }
 }

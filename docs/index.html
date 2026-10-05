@@ -80,7 +80,7 @@
       <h1>Super local wind prediction</h1>
       <p class="development-status"># Under development #</p>
       <p class="spot-line"><span>Spot:</span> <strong data-dashboard-spot>Valkenburgse Meer</strong></p>
-      <p class="meta" data-dashboard-version="2026-10-05T07:42:07.962911+00:00">Last updated: 05 October 2026 09:42:07 CEST</p>
+      <p class="meta" data-dashboard-version="2026-10-05T07:48:08.146079+00:00">Last updated: 05 October 2026 09:48:08 CEST</p>
     </div>
 
     <nav class="dashboard-actions" aria-label="Dashboard actions">
@@ -107,15 +107,15 @@
                 data-controls-id="current-day-interactive-controls"
                 data-details-id="current-day-interactive-details"
                 data-fallback-id="current-day-fallback"
-                data-json-url="current_day_interactive_data.json?v=1791186127962911"
+                data-json-url="current_day_interactive_data.json?v=1791186488146079"
             >
                 <div class="interactive-controls" id="current-day-interactive-controls"></div>
                 <div class="interactive-plot" id="current-day-interactive-plot" aria-label="Interactive current-day wind plot"></div>
                 <div class="interactive-point-details" id="current-day-interactive-details">Click a plotted point to view exact values.</div>
             </div>
             <picture id="current-day-fallback">
-        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1791186127962911" data-static-refresh-src="current_day_predictions_mobile.png">
-        <img src="current_day_predictions.png?v=1791186127962911" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
+        <source media="(max-width: 768px)" srcset="current_day_predictions_mobile.png?v=1791186488146079" data-static-refresh-src="current_day_predictions_mobile.png">
+        <img src="current_day_predictions.png?v=1791186488146079" data-static-refresh-src="current_day_predictions.png" alt="Current day prediction">
       </picture>
     </div>
     <div class="card">
@@ -173,7 +173,7 @@
             if (window.WindDashboardRefresh && typeof window.WindDashboardRefresh.createController === "function") {
                 window.__windDashboardRefresh = window.WindDashboardRefresh.createController({
                     metadataUrl: "metadata_update.json",
-                    currentVersion: "2026-10-05T07:42:07.962911+00:00",
+                    currentVersion: "2026-10-05T07:48:08.146079+00:00",
                     minimumIntervalMs: 300000,
                     pollIntervalMs: 900000,
                     refreshButton: document.getElementById("dashboard-refresh")

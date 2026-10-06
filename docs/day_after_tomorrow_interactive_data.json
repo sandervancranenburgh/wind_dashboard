@@ -52,7 +52,7 @@
         7.803379202777778
       ],
       "estimated_latency_hours": 7.181724799444444,
-      "information_cutoff_utc": "2026-10-06T07:42:07.977850Z",
+      "information_cutoff_utc": "2026-10-06T07:48:10.504719Z",
       "database_open_mode": "read-only/query-only",
       "rows_loaded": 7,
       "metadata_line": "Last ECMWF fetch: 02:33 - Next expected fetch: ~15:10",
@@ -461,37 +461,37 @@
     {
       "time_utc": "2026-10-08 03:00:00+00:00",
       "time_local": "2026-10-08 05:00:00+02:00",
-      "wind_speed_knots": 14.347924567599232
+      "wind_speed_knots": 16.367046849203305
     },
     {
       "time_utc": "2026-10-08 06:00:00+00:00",
       "time_local": "2026-10-08 08:00:00+02:00",
-      "wind_speed_knots": 15.357681133820847
+      "wind_speed_knots": 13.883094959950459
     },
     {
       "time_utc": "2026-10-08 09:00:00+00:00",
       "time_local": "2026-10-08 11:00:00+02:00",
-      "wind_speed_knots": 14.148541999390053
+      "wind_speed_knots": 12.710172272592377
     },
     {
       "time_utc": "2026-10-08 12:00:00+00:00",
       "time_local": "2026-10-08 14:00:00+02:00",
-      "wind_speed_knots": 12.968520174878261
+      "wind_speed_knots": 14.216465130826577
     },
     {
       "time_utc": "2026-10-08 15:00:00+00:00",
       "time_local": "2026-10-08 17:00:00+02:00",
-      "wind_speed_knots": 12.624253555823879
+      "wind_speed_knots": 12.559187119323344
     },
     {
       "time_utc": "2026-10-08 18:00:00+00:00",
       "time_local": "2026-10-08 20:00:00+02:00",
-      "wind_speed_knots": 11.39397679889142
+      "wind_speed_knots": 10.838012781977739
     },
     {
       "time_utc": "2026-10-08 21:00:00+00:00",
       "time_local": "2026-10-08 23:00:00+02:00",
-      "wind_speed_knots": 9.10165323238032
+      "wind_speed_knots": 10.234962655829476
     }
   ]
 }

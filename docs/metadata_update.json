@@ -1,25 +1,40 @@
 {
   "day_after_tomorrow": {
+    "status": "available",
+    "issue_time_utc": "2026-10-06T14:00:00+00:00",
+    "target_date": "2026-10-08",
     "available_hours": 15,
-    "calibration_policy": "none",
+    "expected_hours": 15,
     "champions": {
-      "direction": {
-        "available_at_utc": "2026-10-03T08:45:02.482108+00:00",
-        "calibration_policy": "none",
-        "checkpoint": "candidates/20261003080000_af4b4f24_direction.pt",
-        "model_id": "20261003080000_af4b4f24_direction",
-        "trained_at_utc": "2026-10-03T08:00:00+00:00"
-      },
       "speed": {
-        "available_at_utc": "2026-10-06T05:28:49.056523+00:00",
-        "calibration_policy": "none",
         "checkpoint": "candidates/20261006050000_3bbcbf40_speed.pt",
         "model_id": "20261006050000_3bbcbf40_speed",
-        "trained_at_utc": "2026-10-06T05:00:00+00:00"
+        "trained_at_utc": "2026-10-06T05:00:00+00:00",
+        "calibration_policy": "none",
+        "available_at_utc": "2026-10-06T05:28:49.056523+00:00"
+      },
+      "direction": {
+        "checkpoint": "candidates/20261003080000_af4b4f24_direction.pt",
+        "model_id": "20261003080000_af4b4f24_direction",
+        "trained_at_utc": "2026-10-03T08:00:00+00:00",
+        "calibration_policy": "none",
+        "available_at_utc": "2026-10-03T08:45:02.482108+00:00"
       }
     },
+    "experimental": true,
+    "calibration_policy": "none",
+    "harmonie_fetched_at_utc": "2026-10-06T13:54:05.151000+00:00",
     "ecmwf": {
+      "available": true,
+      "reason": null,
+      "run_identity": "2026-10-06T06:00:00Z|2026-10-06T12:33:26.513350Z",
+      "run_time_utc": "2026-10-06T06:00:00Z",
+      "completed_time_utc": "2026-10-06T12:33:26.513350Z",
+      "last_fetch_utc": "2026-10-06T12:33:26.513350Z",
+      "next_expected_run_utc": "2026-10-06T12:00:00Z",
+      "next_expected_fetch_utc": "2026-10-06T19:10:55.556197Z",
       "arrival_estimate_method": "median_recent_complete_run_latency",
+      "arrival_sample_count": 12,
       "arrival_latency_hours": [
         6.5573648194444445,
         7.810042816666666,
@@ -34,37 +49,33 @@
         6.554919540833334,
         7.805032848055555
       ],
-      "arrival_sample_count": 12,
-      "available": true,
-      "completed_time_utc": "2026-10-06T12:33:26.513350Z",
-      "database_open_mode": "read-only/query-only",
       "estimated_latency_hours": 7.182098943611111,
-      "information_cutoff_utc": "2026-10-06T14:36:10.932037Z",
-      "last_fetch_utc": "2026-10-06T12:33:26.513350Z",
+      "information_cutoff_utc": "2026-10-06T14:46:32.984845Z",
+      "database_open_mode": "read-only/query-only",
+      "rows_loaded": 7,
       "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~21:10",
       "model_version": "50r1",
-      "next_expected_fetch_utc": "2026-10-06T19:10:55.556197Z",
-      "next_expected_run_utc": "2026-10-06T12:00:00Z",
-      "reason": null,
       "resolution": "0.25 degrees",
-      "rows_loaded": 7,
-      "run_identity": "2026-10-06T06:00:00Z|2026-10-06T12:33:26.513350Z",
-      "run_time_utc": "2026-10-06T06:00:00Z",
+      "source": "ecmwf_open_data",
       "selected_grid": [
         52.25,
         4.5
-      ],
-      "source": "ecmwf_open_data"
-    },
-    "expected_hours": 15,
-    "experimental": true,
-    "harmonie_fetched_at_utc": "2026-10-06T13:54:05.151000+00:00",
-    "issue_time_utc": "2026-10-06T14:00:00+00:00",
-    "status": "available",
-    "target_date": "2026-10-08"
+      ]
+    }
   },
+  "static_plot_generated_at_utc": "2026-10-06T14:47:11.312983+00:00",
+  "plot_updated_at_utc": "2026-10-06T14:42:32.476304+00:00",
   "ecmwf": {
+    "available": true,
+    "reason": null,
+    "run_identity": "2026-10-06T06:00:00Z|2026-10-06T12:33:26.513350Z",
+    "run_time_utc": "2026-10-06T06:00:00Z",
+    "completed_time_utc": "2026-10-06T12:33:26.513350Z",
+    "last_fetch_utc": "2026-10-06T12:33:26.513350Z",
+    "next_expected_run_utc": "2026-10-06T12:00:00Z",
+    "next_expected_fetch_utc": "2026-10-06T19:10:55.556197Z",
     "arrival_estimate_method": "median_recent_complete_run_latency",
+    "arrival_sample_count": 12,
     "arrival_latency_hours": [
       6.5573648194444445,
       7.810042816666666,
@@ -79,36 +90,30 @@
       6.554919540833334,
       7.805032848055555
     ],
-    "arrival_sample_count": 12,
-    "available": true,
-    "completed_time_utc": "2026-10-06T12:33:26.513350Z",
-    "database_open_mode": "read-only/query-only",
     "estimated_latency_hours": 7.182098943611111,
-    "information_cutoff_utc": "2026-10-06T14:36:08.427748Z",
-    "last_fetch_utc": "2026-10-06T12:33:26.513350Z",
+    "information_cutoff_utc": "2026-10-06T14:42:32.476304Z",
+    "database_open_mode": "read-only/query-only",
+    "rows_loaded": 16,
     "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~21:10",
     "model_version": "50r1",
-    "next_expected_fetch_utc": "2026-10-06T19:10:55.556197Z",
-    "next_expected_run_utc": "2026-10-06T12:00:00Z",
-    "reason": null,
     "resolution": "0.25 degrees",
-    "rows_loaded": 16,
-    "run_identity": "2026-10-06T06:00:00Z|2026-10-06T12:33:26.513350Z",
-    "run_time_utc": "2026-10-06T06:00:00Z",
+    "source": "ecmwf_open_data",
     "selected_grid": [
       52.25,
       4.5
-    ],
-    "source": "ecmwf_open_data"
+    ]
   },
-  "ecmwf_arrival_estimate_method": "median_recent_complete_run_latency",
+  "ecmwf_run_time_utc": "2026-10-06T06:00:00Z",
   "ecmwf_last_fetch_utc": "2026-10-06T12:33:26.513350Z",
   "ecmwf_next_expected_fetch_utc": "2026-10-06T19:10:55.556197Z",
-  "ecmwf_run_time_utc": "2026-10-06T06:00:00Z",
-  "generated_at_utc": "2026-10-06T14:36:12.221921+00:00",
+  "ecmwf_arrival_estimate_method": "median_recent_complete_run_latency",
+  "prediction_generated_at_utc": "2026-10-06T14:42:14.123735+00:00",
+  "prediction_updated_at_utc": "2026-10-06T14:42:32.476292+00:00",
+  "harmonie_fetched_at_utc": "2026-10-06 14:42:06.698000+00:00",
+  "harmonie_time_kind": "fetched",
+  "harmonie_expected_next_at_utc": "2026-10-06 15:36:06.460000+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
-    "2026-10-05T06:36:06.680000+00:00",
     "2026-10-05T07:36:04.527000+00:00",
     "2026-10-05T08:36:07.502000+00:00",
     "2026-10-05T09:36:04.176000+00:00",
@@ -131,29 +136,14 @@
     "2026-10-06T10:36:06.405000+00:00",
     "2026-10-06T11:36:06.599000+00:00",
     "2026-10-06T12:36:06.928000+00:00",
-    "2026-10-06T13:36:06.130000+00:00"
+    "2026-10-06T13:36:06.130000+00:00",
+    "2026-10-06T14:42:06.698000+00:00"
   ],
   "harmonie_arrival_sample_count": 24,
-  "harmonie_expected_next_at_utc": "2026-10-06 14:36:06.460000+00:00",
-  "harmonie_fetched_at_utc": "2026-10-06 13:36:06.130000+00:00",
-  "harmonie_time_kind": "fetched",
-  "harmonie_update_interval_minutes": 60,
-  "interactive_json": [
-    "current_day_interactive_data.json",
-    "day_after_tomorrow_interactive_data.json",
-    "next_day_interactive_data.json"
-  ],
-  "latest_observation_time_utc": "2026-10-06T14:34:10+00:00",
-  "measured_only_update": true,
-  "model_last_trained_at_utc": "2026-09-12T05:25:17.609879+00:00",
-  "pages": [
-    "index.html",
-    "evaluation.html"
-  ],
   "plot_update_interval_minutes": 6,
-  "plot_updated_at_utc": "2026-10-06T14:36:08.427748+00:00",
-  "prediction_generated_at_utc": "2026-10-06T14:00:12.130090+00:00",
-  "prediction_updated_at_utc": "2026-10-06T14:00:31.625835+00:00",
+  "harmonie_update_interval_minutes": 60,
+  "model_last_trained_at_utc": "2026-09-12T05:25:17.609879+00:00",
+  "generated_at_utc": "2026-10-06T14:47:11.312983+00:00",
   "static_images": [
     "current_day_direction_spider.png",
     "current_day_model_gate_eval_history.png",
@@ -170,5 +160,13 @@
     "next_day_predictions.png",
     "next_day_predictions_mobile.png"
   ],
-  "static_plot_generated_at_utc": "2026-10-06T14:36:12.221921+00:00"
+  "interactive_json": [
+    "current_day_interactive_data.json",
+    "day_after_tomorrow_interactive_data.json",
+    "next_day_interactive_data.json"
+  ],
+  "pages": [
+    "index.html",
+    "evaluation.html"
+  ]
 }

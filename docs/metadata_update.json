@@ -65,8 +65,8 @@
     "reason": "D+2 champion was not available at this issue cutoff",
     "last_error": "D+2 champion was not available at this issue cutoff"
   },
-  "static_plot_generated_at_utc": "2026-10-06T05:35:46.338549+00:00",
-  "plot_updated_at_utc": "2026-10-06T05:31:35.721047+00:00",
+  "static_plot_generated_at_utc": "2026-10-06T05:40:48.616202+00:00",
+  "plot_updated_at_utc": "2026-10-06T05:36:36.554286+00:00",
   "ecmwf": {
     "available": true,
     "reason": null,
@@ -93,7 +93,7 @@
       7.803379202777778
     ],
     "estimated_latency_hours": 7.181724799444444,
-    "information_cutoff_utc": "2026-10-06T05:31:35.721047Z",
+    "information_cutoff_utc": "2026-10-06T05:36:36.554286Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 18,
     "metadata_line": "Last ECMWF fetch: 02:33 - Next expected fetch: ~09:10",
@@ -109,14 +109,13 @@
   "ecmwf_last_fetch_utc": "2026-10-06T00:33:36.253426Z",
   "ecmwf_next_expected_fetch_utc": "2026-10-06T07:10:54.209278Z",
   "ecmwf_arrival_estimate_method": "median_recent_complete_run_latency",
-  "prediction_generated_at_utc": "2026-10-06T05:30:20.670214+00:00",
-  "prediction_updated_at_utc": "2026-10-06T05:31:35.721034+00:00",
-  "harmonie_fetched_at_utc": "2026-10-05 20:36:06.463000+00:00",
+  "prediction_generated_at_utc": "2026-10-06T05:36:15.040559+00:00",
+  "prediction_updated_at_utc": "2026-10-06T05:36:36.554273+00:00",
+  "harmonie_fetched_at_utc": "2026-10-06 05:36:06.271000+00:00",
   "harmonie_time_kind": "fetched",
   "harmonie_expected_next_at_utc": "2026-10-06 06:36:06.439000+00:00",
   "harmonie_arrival_estimate_method": "median_recent_arrival_phase",
   "harmonie_arrival_history_utc": [
-    "2026-10-04T13:36:06.252000+00:00",
     "2026-10-04T14:42:06.345000+00:00",
     "2026-10-04T15:42:03.858000+00:00",
     "2026-10-04T16:42:06.462000+00:00",
@@ -139,13 +138,14 @@
     "2026-10-05T17:36:06.467000+00:00",
     "2026-10-05T18:36:06.457000+00:00",
     "2026-10-05T19:36:06.130000+00:00",
-    "2026-10-05T20:36:06.463000+00:00"
+    "2026-10-05T20:36:06.463000+00:00",
+    "2026-10-06T05:36:06.271000+00:00"
   ],
   "harmonie_arrival_sample_count": 24,
   "plot_update_interval_minutes": 6,
   "harmonie_update_interval_minutes": 60,
   "model_last_trained_at_utc": "2026-09-12T05:25:17.609879+00:00",
-  "generated_at_utc": "2026-10-06T05:35:46.338549+00:00",
+  "generated_at_utc": "2026-10-06T05:40:48.616202+00:00",
   "static_images": [
     "current_day_direction_spider.png",
     "current_day_model_gate_eval_history.png",

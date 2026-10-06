@@ -1,6 +1,6 @@
 {
   "status": "available",
-  "issue_time_utc": "2026-10-06T14:00:00+00:00",
+  "issue_time_utc": "2026-10-06T15:00:00+00:00",
   "target_date": "2026-10-08",
   "available_hours": 15,
   "expected_hours": 15,
@@ -22,7 +22,7 @@
   },
   "experimental": true,
   "calibration_policy": "none",
-  "harmonie_fetched_at_utc": "2026-10-06T13:54:05.151000+00:00",
+  "harmonie_fetched_at_utc": "2026-10-06T14:54:01.900000+00:00",
   "ecmwf": {
     "available": true,
     "reason": null,
@@ -49,7 +49,7 @@
       7.805032848055555
     ],
     "estimated_latency_hours": 7.182098943611111,
-    "information_cutoff_utc": "2026-10-06T14:54:07.435025Z",
+    "information_cutoff_utc": "2026-10-06T15:04:33.480901Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 7,
     "metadata_line": "Last ECMWF fetch: 14:33 - Next expected fetch: ~21:10",

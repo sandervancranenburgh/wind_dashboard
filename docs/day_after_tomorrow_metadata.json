@@ -30,8 +30,8 @@
     "run_time_utc": "2026-10-08T18:00:00Z",
     "completed_time_utc": "2026-10-09T00:32:57.783525Z",
     "last_fetch_utc": "2026-10-09T00:32:57.783525Z",
-    "next_expected_run_utc": "2026-10-09T00:00:00Z",
-    "next_expected_fetch_utc": "2026-10-09T07:10:44.702931Z",
+    "next_expected_run_utc": "2026-10-09T06:00:00Z",
+    "next_expected_fetch_utc": "2026-10-09T13:10:44.702931Z",
     "arrival_estimate_method": "median_recent_complete_run_latency",
     "arrival_sample_count": 12,
     "arrival_latency_hours": [
@@ -49,10 +49,10 @@
       7.810042816666666
     ],
     "estimated_latency_hours": 7.179084147499999,
-    "information_cutoff_utc": "2026-10-09T07:06:44.199903Z",
+    "information_cutoff_utc": "2026-10-09T07:12:10.312380Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 7,
-    "metadata_line": "Last ECMWF fetch: 02:32 - Next expected fetch: ~09:10",
+    "metadata_line": "Last ECMWF fetch: 02:32 - Next expected fetch: ~15:10",
     "model_version": "50r1",
     "resolution": "0.25 degrees",
     "source": "ecmwf_open_data",

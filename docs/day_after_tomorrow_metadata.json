@@ -49,7 +49,7 @@
       6.558482884166667
     ],
     "estimated_latency_hours": 7.180926379583333,
-    "information_cutoff_utc": "2026-10-15T08:12:10.650059Z",
+    "information_cutoff_utc": "2026-10-15T08:18:10.233048Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 7,
     "metadata_line": "Last ECMWF fetch: 09:48 - Next expected fetch: ~15:10",

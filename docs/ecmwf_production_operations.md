@@ -23,7 +23,45 @@ The normal six-minute updater gate reads one scalar ECMWF identity (`run_time|co
 
 `Last ECMWF fetch` is the selected run's recorded completion time. `Next expected fetch` starts with the next six-hour IFS cycle and adds the median completion latency of up to the 12 most recent successful runs. At least four valid observations are required; otherwise the configured eight-hour delay is used. Six-hour cycles are advanced until the estimate is later than the plot cutoff, so the displayed expectation is normally in the future.
 
-ECMWF is a solid `#007f7f` wind-speed line at width 1.9 on both plots. It is excluded from axes, MAE, direction, and variability calculations. The current-day renderer includes the first native point after the unchanged x-axis maximum so matplotlib clips the final native segment at the existing boundary.
+ECMWF is a solid `#007f7f` wind-speed line at width 1.9 on both plots. It is excluded from the forecast plots' axes, inline MAE, direction, and variability calculations. The separate evaluation page includes ECMWF speed MAE as described below. The current-day renderer includes the first native point after the unchanged x-axis maximum so matplotlib clips the final native segment at the existing boundary.
+
+## Direction-sector MAE on the evaluation page
+
+The current-day, next-day, and D+2 windroses include a teal ECMWF speed-MAE
+curve. Each chart retains the existing HARMONIE and Super local results and
+uses HARMONIE forecast directions for all eight sectors. ECMWF coverage starts
+later, so its own target dates and sample counts appear beside each chart.
+The curves therefore do not necessarily cover identical historical weather.
+
+`next_day_wind_model/ecmwf_evaluation.py` opens the archive read-only and
+selects the newest complete IFS run whose run and completion timestamps are
+no later than each original issue time. Exact points and both interpolation
+brackets must also have been fetched by that issue. Scalar wind speed is
+linearly interpolated between native points no more than three hours apart,
+then converted to knots. There is no extrapolation, gap filling from older
+vintages, or dependency on gust availability. This matches the dashboard's
+piecewise-linear speed curve; the D+2 model-feature helper continues to use
+its existing vector interpolation.
+
+Current-day evaluation retains the first logged issue per anchor/target and
+scores each case separately. Next-day uses the historical holdout anchor;
+D+2 uses its stored issue time. Next-day and D+2 average available ECMWF
+forecasts per target hour before scoring. The new issue-level CSVs preserve
+run/completion provenance and reasons for missing ECMWF values. Sector CSVs
+add `ecmwf_mae`, bias, scored-case and distinct-target-hour counts, UTC coverage
+bounds, and `ecmwf_report_version`. Legend MAEs use each model's own counts.
+Missing sectors stay at their true compass positions and leave line gaps;
+values above 3.5 knots are annotated at the radial limit.
+
+Full evaluations refresh these reports. Lightweight refreshes reuse them;
+old current-day reports are migrated once when a cached dashboard is rebuilt.
+Old D+2 reports can be rebuilt from `gate_predictions.csv` during a full or
+prediction stage without fitting. Old next-day target-averaged exports lack
+issue times: the next normal full gate evaluation writes the new issue CSV
+and ECMWF results. No extra model training or database migration is needed.
+Missing or unreadable archives produce a newly generated two-model report,
+replacing any prior ECMWF values. ECMWF does not enter learned production
+features or model-promotion decisions.
 
 ## Installation and persistence
 

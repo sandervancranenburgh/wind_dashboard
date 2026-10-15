@@ -126,7 +126,7 @@ def historical_samples(db: Path, cutoff: pd.Timestamp, artifact: Path):
     return samples
 
 
-def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2, calibration_policy="none", availability_clock=None):
+def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42, minimum=60, margin=1., constraint_eps=.2, calibration_policy="none", availability_clock=None, ecmwf_archive_db=None):
     from next_day_wind_model import day_after_tomorrow_core as core
     from next_day_wind_model.update_model_and_predict import (
         append_model_gate_eval_history, save_model_gate_eval_history_plot)
@@ -195,6 +195,8 @@ def train(samples, cutoff, artifact: Path, *, epochs=30, batch_size=32, seed=42,
     rows = pd.DataFrame(core.prediction_rows(gate, selected["speed"], selected_fits["speed"], "operational_gate", selected["direction"]))
     rows["speed_model_id"] = new_state["speed"]["model_id"]
     rows["direction_model_id"] = new_state["direction"]["model_id"]
+    from next_day_wind_model.ecmwf_evaluation import attach_ecmwf
+    rows = attach_ecmwf(rows, ecmwf_archive_db, site=SITE)
     rows.to_csv(artifact / "gate_predictions.csv", index=False)
     summary["date_bootstrap"] = core.bootstrap(rows[rows.scorable], "prediction", "harmonie")
     core.export_direction_performance(rows, artifact)
@@ -476,11 +478,22 @@ def run_stage(*, args, db_path: Path, out_dir: Path, model_artifact_dir: Path,
                       seed=getattr(args, "seed", 42), minimum=args.challenge_min_eval_samples,
                       margin=args.promotion_margin_pct, constraint_eps=getattr(args, "speed_constraint_eps", .2),
                       calibration_policy=getattr(args, "day_after_tomorrow_calibration", "none"),
-                      availability_clock=(lambda: datetime.now(timezone.utc)) if live_clock else None)
+                      availability_clock=(lambda: datetime.now(timezone.utc)) if live_clock else None,
+                      ecmwf_archive_db=getattr(args, "ecmwf_archive_db", None))
             except Exception as exc:
                 # Keep active champions and previous successful evaluation intact.
                 write_json(artifact / "last_training_attempt.json", {"status": "failed", "at": now.isoformat(), "reason": str(exc)})
                 error = str(exc)
+        if training or prediction:
+            from next_day_wind_model.ecmwf_evaluation import attach_ecmwf, report_is_current
+            report = artifact / f"{PREFIX}_speed_by_direction.csv"
+            saved_issues = artifact / "gate_predictions.csv"
+            if saved_issues.exists() and not report_is_current(report):
+                from next_day_wind_model import day_after_tomorrow_core as core
+                rows = attach_ecmwf(pd.read_csv(saved_issues),
+                    getattr(args, "ecmwf_archive_db", None), site=SITE)
+                rows.to_csv(saved_issues, index=False)
+                core.export_direction_performance(rows, artifact)
         if prediction and 7 <= issue.tz_convert(TZ).hour <= 22:
             sample, table, metadata = infer(db_path, issue, artifact, out_dir)
             if log:

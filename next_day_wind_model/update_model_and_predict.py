@@ -55,6 +55,10 @@ from next_day_wind_model.ecmwf_dashboard import (
     ECMWF_FORECAST_LINEWIDTH,
     load_ecmwf_plot_data,
 )
+from next_day_wind_model.ecmwf_evaluation import (
+    attach_ecmwf, add_sector_metrics, coverage_text, report_is_current,
+)
+from next_day_wind_model.direction_performance_plot import save_direction_plot
 from next_day_wind_model.site_registry import display_name, load_site_registry
 from next_day_wind_model.site_paths import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -6440,6 +6444,80 @@ def _direction_performance_summary_text(direction_csv: Path | None) -> str:
     return " ".join(parts)
 
 
+def save_next_day_direction_evaluation(raw_eval: pd.DataFrame, out_dir: Path,
+                                       stamp: str, *, site: str,
+                                       ecmwf_archive_db: Path | None = None) -> dict:
+    """Persist original issue contexts before target-hour aggregation."""
+    details_dir = out_dir / "model_gate_eval_details"
+    details_dir.mkdir(parents=True, exist_ok=True)
+    gate_eval_details_csv = details_dir / f"{stamp}_model_gate_eval_speed.csv"
+    raw_eval = raw_eval.dropna(subset=["target_time_utc"])
+    raw_eval = attach_ecmwf(raw_eval, ecmwf_archive_db, site=site)
+    issue_details_csv = details_dir / f"{stamp}_model_gate_eval_issues.csv"
+    raw_eval.to_csv(issue_details_csv, index=False)
+    agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
+    direction_by_target = raw_eval.groupby("target_time_utc")["forecast_wind_dir_deg"].agg(
+        _circular_mean_deg
+    )
+    agg_eval["forecast_wind_dir_deg"] = agg_eval["target_time_utc"].map(direction_by_target)
+    agg_eval["n_overlaps"] = raw_eval.groupby("target_time_utc").size().to_numpy()
+    agg_eval["abs_err_forecast"] = np.abs(agg_eval["forecast_wind_speed"] - agg_eval["actual_wind_speed"])
+    agg_eval["abs_err_challenger"] = np.abs(agg_eval["challenger_wind_speed"] - agg_eval["actual_wind_speed"])
+    agg_eval["abs_err_champion"] = np.abs(agg_eval["champion_wind_speed"] - agg_eval["actual_wind_speed"])
+    sector_labels = np.array(["N", "NE", "E", "SE", "S", "SW", "W", "NW"], dtype=object)
+    sector_idx = (
+        np.floor(((agg_eval["forecast_wind_dir_deg"].to_numpy(dtype=float) % 360.0) + 22.5) / 45.0)
+        .astype(int)
+        % 8
+    )
+    agg_eval["forecast_wind_dir_sector"] = sector_labels[sector_idx]
+    direction_rows: list[dict] = []
+    for sector_name, sector_frame in agg_eval.groupby("forecast_wind_dir_sector", sort=False):
+        actual_vals = sector_frame["actual_wind_speed"].to_numpy(dtype=float)
+        forecast_vals = sector_frame["forecast_wind_speed"].to_numpy(dtype=float)
+        challenger_vals = sector_frame["challenger_wind_speed"].to_numpy(dtype=float)
+        champion_vals = sector_frame["champion_wind_speed"].to_numpy(dtype=float)
+        direction_rows.append(
+            {
+                "sector": str(sector_name),
+                "n_points": int(len(sector_frame)),
+                "forecast_mae": float(np.mean(np.abs(forecast_vals - actual_vals))),
+                "forecast_bias_pred_minus_actual": float(np.mean(forecast_vals - actual_vals)),
+                "challenger_mae": float(np.mean(np.abs(challenger_vals - actual_vals))),
+                "challenger_bias_pred_minus_actual": float(np.mean(challenger_vals - actual_vals)),
+                "champion_mae": float(np.mean(np.abs(champion_vals - actual_vals))),
+                "champion_bias_pred_minus_actual": float(np.mean(champion_vals - actual_vals)),
+                "champion_mae_gain_vs_forecast": float(
+                    np.mean(np.abs(forecast_vals - actual_vals))
+                    - np.mean(np.abs(champion_vals - actual_vals))
+                ),
+                "challenger_mae_gain_vs_forecast": float(
+                    np.mean(np.abs(forecast_vals - actual_vals))
+                    - np.mean(np.abs(challenger_vals - actual_vals))
+                ),
+                "challenger_mae_gain_vs_champion": float(
+                    np.mean(np.abs(champion_vals - actual_vals))
+                    - np.mean(np.abs(challenger_vals - actual_vals))
+                ),
+            }
+        )
+    gate_eval_direction_csv = details_dir / f"{stamp}_model_gate_eval_speed_by_direction.csv"
+    gate_eval_direction_stable_csv = out_dir / "model_gate_eval_speed_by_direction.csv"
+    direction_frame = add_sector_metrics(pd.DataFrame(direction_rows),
+        raw_eval.rename(columns={"actual_wind_speed": "actual"}),
+        agg_eval.set_index("target_time_utc").forecast_wind_dir_sector)
+    direction_frame.to_csv(gate_eval_direction_csv, index=False)
+    direction_frame.to_csv(gate_eval_direction_stable_csv, index=False)
+    agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    agg_eval.to_csv(gate_eval_details_csv, index=False)
+    return {"speed_eval_details_csv": str(gate_eval_details_csv),
+            "speed_eval_direction_csv": str(gate_eval_direction_csv),
+            "speed_eval_direction_stable_csv": str(gate_eval_direction_stable_csv),
+            "speed_eval_issues_csv": str(issue_details_csv)}
+
+
 def save_wind_direction_performance_spider_plot(
     direction_csv: Path,
     plot_png: Path,
@@ -6448,95 +6526,18 @@ def save_wind_direction_performance_spider_plot(
     title: str = "MAE for next-day models by forecast wind direction",
     annotate_overflow: bool = False,
 ) -> None:
-    if not direction_csv.exists():
-        return
-    df = pd.read_csv(direction_csv)
-    required = {"sector", "forecast_mae", "champion_mae"}
-    if df.empty or not required.issubset(df.columns):
-        return
-    order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    df = df.copy()
-    for col in ["forecast_mae", "champion_mae"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "n_points" in df.columns:
-        df["n_points"] = pd.to_numeric(df["n_points"], errors="coerce")
-    df["sector"] = df["sector"].astype(str)
-    df = df.set_index("sector").reindex(order).dropna(subset=["forecast_mae", "champion_mae"])
-    if len(df) < 3:
-        return
-
-    labels = df.index.to_list()
-    harmonie = df["forecast_mae"].to_numpy(dtype=float)
-    champion = df["champion_mae"].to_numpy(dtype=float)
-    weights = df["n_points"].to_numpy(dtype=float) if "n_points" in df.columns else np.ones(len(df), dtype=float)
-    if np.isnan(weights).any() or float(np.nansum(weights)) <= 0.0:
-        weights = np.ones(len(df), dtype=float)
-    harmonie_mae = float(np.average(harmonie, weights=weights))
-    champion_mae = float(np.average(champion, weights=weights))
-    angles = np.array([order.index(label) * np.pi / 4 for label in labels])
-    angles_closed = np.r_[angles, angles[0]]
-    harmonie_closed = np.r_[harmonie, harmonie[0]]
-    champion_closed = np.r_[champion, champion[0]]
-
-    fig = plt.figure(figsize=(7.4, 7.0))
-    ax = fig.add_subplot(111, projection="polar")
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.plot(
-        angles_closed,
-        harmonie_closed,
-        color="#777777",
-        linewidth=2.0,
-        marker="o",
-        markersize=4,
-        label=f"Harmonie ({harmonie_mae:.2f} kts)",
-    )
-    ax.plot(
-        angles_closed,
-        champion_closed,
-        color="#f28e2b",
-        linewidth=2.3,
-        marker="o",
-        markersize=4,
-        label=f"{model_label} ({champion_mae:.2f} kts)",
-    )
-    ax.set_xticks(angles)
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_ylim(0.0, 3.5)
-    if annotate_overflow:
-        for values, color in [(harmonie, "#777777"), (champion, "#f28e2b")]:
-            for angle, value in zip(angles, values):
-                if value > 3.5:
-                    ax.scatter([angle], [3.5], marker="^", color=color, s=35, clip_on=False)
-                    ax.annotate(f"{value:.2f}", (angle, 3.5), xytext=(0, 9), textcoords="offset points",
-                                color=color, fontsize=9, ha="center", clip_on=False)
-    ax.set_rlabel_position(225)
-    ax.tick_params(axis="y", labelsize=9)
-    ax.grid(color="#d7d7d7", linewidth=0.8)
-    ax.spines["polar"].set_color("#cfcfcf")
-    ax.set_title(title, pad=22, fontsize=14, fontweight="bold")
-    ax.text(
-        0.5,
-        -0.08,
-        "Lower radial value means lower mean absolute error (kts).",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=10,
-        color="#444444",
-    )
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=1, frameon=False, fontsize=10)
-    fig.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.18)
-    fig.savefig(plot_png, dpi=150, bbox_inches="tight", pad_inches=0.25)
-    plt.close(fig)
+    save_direction_plot(direction_csv, plot_png, model_column="champion_mae",
+                        model_label=model_label, title=title)
 
 
 def save_current_day_direction_performance_csv(
     db_path: Path,
     cfg: DatasetConfig,
     direction_csv: Path,
+    ecmwf_archive_db: Path | None = None,
 ) -> Path | None:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only=ON")
     try:
         rows = pd.read_sql_query(
             """
@@ -6659,7 +6660,13 @@ def save_current_day_direction_performance_csv(
             }
         )
 
-    pd.DataFrame(summary_rows, columns=columns).to_csv(direction_csv, index=False)
+    rows["issue_time_utc"] = pd.to_datetime(rows.issued_ts, unit="ms", utc=True)
+    rows["target_time_utc"] = pd.to_datetime(rows.target_ts, unit="ms", utc=True)
+    rows["actual"] = rows.actual_value
+    rows = attach_ecmwf(rows, ecmwf_archive_db, site=cfg.site)
+    rows.to_csv(direction_csv.with_name("current_day_direction_eval_issues.csv"), index=False)
+    summary = add_sector_metrics(pd.DataFrame(summary_rows, columns=columns), rows)
+    summary.to_csv(direction_csv, index=False)
     return direction_csv
 
 
@@ -6729,81 +6736,9 @@ def _current_day_direction_performance_summary_text(direction_csv: Path | None) 
 
 
 def save_current_day_direction_performance_spider_plot(direction_csv: Path, plot_png: Path) -> None:
-    if not direction_csv.exists():
-        return
-    df = pd.read_csv(direction_csv)
-    required = {"sector", "forecast_mae", "superlocal_mae"}
-    if df.empty or not required.issubset(df.columns):
-        return
-    order = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    df = df.copy()
-    for col in ["forecast_mae", "superlocal_mae"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "n_points" in df.columns:
-        df["n_points"] = pd.to_numeric(df["n_points"], errors="coerce")
-    df["sector"] = df["sector"].astype(str)
-    df = df.set_index("sector").reindex(order).dropna(subset=["forecast_mae", "superlocal_mae"])
-    if len(df) < 3:
-        return
-
-    labels = df.index.to_list()
-    harmonie = df["forecast_mae"].to_numpy(dtype=float)
-    superlocal = df["superlocal_mae"].to_numpy(dtype=float)
-    weights = df["n_points"].to_numpy(dtype=float) if "n_points" in df.columns else np.ones(len(df), dtype=float)
-    if np.isnan(weights).any() or float(np.nansum(weights)) <= 0.0:
-        weights = np.ones(len(df), dtype=float)
-    harmonie_mae = float(np.average(harmonie, weights=weights))
-    superlocal_mae = float(np.average(superlocal, weights=weights))
-    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
-    angles_closed = np.r_[angles, angles[0]]
-    harmonie_closed = np.r_[harmonie, harmonie[0]]
-    superlocal_closed = np.r_[superlocal, superlocal[0]]
-
-    fig = plt.figure(figsize=(7.4, 7.0))
-    ax = fig.add_subplot(111, projection="polar")
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-    ax.plot(
-        angles_closed,
-        harmonie_closed,
-        color="#777777",
-        linewidth=2.0,
-        marker="o",
-        markersize=4,
-        label=f"Harmonie ({harmonie_mae:.2f} kts)",
-    )
-    ax.plot(
-        angles_closed,
-        superlocal_closed,
-        color="#f28e2b",
-        linewidth=2.3,
-        marker="o",
-        markersize=4,
-        label=f"Super local champion model current-day ({superlocal_mae:.2f} kts)",
-    )
-    ax.set_xticks(angles)
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_ylim(0.0, 3.5)
-    ax.set_rlabel_position(225)
-    ax.tick_params(axis="y", labelsize=9)
-    ax.grid(color="#d7d7d7", linewidth=0.8)
-    ax.spines["polar"].set_color("#cfcfcf")
-    ax.set_title("MAE for current-day models by forecast wind direction", pad=22, fontsize=14, fontweight="bold")
-    ax.text(
-        0.5,
-        -0.08,
-        "Lower radial value means lower mean absolute error (kts).",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=10,
-        color="#444444",
-    )
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=1, frameon=False, fontsize=10)
-    fig.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.18)
-    plot_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(plot_png, dpi=150, bbox_inches="tight", pad_inches=0.25)
-    plt.close(fig)
+    save_direction_plot(direction_csv, plot_png, model_column="superlocal_mae",
+        model_label="Super local champion model current-day",
+        title="MAE for current-day models by forecast wind direction")
 
 
 def _json_ready_scalar(value):
@@ -7269,7 +7204,7 @@ def publish_web_dashboard(
     direction_spider_row = ""
     if "model_gate_direction_spider.png" in copied:
         direction_spider_src = f"model_gate_direction_spider.png?v={cache_bust}"
-        direction_text = _direction_performance_summary_text(direction_spider_csv)
+        direction_text = _direction_performance_summary_text(direction_spider_csv) + " " + coverage_text(direction_spider_csv)
         direction_spider_row = f"""
       <div class="direction-card">
       <div class="direction-copy">
@@ -7285,7 +7220,7 @@ def publish_web_dashboard(
         current_day_direction_spider_src = f"current_day_direction_spider.png?v={cache_bust}"
         current_day_direction_text = _current_day_direction_performance_summary_text(
             current_day_direction_spider_csv
-        )
+        ) + " " + coverage_text(current_day_direction_spider_csv)
         current_day_direction_spider_row = f"""
       <div class="direction-card">
       <div class="direction-copy">
@@ -7834,12 +7769,12 @@ def run_dashboard_stage_from_cached_artifacts(
     current_day_direction_spider_png_src: Path | None = None
     current_day_direction_csv = out_dir / "current_day_eval_speed_by_direction.csv"
     current_day_direction_spider_png = out_dir / "current_day_direction_spider.png"
-    if current_day_direction_csv.exists():
+    if report_is_current(current_day_direction_csv):
         current_day_direction_csv_src = current_day_direction_csv
         save_current_day_direction_performance_spider_plot(current_day_direction_csv, current_day_direction_spider_png)
     elif db_path.exists() and not is_test_mode:
         try:
-            if save_current_day_direction_performance_csv(db_path=db_path, cfg=cfg, direction_csv=current_day_direction_csv):
+            if save_current_day_direction_performance_csv(db_path=db_path, cfg=cfg, direction_csv=current_day_direction_csv, ecmwf_archive_db=Path(args.ecmwf_archive_db)):
                 current_day_direction_csv_src = current_day_direction_csv
                 save_current_day_direction_performance_spider_plot(current_day_direction_csv, current_day_direction_spider_png)
         except Exception as exc:
@@ -8950,8 +8885,6 @@ def main() -> None:
             details_dir = out_dir / "model_gate_eval_details"
             details_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            gate_eval_details_csv = details_dir / f"{stamp}_model_gate_eval_speed.csv"
-
             target_times_utc = pd.to_datetime(
                 np.asarray(speed_arrays_full["target_times_all"][speed_eval_start:]).reshape(-1),
                 errors="coerce",
@@ -8959,6 +8892,7 @@ def main() -> None:
             )
             raw_eval = pd.DataFrame(
                 {
+                    "issue_time_utc": np.repeat(speed_eval_anchor_times_utc, horizon),
                     "target_time_utc": target_times_utc,
                     "actual_wind_speed": speed_actual_eval.reshape(-1).astype(float),
                     "forecast_wind_speed": speed_forecast_eval.reshape(-1).astype(float),
@@ -8967,67 +8901,11 @@ def main() -> None:
                     "champion_wind_speed": champion_speed_eval_pred.reshape(-1).astype(float),
                 }
             )
-            raw_eval = raw_eval.dropna(subset=["target_time_utc"])
-            agg_eval = raw_eval.groupby("target_time_utc", as_index=False).mean(numeric_only=True)
-            direction_by_target = raw_eval.groupby("target_time_utc")["forecast_wind_dir_deg"].agg(
-                _circular_mean_deg
-            )
-            agg_eval["forecast_wind_dir_deg"] = agg_eval["target_time_utc"].map(direction_by_target)
-            agg_eval["n_overlaps"] = raw_eval.groupby("target_time_utc").size().to_numpy()
-            agg_eval["abs_err_forecast"] = np.abs(agg_eval["forecast_wind_speed"] - agg_eval["actual_wind_speed"])
-            agg_eval["abs_err_challenger"] = np.abs(agg_eval["challenger_wind_speed"] - agg_eval["actual_wind_speed"])
-            agg_eval["abs_err_champion"] = np.abs(agg_eval["champion_wind_speed"] - agg_eval["actual_wind_speed"])
-            sector_labels = np.array(["N", "NE", "E", "SE", "S", "SW", "W", "NW"], dtype=object)
-            sector_idx = (
-                np.floor(((agg_eval["forecast_wind_dir_deg"].to_numpy(dtype=float) % 360.0) + 22.5) / 45.0)
-                .astype(int)
-                % 8
-            )
-            agg_eval["forecast_wind_dir_sector"] = sector_labels[sector_idx]
-            direction_rows: list[dict] = []
-            for sector_name, sector_frame in agg_eval.groupby("forecast_wind_dir_sector", sort=False):
-                actual_vals = sector_frame["actual_wind_speed"].to_numpy(dtype=float)
-                forecast_vals = sector_frame["forecast_wind_speed"].to_numpy(dtype=float)
-                challenger_vals = sector_frame["challenger_wind_speed"].to_numpy(dtype=float)
-                champion_vals = sector_frame["champion_wind_speed"].to_numpy(dtype=float)
-                direction_rows.append(
-                    {
-                        "sector": str(sector_name),
-                        "n_points": int(len(sector_frame)),
-                        "forecast_mae": float(np.mean(np.abs(forecast_vals - actual_vals))),
-                        "forecast_bias_pred_minus_actual": float(np.mean(forecast_vals - actual_vals)),
-                        "challenger_mae": float(np.mean(np.abs(challenger_vals - actual_vals))),
-                        "challenger_bias_pred_minus_actual": float(np.mean(challenger_vals - actual_vals)),
-                        "champion_mae": float(np.mean(np.abs(champion_vals - actual_vals))),
-                        "champion_bias_pred_minus_actual": float(np.mean(champion_vals - actual_vals)),
-                        "champion_mae_gain_vs_forecast": float(
-                            np.mean(np.abs(forecast_vals - actual_vals))
-                            - np.mean(np.abs(champion_vals - actual_vals))
-                        ),
-                        "challenger_mae_gain_vs_forecast": float(
-                            np.mean(np.abs(forecast_vals - actual_vals))
-                            - np.mean(np.abs(challenger_vals - actual_vals))
-                        ),
-                        "challenger_mae_gain_vs_champion": float(
-                            np.mean(np.abs(champion_vals - actual_vals))
-                            - np.mean(np.abs(challenger_vals - actual_vals))
-                        ),
-                    }
-                )
-            gate_eval_direction_csv = details_dir / f"{stamp}_model_gate_eval_speed_by_direction.csv"
-            gate_eval_direction_stable_csv = out_dir / "model_gate_eval_speed_by_direction.csv"
-            direction_frame = pd.DataFrame(direction_rows)
-            direction_frame.to_csv(gate_eval_direction_csv, index=False)
-            direction_frame.to_csv(gate_eval_direction_stable_csv, index=False)
-            agg_eval["target_time_utc"] = pd.to_datetime(agg_eval["target_time_utc"], utc=True).dt.strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-            agg_eval.to_csv(gate_eval_details_csv, index=False)
-            gate_eval_details_csv_src = gate_eval_details_csv
-            gate_eval_direction_csv_src = gate_eval_direction_stable_csv
-            model_selection_report["speed_eval_details_csv"] = str(gate_eval_details_csv)
-            model_selection_report["speed_eval_direction_csv"] = str(gate_eval_direction_csv)
-            model_selection_report["speed_eval_direction_stable_csv"] = str(gate_eval_direction_stable_csv)
+            evaluation_paths = save_next_day_direction_evaluation(raw_eval, out_dir, stamp,
+                site=cfg.site, ecmwf_archive_db=Path(args.ecmwf_archive_db))
+            model_selection_report.update(evaluation_paths)
+            gate_eval_details_csv_src = Path(evaluation_paths["speed_eval_details_csv"])
+            gate_eval_direction_csv_src = Path(evaluation_paths["speed_eval_direction_stable_csv"])
 
         intraday_challenger_extra = {
             "artifact_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -9488,6 +9366,7 @@ def main() -> None:
             db_path=db_path,
             cfg=cfg,
             direction_csv=current_day_direction_csv,
+            ecmwf_archive_db=Path(args.ecmwf_archive_db),
         ):
             current_day_direction_csv_src = current_day_direction_csv
             save_current_day_direction_performance_spider_plot(

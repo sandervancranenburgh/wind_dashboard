@@ -2,6 +2,7 @@
 import html
 import pandas as pd
 from next_day_wind_model.day_after_tomorrow import PREFIX, status_text
+from next_day_wind_model.ecmwf_evaluation import coverage_text
 
 
 def forecast_card(state, assets, version):
@@ -64,6 +65,8 @@ def evaluation_content(state, assets, version, kind=None):
             caption += " Largest gains: " + ", ".join(positive.sector.head(3)) + "."
         if not worse.empty:
             caption += " HARMONIE performs better for " + ", ".join(worse.sector) + "."
+    if sector_path:
+        caption += " " + coverage_text(sector_path)
     if gate:
         caption += f" Evaluated active model: {gate['spider_model_id']}."
     if gate.get("calibration_policy") == "none":

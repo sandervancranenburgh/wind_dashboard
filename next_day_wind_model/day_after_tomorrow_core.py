@@ -586,7 +586,8 @@ def export_direction_performance(frame: pd.DataFrame, output: Path) -> pd.DataFr
                "forecast_bias_pred_minus_actual", "champion_bias_pred_minus_actual",
                "champion_mae_gain_vs_forecast"]
     numeric = ["actual", "harmonie", "prediction", "harmonie_direction"]
-    work = frame.loc[frame.scorable, ["target_time_utc", *numeric]].copy()
+    extra = ["ecmwf_speed_knots"] if "ecmwf_speed_knots" in frame else []
+    work = frame.loc[frame.scorable, ["target_time_utc", *numeric, *extra]].copy()
     work[numeric] = work[numeric].apply(pd.to_numeric, errors="coerce")
     work = work.loc[np.isfinite(work[numeric]).all(axis=1)].dropna(subset=["target_time_utc"])
     targets = work.groupby("target_time_utc").mean(numeric_only=True)
@@ -606,7 +607,9 @@ def export_direction_performance(frame: pd.DataFrame, output: Path) -> pd.DataFr
         rows.append(dict(zip(columns, [sector, len(group), baseline["mae"], model["mae"],
             baseline["bias"], model["bias"],
             None if group.empty else baseline["mae"] - model["mae"]])))
-    summary = pd.DataFrame(rows, columns=columns)
+    from next_day_wind_model.ecmwf_evaluation import add_sector_metrics
+    summary = add_sector_metrics(pd.DataFrame(rows, columns=columns), work,
+                                 targets["sector"])
     csv_path = output / "day_after_tomorrow_speed_by_direction.csv"
     summary.to_csv(csv_path, index=False)
     targets.reset_index().to_csv(output / "day_after_tomorrow_direction_eval_details.csv", index=False)

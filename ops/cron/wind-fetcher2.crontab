@@ -1,9 +1,5 @@
 # Production template. Review paths and diff against `crontab -l` before install.
 # All operational site selection is explicit; no command relies on a default site.
-# After the artifact-publication canary in docs/storage_cleanup_and_publication.md:
-# WIND_PAGES_PUBLICATION_MODE=artifact
-# Both the daily and six-minute jobs inherit this switch; no generated Git commits.
-# Configure the Actions API token separately, never in this file.
 
 # Fetch both registered Windsurfice sites, then update the existing Valkenburg dashboard.
 */6 7-22 * * * cd /home/sandervancranenburgh/Documents/repos/wind_fetcher2 && /home/sandervancranenburgh/Documents/repos/wind_fetcher2/scripts/run_wind_dashboard_pipeline.sh >> /home/sandervancranenburgh/Documents/repos/wind_fetcher2/wind_pipeline_cron.log 2>&1

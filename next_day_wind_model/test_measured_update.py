@@ -412,7 +412,7 @@ class MeasuredStageTests(unittest.TestCase):
             self.assertTrue(result["ecmwf_changed"])
             self.assertTrue(result["next_day_rendered"])
             self.assertEqual(result["ecmwf_run_identity"], "new-run")
-            self.assertEqual(len(current_overlays), 3)  # desktop, mobile, full-day protected archive
+            self.assertEqual(len(current_overlays), 2)
             self.assertEqual(len(next_overlays), 2)
             for rendered_overlay in current_overlays + next_overlays:
                 pd.testing.assert_frame_equal(rendered_overlay, overlay)

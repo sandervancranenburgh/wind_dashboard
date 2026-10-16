@@ -15,7 +15,6 @@ import pandas as pd
 
 from next_day_wind_model.operational_update import local_day_utc_bounds, write_bytes_if_changed
 from next_day_wind_model.site_registry import display_name
-from next_day_wind_model.daily_archive import update_daily_archive
 
 
 FORECAST_COLUMNS = (
@@ -561,21 +560,6 @@ def run_measured_only_stage(
             for name, source in publish_sources.items()
         }
 
-    # This path runs on observation-only refreshes too: the permanent daily
-    # export must receive the final 22:54 observations, not just forecast runs.
-    update_daily_archive(out_dir=out_dir, current_csv=current_csv, current_png=current_png,
-        local_tz=args.local_timezone, now_utc=now_utc,
-        render_png=lambda destination: save_current_day_plot(
-            composed, destination, args.local_timezone,
-            prediction_generated_at_utc=prediction_generated_at_utc,
-            prediction_updated_at_utc=prediction_updated_at_utc,
-            model_trained_at_utc=model_trained_at_utc, plot_updated_at_utc=plot_updated_at_utc,
-            prior_prediction_tables=prior_tables, live_monitoring_metric=live_metric,
-            harmonie_time_utc=harmonie_time_utc, harmonie_time_kind=harmonie_time_kind,
-            harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
-            ecmwf_speed_series=ecmwf_speed_series, ecmwf_metadata_text=ecmwf_metadata_text,
-            spot_name=_site_display_name(args.site), full_local_day=True))
-
     if ecmwf_changed:
         metadata["ecmwf"] = ecmwf_metadata
         metadata["ecmwf_run_identity"] = ecmwf_metadata.get("run_identity")
@@ -685,7 +669,6 @@ def run_measured_only_stage(
             web_out_dir=Path(args.web_out_dir),
             remote=args.git_remote,
             branch=args.git_branch,
-            publication_mode=getattr(args, "pages_publication_mode", None),
         )
 
     result = {

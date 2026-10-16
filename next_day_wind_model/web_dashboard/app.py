@@ -29,7 +29,6 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_file,
     send_from_directory,
     session,
     url_for,
@@ -42,8 +41,6 @@ if str(REPO_ROOT) not in sys.path:
 
 import db_store
 from next_day_wind_model.site_registry import rider_spot_values
-from next_day_wind_model.site_registry import load_site_registry
-from next_day_wind_model.dashboard_publication import default_bundle_path
 from wingfoil_analysis import analyze_session_file, build_wind_context
 
 
@@ -558,26 +555,27 @@ def _format_long_session_date(value: str) -> str:
     return f"{day.strftime('%A')} {day.day} {day.strftime('%B %Y')}"
 
 
-def _current_day_archive_plot_for_submission(submission_date: str, spot: str | None = None) -> dict[str, str] | None:
+def _current_day_archive_plot_for_submission(submission_date: str) -> dict[str, str] | None:
     try:
         day = datetime.strptime(submission_date, "%Y-%m-%d").date()
     except ValueError:
         return None
-    registry = load_site_registry()
-    site_id = registry.default_public_site_id if spot is None else registry.spot_to_site().get(spot)
-    if site_id is None:
+    if not CURRENT_DAY_PLOT_ARCHIVE_DIR.exists():
         return None
-    directories = [(ARTIFACTS_DIR / site_id / "current_day_plot_archive", site_id)]
-    if site_id == registry.default_public_site_id:
-        directories.append((CURRENT_DAY_PLOT_ARCHIVE_DIR, None))
-    for directory, route_site in directories:
-        stable_path = directory / f"current_day_predictions_{day.isoformat()}.png"
-        matches = sorted(directory.glob(f"{day.strftime('%Y%m%d')}-*_current_day_predictions.png"))
-        path = stable_path if stable_path.is_file() else (matches[-1] if matches else None)
-        if path is not None and not path.is_symlink():
-            return {"filename": path.name, "url": url_for("current_day_archive_asset", filename=path.name,
-                                                          **({"site_id": route_site} if route_site else {}))}
-    return None
+
+    stable_path = CURRENT_DAY_PLOT_ARCHIVE_DIR / f"current_day_predictions_{day.isoformat()}.png"
+    if stable_path.exists():
+        path = stable_path
+    else:
+        prefix = day.strftime("%Y%m%d")
+        matches = sorted(CURRENT_DAY_PLOT_ARCHIVE_DIR.glob(f"{prefix}-*_current_day_predictions.png"))
+        if not matches:
+            return None
+        path = matches[-1]
+    return {
+        "filename": path.name,
+        "url": url_for("current_day_archive_asset", filename=path.name),
+    }
 
 
 class ActivityUploadError(ValueError):
@@ -1635,36 +1633,12 @@ def dashboard_asset(filename: str):
 
 
 @app.route("/current-day-plot-archive/<path:filename>")
-@app.route("/current-day-plot-archive/<site_id>/<path:filename>")
-def current_day_archive_asset(filename: str, site_id: str | None = None):
+def current_day_archive_asset(filename: str):
     old_archive_name = re.fullmatch(r"\d{8}-\d{6}_current_day_predictions\.png", filename)
     daily_archive_name = re.fullmatch(r"current_day_predictions(?:_mobile)?_\d{4}-\d{2}-\d{2}\.png", filename)
     if "/" in filename or not (old_archive_name or daily_archive_name):
         abort(404)
-    registry = load_site_registry()
-    if site_id is None:
-        directory = CURRENT_DAY_PLOT_ARCHIVE_DIR
-    else:
-        try:
-            registry.site(site_id)
-        except KeyError:
-            abort(404)
-        directory = ARTIFACTS_DIR / site_id / "current_day_plot_archive"
-    if (directory / filename).is_symlink():
-        abort(404)
-    return send_from_directory(directory, filename)
-
-
-@app.get("/forecast-publication/dashboard.zip")
-def forecast_publication_bundle():
-    # Public outputs only; the builder uses an explicit allowlist. This serves
-    # one atomically replaced bundle and never packages data during a request.
-    bundle = Path(app.config.get("DASHBOARD_BUNDLE_PATH") or default_bundle_path(REPO_ROOT))
-    if bundle.is_symlink() or not bundle.is_file():
-        abort(404)
-    response = send_file(bundle, mimetype="application/zip", conditional=True)
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    return send_from_directory(CURRENT_DAY_PLOT_ARCHIVE_DIR, filename)
 
 
 @app.post("/register")
@@ -1945,7 +1919,7 @@ def experience_detail(experience_id: int):
         row=row,
         wind_plot=_measured_wind_plot(row, predictions),
         wind_variability_plot=_measured_wind_variability_plot(row),
-        current_day_archive_plot=_current_day_archive_plot_for_submission(row["date"], row["spot"]),
+        current_day_archive_plot=_current_day_archive_plot_for_submission(row["date"]),
         activity_analysis=activity_analysis,
     )
 

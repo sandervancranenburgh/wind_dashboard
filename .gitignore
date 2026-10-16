@@ -20,6 +20,17 @@ logs/
 *.pth
 
 # Model/runtime artifacts (regenerated)
+next_day_wind_model/publication/
+storage_cleanup_reports/
+# Artifact-based Pages publication: keep public runtime outputs on disk, outside Git.
+# Existing tracked outputs are removed from the index only AFTER the Pages canary.
+/docs/*.png
+/docs/*.json
+/docs/*.html
+/docs/dashboard_refresh.js
+/docs/site-assets/
+/docs/site.webmanifest
+/docs/spots/
 next_day_wind_model/artifacts/
 next_day_wind_model/artifacts_dev/
 next_day_wind_model/artifacts_dev_models/

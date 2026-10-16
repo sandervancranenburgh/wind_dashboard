@@ -22,6 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from next_day_wind_model.daily_archive import atomic_write, update_daily_archive
+
 # The normal six-minute command is classified before importing the scientific
 # and ML stack. Full/recovery modes re-enter this file in a child process with
 # the gate marker set; no-change exits here without loading those modules.
@@ -354,6 +356,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--git-remote", default="origin", help="Git remote name for auto-push.")
     parser.add_argument("--git-branch", default="main", help="Git branch name for auto-push.")
+    parser.add_argument(
+        "--pages-publication-mode", choices=["git", "artifact"],
+        default=os.environ.get("WIND_PAGES_PUBLICATION_MODE", "git"),
+        help="Pages transport. Switch to artifact after validating the migration runbook.",
+    )
     parser.add_argument(
         "--operational-measured-only",
         action="store_true",
@@ -3341,7 +3348,8 @@ def _current_day_direction_arrow_rows(table: pd.DataFrame) -> tuple[pd.DataFrame
         actual_mask = actual_mask & table["is_actual_observation"].astype(bool)
     actual_rows = table[actual_mask].copy()
     if not actual_rows.empty:
-        actual_rows["_arrow_hour"] = actual_rows["time_local"].dt.round("h")
+        actual_rows["_arrow_hour"] = actual_rows["time_local"].dt.tz_convert("UTC").dt.round("h").dt.tz_convert(
+            actual_rows["time_local"].dt.tz)
         actual_rows["_arrow_distance"] = (
             actual_rows["time_local"] - actual_rows["_arrow_hour"]
         ).abs()
@@ -3374,6 +3382,7 @@ def save_current_day_plot(
     ecmwf_metadata_text: str | None = None,
     spot_name: str | None = None,
     render_diagnostics: dict[str, object] | None = None,
+    full_local_day: bool = False,
 ) -> None:
     def _prepare_branch_frame(
         raw_frame: pd.DataFrame,
@@ -3404,11 +3413,12 @@ def save_current_day_plot(
         if issued_at_local is None:
             return None
 
-        issue_anchor = pd.Timestamp(issued_at_local).floor("h")
-        frame = frame[
-            (frame["time_local"].dt.hour >= 8)
-            & ((frame["time_local"].dt.hour < 22) | ((frame["time_local"].dt.hour == 22) & (frame["time_local"].dt.minute == 0)))
-        ].copy()
+        issue_anchor = pd.Timestamp(issued_at_local).tz_convert("UTC").floor("h").tz_convert(ZoneInfo(local_tz))
+        if not full_local_day:
+            frame = frame[
+                (frame["time_local"].dt.hour >= 8)
+                & ((frame["time_local"].dt.hour < 22) | ((frame["time_local"].dt.hour == 22) & (frame["time_local"].dt.minute == 0)))
+            ].copy()
         if frame.empty:
             return None
         if "is_future" in frame.columns:
@@ -3479,12 +3489,14 @@ def save_current_day_plot(
     table = table.copy()
     table["time_local"] = pd.to_datetime(table["time_local"], utc=True, errors="coerce").dt.tz_convert(plot_tz)
     table = table.dropna(subset=["time_local"]).copy()
-    table = table[
-        (table["time_local"].dt.hour >= 8)
-        & ((table["time_local"].dt.hour < 22) | ((table["time_local"].dt.hour == 22) & (table["time_local"].dt.minute == 0)))
-    ].reset_index(drop=True)
+    if not full_local_day:
+        table = table[
+            (table["time_local"].dt.hour >= 8)
+            & ((table["time_local"].dt.hour < 22) | ((table["time_local"].dt.hour == 22) & (table["time_local"].dt.minute == 0)))
+        ]
+    table = table.reset_index(drop=True)
     if table.empty:
-        raise ValueError("No rows available in 08:00-22:00 range for current-day plotting.")
+        raise ValueError("No rows available in the requested current-day plotting range.")
 
     time_index = pd.DatetimeIndex(table["time_local"])
     x = mdates.date2num(time_index.to_pydatetime()).astype(float)
@@ -3536,9 +3548,9 @@ def save_current_day_plot(
 
     current_issue_dt = _parse_iso_utc(prediction_generated_at_utc)
     if current_issue_dt is None:
-        current_issue_anchor = table["time_local"].max().floor("h")
+        current_issue_anchor = table["time_local"].max().tz_convert("UTC").floor("h").tz_convert(plot_tz)
     else:
-        current_issue_anchor = pd.Timestamp(current_issue_dt).tz_convert(ZoneInfo(local_tz)).floor("h")
+        current_issue_anchor = pd.Timestamp(current_issue_dt).tz_convert("UTC").floor("h").tz_convert(plot_tz)
 
     overlay_tables = prior_prediction_tables or []
     branch_frames_by_anchor: dict[pd.Timestamp, pd.DataFrame] = {}
@@ -4026,6 +4038,12 @@ def save_current_day_plot(
     )
     xlim_left = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=8)
     xlim_right = pd.Timestamp(first_dt).normalize() + pd.Timedelta(hours=22)
+    if full_local_day:
+        # Daily archive plots must also show observations outside 08:00..22:00.
+        # Calendar localization, rather than +24h, handles both DST transitions.
+        xlim_left = pd.Timestamp(first_dt).normalize()
+        xlim_right = pd.Timestamp(datetime.combine(xlim_left.date() + timedelta(days=1),
+                                                   datetime.min.time()), tz=plot_tz)
     xlim_left_num = float(mdates.date2num(xlim_left.to_pydatetime()))
     xlim_right_num = float(mdates.date2num(xlim_right.to_pydatetime()))
     for axis in (ax, weather_ax, variability_ax, direction_ax):
@@ -5055,9 +5073,11 @@ def save_dayahead_snapshot(
     target_day_local = target_times_utc[0].astimezone(ZoneInfo(local_tz)).date()
     snapshot_dir = out_dir / "dayahead_snapshots"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = snapshot_dir / (
-        f"{issue_local.strftime('%Y%m%d-%H%M%S')}_target_{target_day_local.strftime('%Y%m%d')}.csv"
-    )
+    # The historical evaluator needs the first issued day-ahead forecast, not
+    # another copy on every refresh. Keep its fallback until DB coverage is audited.
+    snapshot_path = snapshot_dir / f"dayahead_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    if snapshot_path.exists():
+        return str(snapshot_path)
     snap = table[
         [
             "target_time_utc",
@@ -5072,7 +5092,7 @@ def save_dayahead_snapshot(
     snap["issue_local_time"] = issue_local.isoformat()
     snap["issue_date_local"] = issue_local.strftime("%Y-%m-%d")
     snap["target_date_local"] = target_day_local.strftime("%Y-%m-%d")
-    snap.to_csv(snapshot_path, index=False)
+    atomic_write(snapshot_path, snap.to_csv(index=False).encode("utf-8"))
     return str(snapshot_path)
 
 
@@ -5090,17 +5110,22 @@ def save_current_day_snapshot(
         pred_dt = datetime.now(timezone.utc)
     pred_local = pred_dt.astimezone(ZoneInfo(local_tz))
     target_day_local = pd.to_datetime(table_local["time_local"]).dt.tz_convert(ZoneInfo(local_tz)).iloc[0].date()
-    snapshot_dir = out_dir / "current_day_snapshots"
+    # Hourly forecast branches remain necessary for today's dashboard. Keep a
+    # bounded working cache, separate from the permanent last-of-day exports.
+    snapshot_dir = out_dir / "intraday_prediction_cache" / target_day_local.strftime("%Y%m%d")
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = snapshot_dir / (
-        f"{pred_local.strftime('%Y%m%d-%H%M%S')}_target_{target_day_local.strftime('%Y%m%d')}.csv"
+        f"{pred_local.strftime('%Y%m%d-%H')}0000_{pred_local.strftime('%z')}_target_{target_day_local.strftime('%Y%m%d')}.csv"
     )
     snap = table_local.copy()
     snap["issued_at_utc"] = pred_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     snap["issued_at_local"] = pred_local.strftime("%Y-%m-%dT%H:%M:%S%z")
     snap["target_day_local"] = target_day_local.isoformat()
     snap["time_local"] = pd.to_datetime(snap["time_local"]).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-    snap.to_csv(snapshot_path, index=False)
+    payload = snap.to_csv(index=False).encode("utf-8")
+    if not snapshot_path.exists():
+        atomic_write(snapshot_path, payload)
+    atomic_write(snapshot_dir / "latest.csv", payload)
     return str(snapshot_path)
 
 
@@ -5110,10 +5135,9 @@ def _find_current_day_snapshot_paths(
     max_snapshots: int = 10,
 ) -> list[Path]:
     snapshot_dir = out_dir / "current_day_snapshots"
-    if not snapshot_dir.exists():
-        return []
     pattern = f"*_target_{target_day_local.strftime('%Y%m%d')}.csv"
-    matches = sorted(snapshot_dir.glob(pattern))
+    working_cache = out_dir / "intraday_prediction_cache" / target_day_local.strftime("%Y%m%d")
+    matches = sorted([*snapshot_dir.glob(pattern), *working_cache.glob(pattern)], key=lambda p: p.name)
     if not matches:
         return []
     return matches
@@ -5145,10 +5169,13 @@ def load_current_day_prediction_history(
         issued_series = snap.get("issued_at_local", pd.Series(dtype="datetime64[ns, UTC]")).dropna()
         if issued_series.empty:
             continue
-        issue_hour = pd.to_datetime(issued_series.iloc[0]).floor("h")
+        issued_at = pd.to_datetime(issued_series.iloc[0]).tz_convert("UTC")
+        issue_hour = issued_at.floor("h")
         # Keep the earliest snapshot within each issue hour so repeated reruns do not
         # overwrite that hour's forecast branch.
-        if issue_hour not in snapshots_by_issue_hour:
+        existing = snapshots_by_issue_hour.get(issue_hour)
+        previous_issue = None if existing is None else pd.to_datetime(existing["issued_at_local"].iloc[0]).tz_convert("UTC")
+        if previous_issue is None or issued_at < previous_issue:
             snapshots_by_issue_hour[issue_hour] = snap.sort_values("time_local").reset_index(drop=True)
     if not snapshots_by_issue_hour:
         return []
@@ -5166,6 +5193,9 @@ def load_latest_current_day_snapshot(
 ) -> pd.DataFrame | None:
     tz = ZoneInfo(local_tz)
     paths = _find_current_day_snapshot_paths(out_dir, target_day_local, max_snapshots=0)
+    latest_cache = out_dir / "intraday_prediction_cache" / target_day_local.strftime("%Y%m%d") / "latest.csv"
+    if latest_cache.is_file():
+        paths.append(latest_cache)
     if not paths:
         return None
     latest_path = paths[-1]
@@ -5558,6 +5588,10 @@ def _find_dayahead_snapshot(out_dir: Path, target_day_local: date) -> Path | Non
         return None
     pattern = f"*_target_{target_day_local.strftime('%Y%m%d')}.csv"
     matches = sorted(snapshot_dir.glob(pattern))
+    stable_path = snapshot_dir / f"dayahead_target_{target_day_local.strftime('%Y%m%d')}.csv"
+    if stable_path.exists():
+        # Legacy copies precede the new cache and retain the fair earliest issue.
+        return matches[0] if matches else stable_path
     if not matches:
         return None
     # Use earliest issued snapshot for a fair fixed day-ahead comparison.
@@ -7872,6 +7906,22 @@ def run_dashboard_stage_from_cached_artifacts(
         ),
     )
 
+    if not is_test_mode:
+        update_daily_archive(out_dir=out_dir, current_csv=current_day_table_path,
+            current_png=current_day_plot_path, local_tz=args.local_timezone,
+            render_png=lambda destination: save_current_day_plot(
+                current_day_table, destination, args.local_timezone,
+                prediction_generated_at_utc=prediction_generated_at_utc,
+                prediction_updated_at_utc=prediction_updated_at_utc,
+                model_trained_at_utc=model_last_trained_at_utc,
+                plot_updated_at_utc=plot_updated_at_utc,
+                prior_prediction_tables=current_day_prior_prediction_tables,
+                live_monitoring_metric=current_day_live_monitoring_metric,
+                harmonie_time_utc=harmonie_time_utc, harmonie_time_kind=harmonie_time_kind,
+                harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+                ecmwf_speed_series=ecmwf_speed_series, ecmwf_metadata_text=ecmwf_metadata_text,
+                spot_name=_site_display_name(args.site), full_local_day=True))
+
     daily_mae_csv_src: Path | None = None
     daily_mae_png_src: Path | None = None
     daily_mae_png_mobile_src: Path | None = None
@@ -7983,6 +8033,7 @@ def run_dashboard_stage_from_cached_artifacts(
                 web_out_dir=Path(args.web_out_dir),
                 remote=args.git_remote,
                 branch=args.git_branch,
+                publication_mode=getattr(args, "pages_publication_mode", None),
             )
 
     refreshed_metadata = dict(metadata)
@@ -8031,7 +8082,9 @@ def run_dashboard_stage_from_cached_artifacts(
     if web_publish is not None:
         print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
     if args.git_auto_push_pages:
-        if git_publish.get("pushed"):
+        if git_publish.get("dispatched"):
+            print("Web dashboard artifact prepared; GitHub Pages workflow dispatched (deployment pending).")
+        elif git_publish.get("pushed"):
             print(
                 "Web dashboard pushed to git: "
                 f"{git_publish.get('remote')}/{git_publish.get('branch')} @ {git_publish.get('commit')}"
@@ -8045,6 +8098,7 @@ def auto_push_dashboard_changes(
     web_out_dir: Path,
     remote: str,
     branch: str,
+    publication_mode: str | None = None,
 ) -> dict:
     if not (repo_root / ".git").exists():
         return {"enabled": True, "pushed": False, "reason": "not_a_git_repo"}
@@ -8066,6 +8120,17 @@ def auto_push_dashboard_changes(
             "current_branch": current_branch,
             "configured_branch": branch,
         }
+
+    mode = publication_mode or os.environ.get("WIND_PAGES_PUBLICATION_MODE", "git")
+    if mode == "artifact":
+        from next_day_wind_model.dashboard_publication import dispatch_publication
+
+        result = dispatch_publication(repo_root, web_out_dir, remote, branch)
+        if not result.get("dispatched"):
+            raise RuntimeError("Dashboard artifact publication failed; no Git fallback was attempted.")
+        return result
+    if mode != "git":
+        return {"enabled": True, "pushed": False, "reason": "invalid_publication_mode"}
 
     try:
         rel_web_dir = web_out_dir.resolve().relative_to(repo_root.resolve())
@@ -9519,6 +9584,20 @@ def main() -> None:
     )
     _log_rss("plot_generation_complete")
     if not is_test_mode:
+        update_daily_archive(out_dir=out_dir, current_csv=current_day_table_path,
+            current_png=current_day_plot_path, local_tz=args.local_timezone,
+            render_png=lambda destination: save_current_day_plot(
+                current_day_table, destination, args.local_timezone,
+                prediction_generated_at_utc=prediction_generated_at_utc,
+                prediction_updated_at_utc=prediction_updated_at_utc,
+                model_trained_at_utc=model_last_trained_at_utc,
+                plot_updated_at_utc=plot_updated_at_utc,
+                prior_prediction_tables=current_day_prior_prediction_tables,
+                live_monitoring_metric=current_day_live_monitoring_metric,
+                harmonie_time_utc=harmonie_time_utc, harmonie_time_kind=harmonie_time_kind,
+                harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+                ecmwf_speed_series=ecmwf_speed_series, ecmwf_metadata_text=ecmwf_metadata_text,
+                spot_name=_site_display_name(args.site), full_local_day=True))
         current_day_snapshot_csv = save_current_day_snapshot(
             out_dir=out_dir,
             table=current_day_table,
@@ -9551,20 +9630,11 @@ def main() -> None:
             )
             gate_eval_history_png_src = gate_eval_history_png
     if not is_test_mode:
-        archived_next_day_plots = maybe_archive_next_day_plots(
-            next_day_plot_path=plot_path,
-            next_day_plot_mobile_path=plot_path_mobile,
-            out_dir=out_dir,
-            local_tz=args.local_timezone,
-            test_now_local_hour=args.test_now_local_hour,
-        )
-        archived_current_day_plot = maybe_archive_current_day_plot(
-            current_day_plot_path=current_day_plot_path,
-            current_day_plot_mobile_path=current_day_plot_mobile_path,
-            out_dir=out_dir,
-            local_tz=args.local_timezone,
-            test_now_local_hour=args.test_now_local_hour,
-        )
+        # update_daily_archive already kept the latest observed current-day
+        # PNG/CSV. Next-day images are reconstructible and no longer archived.
+        archive_day = pd.to_datetime(current_day_table["time_local"], utc=True).dt.tz_convert(
+            ZoneInfo(args.local_timezone)).iloc[0].date().isoformat()
+        archived_current_day_plot = str(out_dir / "current_day_plot_archive" / f"current_day_predictions_{archive_day}.png")
         daily_mae_csv, daily_mae_png = maybe_save_daily_mae_dayahead(
             out_dir=out_dir,
             db_path=db_path,
@@ -9708,6 +9778,7 @@ def main() -> None:
                 web_out_dir=Path(args.web_out_dir),
                 remote=args.git_remote,
                 branch=args.git_branch,
+                publication_mode=getattr(args, "pages_publication_mode", None),
             )
 
     post_run_champion_states = _load_active_champion_states(
@@ -9966,7 +10037,9 @@ def main() -> None:
     if web_publish is not None:
         print(f"Web dashboard updated in: {Path(args.web_out_dir).resolve()}")
     if args.git_auto_push_pages:
-        if git_publish.get("pushed"):
+        if git_publish.get("dispatched"):
+            print("Web dashboard artifact prepared; GitHub Pages workflow dispatched (deployment pending).")
+        elif git_publish.get("pushed"):
             print(
                 "Web dashboard pushed to git: "
                 f"{git_publish.get('remote')}/{git_publish.get('branch')} @ {git_publish.get('commit')}"

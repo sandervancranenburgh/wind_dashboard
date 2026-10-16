@@ -435,13 +435,17 @@ def render_cached(output: Path, archive: Path | None, now, *, force=True):
             start_utc=(targets.min() - pd.Timedelta(hours=3)).to_pydatetime(),
             end_utc=(targets.max() + pd.Timedelta(hours=3)).to_pydatetime(), local_timezone=TZ)
     if force or ec_meta != metadata.get("ecmwf"):
+        diagnostics = {}
         for mobile in [False, True]:
             save_prediction_plot(table, output / f"{PREFIX}_predictions{'_mobile' if mobile else ''}.png", TZ,
                 plot_updated_at_utc=now, prediction_updated_at_utc=metadata["issue_time_utc"],
                 model_trained_at_utc=metadata["champions"]["speed"].get("available_at_utc", metadata["champions"]["speed"]["trained_at_utc"]),
                 harmonie_time_utc=metadata.get("harmonie_fetched_at_utc"),
                 mobile=mobile, ecmwf_speed_series=ec, spot_name="Valkenburgse Meer",
+                ecmwf_metadata_text=ec_meta.get("metadata_line"), render_diagnostics=diagnostics,
                 experiment_label="Experimental D+2", operational_forecast=True)
+        metadata["plot_meta_text"] = diagnostics.get("plot_meta_text", "")
+        metadata["ecmwf"] = json.loads(json.dumps(ec_meta), parse_constant=lambda _: None)
         table["target_time_local"] = table.target_time_utc.dt.tz_convert(TZ).astype(str)
         table["target_time_utc"] = table.target_time_utc.astype(str)
         from next_day_wind_model.weather_conditions import weather_description

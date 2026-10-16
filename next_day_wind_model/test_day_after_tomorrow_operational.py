@@ -305,12 +305,20 @@ print('cached renderer has no training imports')'''
                 "issue_time_utc": "2026-10-02T13:00:00+00:00", "target_date": "2026-10-04",
                 "available_hours": 9, "champions": {"speed": {"trained_at_utc": "2026-10-02T05:00:00+00:00",
                     "available_at_utc": "2026-10-02T05:24:00+00:00"}}})
-            with patch.object(updater, "save_prediction_plot") as renderer:
-                state = d2.render_cached(output, None, core.utc("2026-10-02T15:06:00+02:00"))
+            fetch_line = "Last ECMWF fetch: 09:48 - Next expected fetch: ~16:00"
+            def capture_render(*args, **kwargs):
+                self.assertEqual(kwargs["ecmwf_metadata_text"], fetch_line)
+                kwargs["render_diagnostics"]["plot_meta_text"] = fetch_line
+            with patch.object(updater, "save_prediction_plot", side_effect=capture_render) as renderer, \
+                 patch("next_day_wind_model.ecmwf_dashboard.load_ecmwf_plot_data",
+                       return_value=(pd.DataFrame(), {"metadata_line": fetch_line})):
+                state = d2.render_cached(output, output / "archive.sqlite", core.utc("2026-10-02T15:06:00+02:00"))
                 self.assertEqual(renderer.call_count, 2)
                 self.assertEqual(renderer.call_args.kwargs["model_trained_at_utc"], "2026-10-02T05:24:00+00:00")
                 self.assertEqual(state["available_hours"], 9)
             payload = json.loads((output / "day_after_tomorrow_interactive_data.json").read_text())
+            self.assertEqual(payload["metadata"]["plot_meta_text"], fetch_line)
+            self.assertEqual(payload["metadata"]["ecmwf"]["metadata_line"], fetch_line)
             self.assertEqual(len(payload["rows"]), 15)
             self.assertIsNone(payload["rows"][-1]["lstm_pred_wind_speed"])
             self.assertTrue(payload["rows"][0]["target_time_utc"].startswith("2026-10-04"))

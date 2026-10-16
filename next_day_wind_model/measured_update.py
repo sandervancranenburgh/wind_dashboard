@@ -499,6 +499,7 @@ def run_measured_only_stage(
                 "harmonie_update_interval_minutes": harmonie_update_interval_minutes,
                 "harmonie_expected_next_at_utc": harmonie_expected_next_at_utc,
                 "ecmwf_speed_series": ecmwf_speed_series,
+                "ecmwf_metadata_text": ecmwf_metadata_text,
                 "spot_name": _site_display_name(args.site),
             }
             save_next_day_plot(
@@ -528,6 +529,7 @@ def run_measured_only_stage(
             local_tz=args.local_timezone,
             current_day_csv=current_csv,
             next_day_csv=missing_next_csv,
+            ecmwf_metadata_text=ecmwf_metadata_text,
             current_day_prior_prediction_tables=prior_tables,
             prediction_generated_at_utc=prediction_generated_at_utc,
             prediction_updated_at_utc=prediction_updated_at_utc,

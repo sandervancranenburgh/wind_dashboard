@@ -385,10 +385,12 @@ class MeasuredStageTests(unittest.TestCase):
             next_overlays: list[pd.DataFrame] = []
 
             def save_current(table, path, local_tz, **kwargs):
+                self.assertEqual(kwargs["ecmwf_metadata_text"], selected["metadata_line"])
                 current_overlays.append(kwargs["ecmwf_speed_series"].copy())
                 self._save_plot(table, path, local_tz, **kwargs)
 
             def save_next(table, path, **kwargs):
+                self.assertEqual(kwargs["ecmwf_metadata_text"], selected["metadata_line"])
                 next_overlays.append(kwargs["ecmwf_speed_series"].copy())
                 Path(path).write_bytes(b"next-mobile" if kwargs.get("mobile") else b"next")
 

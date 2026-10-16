@@ -2681,6 +2681,7 @@ def save_prediction_plot(
     render_diagnostics: dict[str, object] | None = None,
     experiment_label: str | None = None,
     operational_forecast: bool = False,
+    ecmwf_metadata_text: str | None = None,
 ) -> None:
     table = table.copy()
     if "target_time_local" not in table.columns:
@@ -2851,6 +2852,7 @@ def save_prediction_plot(
         plot_update_interval_minutes=plot_update_interval_minutes,
         harmonie_update_interval_minutes=harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        additional_line_after_harmonie=ecmwf_metadata_text if ecmwf_line is not None else None,
     )
     if experiment_label and not operational_forecast:
         def experiment_time(value):
@@ -4279,7 +4281,7 @@ def save_current_day_plot(
     )
     metadata_artist = ax.text(
         0.015,
-        meta_text_y + (0.025 if ecmwf_plotted else 0.0),
+        meta_text_y + (0.03 if ecmwf_plotted else 0.0),
         plot_meta_text,
         transform=ax.transAxes,
         ha="left",
@@ -4455,7 +4457,7 @@ def save_current_day_plot(
                 ],
                 "metadata_position_axes": [
                     0.015,
-                    meta_text_y + (0.025 if ecmwf_plotted else 0.0),
+                    meta_text_y + (0.03 if ecmwf_plotted else 0.0),
                 ],
                 "spot_name": spot_name or "",
                 "header_bounds_figure": header_bounds,
@@ -6810,6 +6812,7 @@ def _write_interactive_plot_assets(
     plot_update_interval_minutes: int = DEFAULT_PLOT_UPDATE_INTERVAL_MINUTES,
     harmonie_update_interval_minutes: int = DEFAULT_HARMONIE_UPDATE_INTERVAL_MINUTES,
     harmonie_expected_next_at_utc: datetime | pd.Timestamp | str | None = None,
+    ecmwf_metadata_text: str | None = None,
 ) -> dict:
     assets: dict[str, str] = {}
 
@@ -6877,6 +6880,7 @@ def _write_interactive_plot_assets(
                 plot_update_interval_minutes=plot_update_interval_minutes,
                 harmonie_update_interval_minutes=harmonie_update_interval_minutes,
                 harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+                additional_line_after_harmonie=ecmwf_metadata_text,
             )
 
             prior_payload_rows: list[dict] = []
@@ -6928,7 +6932,14 @@ def _write_interactive_plot_assets(
             payload = {
                 "plot_kind": "next_day",
                 "timezone": local_tz,
-                "metadata": {},
+                "metadata": {"plot_meta_text": _format_plot_meta_text(
+                    plot_updated_at_utc, prediction_updated_at_utc, model_trained_at_utc, local_tz,
+                    harmonie_time_utc=harmonie_time_utc, harmonie_time_kind=harmonie_time_kind,
+                    plot_update_interval_minutes=plot_update_interval_minutes,
+                    harmonie_update_interval_minutes=harmonie_update_interval_minutes,
+                    harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+                    additional_line_after_harmonie=ecmwf_metadata_text,
+                )},
                 "rows": _frame_to_json_records(frame),
             }
             json_path = web_out_dir / "next_day_interactive_data.json"
@@ -7121,6 +7132,7 @@ def publish_web_dashboard(
         plot_update_interval_minutes=plot_update_interval_minutes,
         harmonie_update_interval_minutes=harmonie_update_interval_minutes,
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
+        ecmwf_metadata_text=(ecmwf_metadata or {}).get("metadata_line"),
     )
     if "dashboard_interactive_js" in interactive_assets:
         copied[interactive_assets["dashboard_interactive_js"]] = str(
@@ -7749,6 +7761,7 @@ def run_dashboard_stage_from_cached_artifacts(
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
         spot_name=_site_display_name(args.site),
+        ecmwf_metadata_text=ecmwf_metadata_text,
     )
     save_prediction_plot(
         table,
@@ -7765,6 +7778,7 @@ def run_dashboard_stage_from_cached_artifacts(
         ecmwf_speed_series=ecmwf_speed_series,
         spot_name=_site_display_name(args.site),
         mobile=True,
+        ecmwf_metadata_text=ecmwf_metadata_text,
     )
 
     current_day_table_path = cached["paths"]["current_day_predictions_csv"]
@@ -9438,6 +9452,7 @@ def main() -> None:
         harmonie_expected_next_at_utc=harmonie_expected_next_at_utc,
         ecmwf_speed_series=ecmwf_speed_series,
         spot_name=_site_display_name(args.site),
+        ecmwf_metadata_text=ecmwf_metadata_text,
     )
     save_prediction_plot(
         table,
@@ -9454,6 +9469,7 @@ def main() -> None:
         ecmwf_speed_series=ecmwf_speed_series,
         spot_name=_site_display_name(args.site),
         mobile=True,
+        ecmwf_metadata_text=ecmwf_metadata_text,
     )
 
     current_day_plot_path = out_dir / f"current_day_predictions{test_suffix}.png"

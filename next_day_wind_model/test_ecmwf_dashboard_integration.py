@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ from next_day_wind_model.operational_update import (
     decide_execution_mode,
 )
 from next_day_wind_model.update_model_and_predict import (
+    _write_interactive_plot_assets,
     save_current_day_plot,
     save_prediction_plot,
 )
@@ -159,6 +161,48 @@ def overlay_for(day: str, *, extreme: bool = False) -> pd.DataFrame:
 
 
 class RendererIntegrationTests(unittest.TestCase):
+    def test_fetch_metadata_is_visible_on_all_horizons_and_screen_sizes(self) -> None:
+        fetch_line = "Last ECMWF fetch: 09:48 - Next expected fetch: ~16:00"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for mobile in (False, True):
+                for horizon in ("current", "next", "d2"):
+                    with self.subTest(mobile=mobile, horizon=horizon):
+                        diagnostics = {}
+                        kwargs = dict(mobile=mobile, ecmwf_metadata_text=fetch_line,
+                                      render_diagnostics=diagnostics)
+                        if horizon == "current":
+                            save_current_day_plot(current_table(), root / "plot.png",
+                                ecmwf_speed_series=overlay_for(DAY), **kwargs, **current_kwargs())
+                            lines = diagnostics["metadata_lines"]
+                        else:
+                            if horizon == "d2":
+                                kwargs.update(experiment_label="Experimental D+2", operational_forecast=True)
+                            save_prediction_plot(next_table(), root / "plot.png",
+                                ecmwf_speed_series=overlay_for("2026-09-17"), **kwargs, **next_kwargs())
+                            lines = diagnostics["plot_meta_text"].splitlines()
+                        self.assertEqual(len(lines), 5)
+                        self.assertEqual(lines[3], fetch_line)
+                        self.assertTrue(lines[2].startswith("Last HARMONIE"))
+                        self.assertTrue(lines[4].startswith("Champion model"))
+                        assert_header_bounds_do_not_overlap(self, diagnostics)
+                        bounds = diagnostics["header_bounds_figure"]["metadata"]
+                        axes = diagnostics.get("axes_position", diagnostics.get("axes_positions", [None])[0])
+                        self.assertGreaterEqual(bounds[1], axes[1] + axes[3])
+
+    def test_interactive_headers_receive_the_same_fetch_text(self) -> None:
+        fetch_line = "Last ECMWF fetch: 09:48 - Next expected fetch: ~16:00"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current_csv, next_csv = root / "current.csv", root / "next.csv"
+            current_table().to_csv(current_csv, index=False)
+            next_table().to_csv(next_csv, index=False)
+            _write_interactive_plot_assets(root, LOCAL_TZ, current_csv, next_csv,
+                ecmwf_metadata_text=fetch_line)
+            for horizon in ("current_day", "next_day"):
+                payload = json.loads((root / f"{horizon}_interactive_data.json").read_text())
+                self.assertIn(fetch_line, payload["metadata"]["plot_meta_text"].splitlines())
+
     def test_current_day_solid_style_post_xmax_and_unchanged_layout(self) -> None:
         table = current_table()
         overlay = overlay_for(DAY, extreme=True)

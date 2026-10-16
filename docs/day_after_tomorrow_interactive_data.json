@@ -52,7 +52,7 @@
         6.5539753152777775
       ],
       "estimated_latency_hours": 7.180113087083333,
-      "information_cutoff_utc": "2026-10-16T10:24:10.583598Z",
+      "information_cutoff_utc": "2026-10-16T10:30:10.063386Z",
       "database_open_mode": "read-only/query-only",
       "rows_loaded": 7,
       "metadata_line": "Last ECMWF fetch: 09:48 - Next expected fetch: ~15:10",
@@ -64,7 +64,7 @@
         4.5
       ]
     },
-    "plot_meta_text": "Last plot update: 12:24 - Next update: 12:30\nLast prediction update: 12:00 - Next expected update: ~12:54\nLast HARMONIE fetch: 11:54 - Next expected fetch: ~12:54\nLast ECMWF fetch: 09:48 - Next expected fetch: ~15:10\nChampion model trained & promoted: 7 October 07:29"
+    "plot_meta_text": "Last plot update: 12:30 - Next update: 12:36\nLast prediction update: 12:00 - Next expected update: ~12:54\nLast HARMONIE fetch: 11:54 - Next expected fetch: ~12:54\nLast ECMWF fetch: 09:48 - Next expected fetch: ~15:10\nChampion model trained & promoted: 7 October 07:29"
   },
   "rows": [
     {

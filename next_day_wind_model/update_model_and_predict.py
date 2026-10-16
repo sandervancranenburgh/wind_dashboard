@@ -2399,6 +2399,32 @@ def _load_harmonie_arrival_estimate(
     )
 
 
+def _scheduled_update_time(
+    expected_utc: datetime,
+    local_tz: str,
+    *,
+    include_midnight: bool = False,
+) -> datetime:
+    """Respect the 07:00..22:54 collector and daily midnight plot refresh."""
+    tz = ZoneInfo(local_tz)
+    expected = expected_utc.astimezone(tz)
+    now = datetime.now(tz)
+    # At a midnight/manual refresh the last fetch may still be yesterday's.
+    # Keep overdue daytime estimates visible, but never predict overnight polls.
+    if now.hour < 7 and expected < now:
+        expected = now
+    first_poll = expected.replace(hour=7, minute=0, second=0, microsecond=0)
+    last_poll = expected.replace(hour=22, minute=54, second=59, microsecond=999999)
+    if expected < first_poll:
+        return first_poll.astimezone(timezone.utc)
+    if expected > last_poll:
+        next_day = (expected + timedelta(days=1)).replace(
+            hour=0 if include_midnight else 7, minute=0, second=0, microsecond=0
+        )
+        return next_day.astimezone(timezone.utc)
+    return expected.astimezone(timezone.utc)
+
+
 def _format_harmonie_metadata_text(
     harmonie_time_utc: datetime | pd.Timestamp | str | None,
     harmonie_time_kind: str,
@@ -2421,6 +2447,7 @@ def _format_harmonie_metadata_text(
             minutes=max(1, int(harmonie_update_interval_minutes))
         )
     harmonie_txt = _format_compact_local_time(local_dt, tz)
+    next_dt = _scheduled_update_time(next_dt, local_tz)
     next_txt = _format_compact_local_time(next_dt, tz)
     return f"{label}: {harmonie_txt} - Next expected fetch: ~{next_txt}"
 
@@ -2446,7 +2473,11 @@ def _format_update_line(
         return f"Last {label}: unknown - {next_label}: unknown"
     tz = ZoneInfo(local_tz)
     local_dt = value_dt.astimezone(tz)
-    next_local = local_dt + timedelta(minutes=max(1, int(interval_minutes)))
+    next_local = _scheduled_update_time(
+        value_dt + timedelta(minutes=max(1, int(interval_minutes))),
+        local_tz,
+        include_midnight=True,
+    )
     prefix = "~" if expected else ""
     return (
         f"Last {label}: {_format_compact_local_time(local_dt, tz)} - "
@@ -2480,6 +2511,7 @@ def _format_prediction_update_line(
     if expected_dt is None:
         next_txt = "unknown"
     else:
+        expected_dt = _scheduled_update_time(expected_dt, local_tz)
         next_txt = f"~{_format_compact_local_time(expected_dt, tz)}"
     return f"Last prediction update: {prediction_txt} - Next expected update: {next_txt}"
 
@@ -9083,6 +9115,7 @@ def main() -> None:
 
     _log_rss("model_and_scaler_loading_complete", skip_training=args.skip_training)
     _log_rss("next_day_inference_input_start")
+    inference_reference_time = datetime.now(timezone.utc)
     inference_input_speed = build_next_day_inference_input(
         db_path=db_path,
         cfg=cfg,
@@ -9090,6 +9123,7 @@ def main() -> None:
         x_std=speed_arrays["x_std"],
         feature_schema=_next_day_feature_schema_from_scalers(speed_arrays),
         local_tz=args.local_timezone,
+        reference_time_utc=inference_reference_time,
     )
     _log_rss("next_day_speed_inference_input_complete")
     inference_input_direction = build_next_day_inference_input(
@@ -9099,6 +9133,7 @@ def main() -> None:
         x_std=direction_arrays["x_std"],
         feature_schema=_direction_feature_schema_from_scalers(direction_arrays),
         local_tz=args.local_timezone,
+        reference_time_utc=inference_reference_time,
     )
     _log_rss("next_day_direction_inference_input_complete")
     speed_inference_calibration_context = _build_speed_calibration_context(

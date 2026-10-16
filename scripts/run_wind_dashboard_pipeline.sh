@@ -17,18 +17,33 @@ else
     MODEL_ARTIFACT_DIR="${SITE_ARTIFACT_DIR}"
 fi
 
+# Midnight rollover uses the stored forecast vintages and existing models.
+# It must work independently of source availability during the overnight pause.
+REFRESH_ONLY=0
+case "${1:-}" in
+    "") ;;
+    --refresh-only) REFRESH_ONLY=1 ;;
+    *) printf 'usage: %s [--refresh-only]\n' "$0" >&2; exit 64 ;;
+esac
+if [ "$#" -gt 1 ]; then
+    printf 'usage: %s [--refresh-only]\n' "$0" >&2
+    exit 64
+fi
+
 cd "${REPO_ROOT}"
 
 # Hold the existing updater lock across the complete fetch -> gate sequence.
 # The marker prevents recursion after the lock runner re-executes this script.
 if [ "${WIND_DASHBOARD_PIPELINE_LOCK_HELD:-0}" != "1" ]; then
     exec env WIND_DASHBOARD_PIPELINE_LOCK_HELD=1 \
-        "${SCRIPT_DIR}/run_wind_updater_locked.sh" "${BASH_SOURCE[0]}"
+        "${SCRIPT_DIR}/run_wind_updater_locked.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 
 # Prediction/dashboard work is deliberately conditional on a completely
 # successful observation + production HARMONIE fetch and database write.
-"${PYTHON_BIN}" source_fetch.py data --all-sites
+if [ "${REFRESH_ONLY}" != "1" ]; then
+    "${PYTHON_BIN}" source_fetch.py data --all-sites
+fi
 
 exec "${PYTHON_BIN}" next_day_wind_model/update_model_and_predict.py \
     --db data/wind_data_all_sites.db \

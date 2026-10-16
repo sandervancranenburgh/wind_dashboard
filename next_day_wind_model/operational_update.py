@@ -481,6 +481,14 @@ def validate_cached_prediction_artifacts(
         }
         if expected_day not in current_days:
             return CachedArtifactStatus(False, None, "current_day_cache_is_stale")
+        next_days = {
+            datetime.fromtimestamp(row["timestamp"] / 1000.0, tz=timezone.utc)
+            .astimezone(ZoneInfo(local_timezone))
+            .date()
+            for row in next_rows
+        }
+        if expected_day + timedelta(days=1) not in next_days:
+            return CachedArtifactStatus(False, None, "next_day_cache_is_stale")
         payload = {
             "schema": 1,
             "current": current_rows,

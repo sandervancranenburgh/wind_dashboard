@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from array import array
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -1808,6 +1809,7 @@ def build_next_day_inference_input(
     x_std: np.ndarray,
     feature_schema: str = "legacy",
     local_tz: str = "Europe/Amsterdam",
+    reference_time_utc: datetime | pd.Timestamp | str | None = None,
 ) -> Dict[str, np.ndarray | str]:
     schema = str(feature_schema).strip().lower()
     conn = sqlite3.connect(str(db_path))
@@ -1820,9 +1822,13 @@ def build_next_day_inference_input(
     # Predict the next local calendar day. Windsurfice displays times in local
     # civil time, while the DB stores UTC instants for durability.
     tz = ZoneInfo(local_tz)
-    latest_obs_local = latest_obs.tz_convert(tz)
-    reference_day_start_local = latest_obs_local.floor("D")
-    target_day_start_local = reference_day_start_local + pd.Timedelta(days=1)
+    # Operational callers supply one issue time for speed and direction.
+    # Historical callers can continue to anchor to their latest observation.
+    reference = latest_obs if reference_time_utc is None else pd.Timestamp(reference_time_utc)
+    if reference.tzinfo is None:
+        reference = reference.tz_localize("UTC")
+    reference_day_start_local = reference.tz_convert(tz).normalize()
+    target_day_start_local = reference_day_start_local + pd.DateOffset(days=1)
     target_times_local = pd.date_range(
         start=target_day_start_local,
         periods=cfg.target_hours,

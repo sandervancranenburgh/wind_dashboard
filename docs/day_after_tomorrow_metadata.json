@@ -23,7 +23,7 @@
   "experimental": true,
   "calibration_policy": "none",
   "harmonie_fetched_at_utc": "2026-10-17T10:54:05.017000+00:00",
-  "plot_meta_text": "Last plot update: 13:48 - Next update: 13:54\nLast prediction update: 13:00 - Next expected update: ~13:54\nLast HARMONIE fetch: 12:54 - Next expected fetch: ~13:54\nLast ECMWF fetch: 09:48 - Next expected fetch: ~15:11\nChampion model trained & promoted: 7 October 07:29",
+  "plot_meta_text": "Last plot update: 13:54 - Next update: 14:00\nLast prediction update: 13:00 - Next expected update: ~13:54\nLast HARMONIE fetch: 12:54 - Next expected fetch: ~13:54\nLast ECMWF fetch: 09:48 - Next expected fetch: ~15:11\nChampion model trained & promoted: 7 October 07:29",
   "ecmwf": {
     "available": true,
     "reason": null,
@@ -50,7 +50,7 @@
       6.553024717777778
     ],
     "estimated_latency_hours": 7.189871237638889,
-    "information_cutoff_utc": "2026-10-17T11:48:11.980234Z",
+    "information_cutoff_utc": "2026-10-17T11:54:11.731007Z",
     "database_open_mode": "read-only/query-only",
     "rows_loaded": 7,
     "metadata_line": "Last ECMWF fetch: 09:48 - Next expected fetch: ~15:11",

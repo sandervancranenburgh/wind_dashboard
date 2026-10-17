@@ -2,7 +2,7 @@
   "plot_kind": "next_day",
   "timezone": "Europe/Amsterdam",
   "metadata": {
-    "status": "available",
+    "status": "stale",
     "issue_time_utc": "2026-10-17T20:00:00+00:00",
     "target_date": "2026-10-19",
     "available_hours": 15,
@@ -26,7 +26,7 @@
     "experimental": true,
     "calibration_policy": "none",
     "harmonie_fetched_at_utc": "2026-10-17T19:54:05.524000+00:00",
-    "plot_meta_text": "Last plot update: 22:58 - Next update: 18 October 00:00\nLast prediction update: 22:00 - Next expected update: ~22:54\nLast HARMONIE fetch: 21:54 - Next expected fetch: ~22:54\nLast ECMWF fetch: 21:48 - Next expected fetch: ~18 October 03:11\nChampion model trained & promoted: 7 October 07:29",
+    "plot_meta_text": "Last plot update: 00:04 - Next update: 07:00\nLast prediction update: 17 October 22:00 - Next expected update: ~07:00\nLast HARMONIE fetch: 17 October 21:54 - Next expected fetch: ~07:00\nLast ECMWF fetch: 17 October 21:48 - Next expected fetch: ~03:11\nChampion model trained & promoted: 7 October 07:29",
     "ecmwf": {
       "available": true,
       "reason": null,
@@ -53,10 +53,10 @@
         6.556976960555556
       ],
       "estimated_latency_hours": 7.189871237638889,
-      "information_cutoff_utc": "2026-10-17T20:58:53.099108Z",
+      "information_cutoff_utc": "2026-10-17T22:04:59.901139Z",
       "database_open_mode": "read-only/query-only",
       "rows_loaded": 7,
-      "metadata_line": "Last ECMWF fetch: 21:48 - Next expected fetch: ~18 October 03:11",
+      "metadata_line": "Last ECMWF fetch: 17 October 21:48 - Next expected fetch: ~03:11",
       "model_version": "50r1",
       "resolution": "0.25 degrees",
       "source": "ecmwf_open_data",
